@@ -3,11 +3,24 @@
 // ARCHITECTURE RULE: this does NOT create a parallel pricing system. The
 // routing engine already reads `offer.incentiveBps` and applies it to route
 // economics. This service manages the CAMPAIGN lifecycle and the accounting
-// (accrued on completion, paid on settlement) so that:
+// so that:
 //   - displayed incentives are "promised" (campaign budget remaining)
 //   - earned incentives are "accrued" (only after a qualifying execution
 //     COMPLETES)
 //   - paid incentives are credited via the existing ledger
+//
+// ACCOUNTING SEMANTICS (Prompt 2.2):
+//   totalBudget     — max total incentive the campaign will ever pay out
+//   accrued         — cumulative incentive earned by completed executions
+//   paid            — cumulative incentive actually disbursed (subset of accrued)
+//   qualifiedVolume — cumulative settlement volume that earned incentives
+//
+//   remainingBudget = totalBudget - accrued
+//   unpaidAccrued   = accrued - paid
+//
+// (paid is NOT an additional consumption of the budget — it is a disbursement
+// of already-accrued earnings. Subtracting both accrued and paid from
+// totalBudget would double-count paid incentives.)
 //
 // CONCURRENCY SAFETY (Prompt 2.1):
 //   - IncentiveEarning has a @@unique([campaignId, executionId, providerId])
@@ -23,7 +36,8 @@ import { Prisma } from "@prisma/client";
 import { Decimal, moneyAdd, moneyGte, moneyLte, moneyGt, moneyMin, bpsToFactor, incentiveForAmount } from "@/lib/engine/money";
 import { appendAuditEvent } from "@/lib/engine/audit";
 
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 5;
+const RETRY_DELAY_MS = 50;
 
 // Find the best active campaign for a given settlement asset + corridor context.
 // Returns the incentiveBps to apply, or 0 if none.
@@ -44,8 +58,12 @@ export async function getApplicableIncentiveBps(
   let bestId: string | null = null;
   for (const c of campaigns) {
     if (!isCampaignEligible(c, context)) continue;
-    // Check budget remaining.
-    const remaining = new Decimal(c.totalBudget).minus(new Decimal(c.accrued)).minus(new Decimal(c.paid));
+    // Check budget remaining. Accounting semantics:
+    //   accrued = cumulative incentive earned by completed executions
+    //   paid    = cumulative incentive actually disbursed
+    //   remainingBudget = totalBudget - accrued
+    // (paid is a subset of accrued, not an additional consumption.)
+    const remaining = new Decimal(c.totalBudget).minus(new Decimal(c.accrued));
     if (moneyLte(remaining, 0)) continue;
     // Check volume cap remaining.
     if (c.volumeCap) {
@@ -107,7 +125,10 @@ export async function accrueIncentiveForExecution(executionId: string): Promise<
       if (result === "ACCRUED") { accrued = true; break; }
       if (result === "DUPLICATE") { accrued = false; break; } // already earned
       if (result === "SKIP") { accrued = false; break; } // budget/volume exhausted
-      // result === "CONFLICT" → retry
+      // result === "CONFLICT" → wait briefly and retry
+      if (attempt < MAX_RETRIES - 1) {
+        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * (attempt + 1)));
+      }
     }
     if (!accrued) continue;
 
@@ -165,7 +186,8 @@ async function tryAccrueLeg(campaignId: string, executionId: string, leg: any): 
       }
 
       // Enforce total budget remaining.
-      const budgetRemaining = new Decimal(campaign.totalBudget).minus(new Decimal(campaign.accrued)).minus(new Decimal(campaign.paid));
+      // remainingBudget = totalBudget - accrued (paid is a subset of accrued).
+      const budgetRemaining = new Decimal(campaign.totalBudget).minus(new Decimal(campaign.accrued));
       if (moneyLte(budgetRemaining, 0)) {
         await markExhausted(tx, campaignId);
         return "SKIP";
@@ -211,7 +233,8 @@ async function tryAccrueLeg(campaignId: string, executionId: string, leg: any): 
       }
 
       // Check if budget is now exhausted.
-      const newRemaining = new Decimal(campaign.totalBudget).minus(moneyAdd(new Decimal(campaign.accrued), amount)).minus(new Decimal(campaign.paid));
+      // remainingBudget = totalBudget - accrued (paid is a subset of accrued).
+      const newRemaining = new Decimal(campaign.totalBudget).minus(moneyAdd(new Decimal(campaign.accrued), amount));
       if (moneyLte(newRemaining, 0)) {
         await markExhausted(tx, campaignId);
       }
@@ -251,7 +274,7 @@ async function accrueWithCappedVolume(tx: any, campaign: any, executionId: strin
   if (campaign.perTxnCap && moneyGt(amount, campaign.perTxnCap)) {
     amount = new Decimal(campaign.perTxnCap);
   }
-  const budgetRemaining = new Decimal(campaign.totalBudget).minus(new Decimal(campaign.accrued)).minus(new Decimal(campaign.paid));
+  const budgetRemaining = new Decimal(campaign.totalBudget).minus(new Decimal(campaign.accrued));
   if (moneyLte(budgetRemaining, 0)) {
     await markExhausted(tx, campaign.id);
     return "SKIP";
@@ -367,7 +390,13 @@ export async function getCampaignStats(campaignId: string) {
   const accrued = new Decimal(c.accrued);
   const paid = new Decimal(c.paid);
   const budget = new Decimal(c.totalBudget);
-  const remaining = budget.minus(accrued).minus(paid);
+  // Accounting semantics:
+  //   accrued        = cumulative incentive earned by completed executions
+  //   paid           = cumulative incentive actually disbursed (subset of accrued)
+  //   remainingBudget = totalBudget - accrued
+  //   unpaidAccrued  = accrued - paid
+  const remaining = budget.minus(accrued);
+  const unpaidAccrued = accrued.minus(paid);
   const qualifiedVolume = new Decimal(c.qualifiedVolume);
   const volRemaining = c.volumeCap ? new Decimal(c.volumeCap).minus(qualifiedVolume) : null;
   return {
@@ -382,6 +411,7 @@ export async function getCampaignStats(campaignId: string) {
     accrued: accrued.toString(),
     paid: paid.toString(),
     remaining: remaining.toString(),
+    unpaidAccrued: unpaidAccrued.toString(),
     volumeCap: c.volumeCap?.toString() ?? null,
     qualifiedVolume: qualifiedVolume.toString(),
     volumeRemaining: volRemaining?.toString() ?? null,

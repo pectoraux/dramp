@@ -22,6 +22,12 @@ export async function getNetworkOverview() {
   const aggregateExposure = vaults.reduce((s, v) => s + Number(v.lockedCollateral.toString()), 0);
   const aggregateCollateral = vaults.reduce((s, v) => s + Number(v.usableCollateral.toString()), 0);
 
+  // Incentive accounting: accrued = cumulative earned, paid = cumulative disbursed.
+  // remainingBudget = totalBudget - accrued; unpaidAccrued = accrued - paid.
+  const incentiveBudget = new Decimal(campaigns._sum.totalBudget ?? 0);
+  const incentiveAccrued = new Decimal(campaigns._sum.accrued ?? 0);
+  const incentivePaid = new Decimal(campaigns._sum.paid ?? 0);
+
   return {
     totalVolume,
     completedCount: completedExecutions.length,
@@ -32,9 +38,11 @@ export async function getNetworkOverview() {
     aggregateExposure: aggregateExposure.toString(),
     aggregateCollateral: aggregateCollateral.toString(),
     unsettledObligations: obligations._sum.amount?.toString() ?? "0",
-    incentiveBudget: campaigns._sum.totalBudget?.toString() ?? "0",
-    incentiveAccrued: campaigns._sum.accrued?.toString() ?? "0",
-    incentivePaid: campaigns._sum.paid?.toString() ?? "0",
+    incentiveBudget: incentiveBudget.toString(),
+    incentiveAccrued: incentiveAccrued.toString(),
+    incentivePaid: incentivePaid.toString(),
+    incentiveRemaining: incentiveBudget.minus(incentiveAccrued).toString(),
+    incentiveUnpaidAccrued: incentiveAccrued.minus(incentivePaid).toString(),
   };
 }
 
