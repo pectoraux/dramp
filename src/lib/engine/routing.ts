@@ -603,27 +603,79 @@ export interface RouteScoreContext {
 }
 
 // Compute the raw (un-normalized) score for a single route. Lower = better
-// (it's a penalty). This is used for pairwise comparison (isBetterRoute) where
-// normalization across a candidate set isn't available.
+// (it's a penalty). This is used for pairwise comparison where normalization
+// across a candidate set isn't available.
 export function scoreRoute(route: CandidateRoute, ctx: RouteScoreContext): number {
+  return calculateAbsoluteRouteQuality(route, ctx);
+}
+
+// ---- Absolute Route Quality (Prompt 3.3) ---------------------------------
+//
+// A STABLE cross-time route quality score that does NOT depend on the
+// candidate set. Each dimension is bounded 0..1 using absolute reference
+// points, so the same route gets the same quality score regardless of what
+// other routes exist in the marketplace at that moment.
+//
+// Used by:
+//   - advanceSearching (WAIT_FOR_BETTER re-evaluation) via shouldReplaceRoute
+//   - isBetterRoute (delegates to shouldReplaceRoute)
+//
+// NOT used by rankAndTag (which uses candidate-set-relative normalization for
+// ranking among currently available alternatives).
+
+// Absolute reference points for normalization (stable across time):
+const ABS_COST_REF = 0.01;   // 1% effective cost = penalty 1.0 (100 bps)
+const ABS_DURATION_REF = 600; // 10 minutes = penalty 1.0
+
+export function calculateAbsoluteRouteQuality(route: CandidateRoute, ctx: RouteScoreContext): number {
   const w = weightFor(ctx.riskTolerance);
   const notional = route.legs[0]?.amount.toNumber() || 1;
-  const normCost = route.effectiveCost.toNumber() / notional;
-  const normDur = route.expectedExecutionSeconds / 600;
-  const normRisk = route.risk.composite;
 
-  // Compute route reputation across ALL material legs (same as rankAndTag).
+  // Bounded absolute dimensions (each 0..1, higher = worse):
+  const absCost = Math.min(1, route.effectiveCost.toNumber() / notional / ABS_COST_REF);
+  const absDur = Math.min(1, route.expectedExecutionSeconds / ABS_DURATION_REF);
+  const absRisk = Math.min(1, route.risk.composite);
+
+  // Route reputation across ALL legs (0..1, higher = better → invert for penalty).
   const routeRep = computeRouteReputation(route, ctx);
-  // For pairwise comparison, we invert: higher reputation → lower penalty.
-  // repScore is 0..1; (1 - repScore) gives a 0..1 penalty.
-  const normRep = 1 - routeRep;
+  const absRep = 1 - routeRep; // 0 = perfect reputation, 1 = no reputation
 
-  // Compute commitment reliability across ALL legs (same as rankAndTag).
+  // Commitment reliability across ALL legs (0..1, higher = better).
   const routeCommit = computeRouteCommitment(route, ctx);
   const commitReduction = routeCommit * 0.2;
 
-  const adjustedRepPenalty = w.reputation * normRep * (1 - commitReduction);
-  return w.cost * normCost + w.speed * normDur + w.risk * normRisk + adjustedRepPenalty;
+  const adjustedRepPenalty = w.reputation * absRep * (1 - commitReduction);
+  return w.cost * absCost + w.speed * absDur + w.risk * absRisk + adjustedRepPenalty;
+}
+
+// ---- Route replacement (Prompt 3.3) --------------------------------------
+//
+// Determines whether a newly discovered route should replace the current
+// reference route during WAIT_FOR_BETTER. Uses absolute quality (not
+// candidate-set-normalized) so the comparison is stable across time.
+//
+// ROUTE_REPLACEMENT_THRESHOLD: the minimum absolute quality improvement
+// required to justify replacing the reference route. Expressed in normalized
+// quality units (0..1 scale). A value of 0.01 means the new route must be
+// at least 1% better in absolute quality terms.
+export const ROUTE_REPLACEMENT_THRESHOLD = 0.01;
+
+export function shouldReplaceRoute(
+  newRoute: CandidateRoute,
+  refRoute: CandidateRoute,
+  ctx: RouteScoreContext,
+): { replace: boolean; improvement: number; reason: string } {
+  if (newRoute.hardFilterRejection) return { replace: false, improvement: 0, reason: "new route rejected by hard filter" };
+  if (refRoute.hardFilterRejection) return { replace: true, improvement: 1, reason: "reference route rejected" };
+
+  const refQuality = calculateAbsoluteRouteQuality(refRoute, ctx);
+  const newQuality = calculateAbsoluteRouteQuality(newRoute, ctx);
+  const improvement = refQuality - newQuality; // positive = new is better
+
+  if (improvement >= ROUTE_REPLACEMENT_THRESHOLD) {
+    return { replace: true, improvement, reason: `absolute quality improved by ${improvement.toFixed(4)} (threshold: ${ROUTE_REPLACEMENT_THRESHOLD})` };
+  }
+  return { replace: false, improvement, reason: `improvement ${improvement.toFixed(4)} below threshold ${ROUTE_REPLACEMENT_THRESHOLD}` };
 }
 
 // Compute route-level reputation across ALL material legs.
@@ -782,18 +834,79 @@ export async function findRoutes(input: FindRoutesInput): Promise<CandidateRoute
   return rankAndTag(filtered, input.riskTolerance, reputationMap, corridorScoreMap, commitmentReliabilityMap);
 }
 
-// Quick helper used by the engine ticker to check whether a *better* route
-// than the current reference exists. Uses the SAME scoring semantics as
-// rankAndTag via the shared scoreRoute function — no drift between initial
-// ranking and re-evaluation.
+// Quick helper that delegates to shouldReplaceRoute. This is kept for
+// backward compatibility but the canonical path is shouldReplaceRoute.
 export function isBetterRoute(
   newRoute: CandidateRoute,
   refRoute: CandidateRoute,
   riskTolerance: string,
   ctx?: RouteScoreContext,
 ): boolean {
-  if (newRoute.hardFilterRejection) return false;
-  if (refRoute.hardFilterRejection) return true;
   const scoreCtx: RouteScoreContext = ctx ?? { riskTolerance };
-  return scoreRoute(newRoute, scoreCtx) < scoreRoute(refRoute, scoreCtx);
+  return shouldReplaceRoute(newRoute, refRoute, scoreCtx).replace;
+}
+
+// ---- Persisted route reconstruction (Prompt 3.3) -------------------------
+//
+// Rebuilds a real CandidateRoute from a persisted Route + Leg[] with all
+// material fields needed for scoring: provider IDs, corridors, amounts,
+// risk dimensions, etc. No fake provider IDs or empty fields.
+
+export async function reconstructPersistedRoute(routeId: string): Promise<CandidateRoute | null> {
+  const route = await db.route.findUnique({
+    where: { id: routeId },
+    include: { legs: { include: { provider: true, offer: true } } },
+  });
+  if (!route) return null;
+
+  const legs: CandidateLeg[] = route.legs
+    .sort((a, b) => a.sequence - b.sequence)
+    .map((l) => ({
+      providerId: l.providerId,
+      offerId: l.offerId,
+      sequence: l.sequence,
+      role: l.role,
+      amount: l.amount,
+      sourceAsset: l.sourceAsset,
+      destinationAsset: l.destinationAsset,
+      sourceCountry: l.offer?.sourceCountry ?? "GLOBAL",
+      destinationCountry: l.offer?.destinationCountry ?? "GLOBAL",
+      settlementAssetId: l.settlementAssetId,
+      channelType: l.channelType,
+      feeBps: l.offer?.feeBps ?? 0,
+      incentiveBps: l.offer?.incentiveBps ?? 0,
+      rate: l.offer?.rate ?? new Decimal(1),
+      expectedExecutionSeconds: l.offer?.expectedExecutionSeconds ?? 60,
+      providerRisk: providerRiskFromRecord(l.provider ? {
+        trustModel: l.provider.trustModel,
+        providerType: l.provider.providerType,
+        reputationScore: l.provider.reputationScore,
+        status: l.provider.status,
+      } : { trustModel: "NON_CUSTODIAL", providerType: "HYBRID", reputationScore: 0.5, status: "ACTIVE" }),
+      offerCapacity: l.offer?.availableCapacity ?? new Decimal(0),
+      settlementAssetRisk: null,
+    }));
+
+  return {
+    legs,
+    hopCount: route.legCount,
+    split: route.splitRoute,
+    totalCost: route.totalCost,
+    effectiveCost: route.effectiveCost,
+    grossOutput: route.grossOutput,
+    netOutput: route.netOutput,
+    incentiveBps: route.incentiveBps,
+    risk: {
+      counterparty: route.riskCounterparty,
+      settlementAsset: route.riskSettlementAsset,
+      liquidity: route.riskLiquidity,
+      operational: route.riskOperational,
+      duration: route.riskDuration,
+      composite: route.riskComposite,
+    },
+    expectedExecutionSeconds: route.expectedExecutionSeconds,
+    explanation: route.explanation,
+    tag: route.tag,
+    hardFilterRejection: undefined,
+  };
 }

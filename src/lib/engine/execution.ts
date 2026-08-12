@@ -554,11 +554,13 @@ async function advanceSearching(execution: Prisma.ExecutionGetPayload<{ include:
     return { advanced: false, reason: "reference_set" };
   }
 
-  // Compare the new best to the reference using the SAME scoring semantics
-  // as rankAndTag (cost + speed + risk + reputation + corridor + commitment).
-  // This prevents drift between initial ranking and re-evaluation — a route
-  // that wins on reputation during ranking must also win during re-evaluation.
-  // Fetch the scoring context (reputation, corridor scores, commitment).
+  // Compare the new best to the reference using ABSOLUTE route quality
+  // (not candidate-set-normalized). This is stable across time — the same
+  // route gets the same quality score regardless of what other candidates
+  // exist in the marketplace at this moment.
+  //
+  // The persisted reference route is RECONSTRUCTED with its real provider IDs,
+  // corridors, amounts, and risk dimensions — no fake/default values.
   let scoreCtx: any = { riskTolerance: execution.intent.riskTolerance };
   try {
     const { getReputationMap, getCorridorScoreMap } = await import("@/lib/economics/reputation");
@@ -573,19 +575,18 @@ async function advanceSearching(execution: Prisma.ExecutionGetPayload<{ include:
     // Fall back to cost/speed/risk only if reputation service is unavailable.
   }
 
-  // Reconstruct the reference route as a CandidateRoute-like object for scoring.
-  const refAsCandidate = {
-    legs: [{ providerId: "", amount: execution.intent.sourceAmount, sourceAsset: "", destinationAsset: "", sourceCountry: "", destinationCountry: "" }],
-    effectiveCost: refRoute.effectiveCost,
-    expectedExecutionSeconds: refRoute.expectedExecutionSeconds,
-    risk: { composite: refRoute.riskComposite, counterparty: 0, settlementAsset: 0, liquidity: 0, operational: 0, duration: 0 },
-    hardFilterRejection: undefined,
-  } as any;
+  // Reconstruct the persisted reference route with REAL provider/corridor data.
+  const { reconstructPersistedRoute, shouldReplaceRoute, ROUTE_REPLACEMENT_THRESHOLD } = await import("@/lib/engine/routing");
+  const refCandidate = await reconstructPersistedRoute(refRoute.id);
+  if (!refCandidate) {
+    // Reference route couldn't be reconstructed — use the current best.
+    const persisted = await persistSingleRoute(execution.id, best);
+    await db.execution.update({ where: { id: execution.id }, data: { referenceRouteId: persisted.id } });
+    await selectRoute(execution.id, persisted.id);
+    return { advanced: true, reason: "reference_unreconstructable" };
+  }
 
-  const { scoreRoute } = await import("@/lib/engine/routing");
-  const refScore = scoreRoute(refAsCandidate, scoreCtx);
-  const bestScore = scoreRoute(best, scoreCtx);
-  const scoreImprovement = refScore - bestScore; // positive = new route is better
+  const replacement = shouldReplaceRoute(best, refCandidate, scoreCtx);
 
   // Also compute cost improvement for audit trail.
   const improvementBps = refRoute.effectiveCost
@@ -599,12 +600,7 @@ async function advanceSearching(execution: Prisma.ExecutionGetPayload<{ include:
     data: { waitedSeconds, lastTickAt: new Date() },
   });
 
-  // A route is "better" if its full score (cost+speed+risk+reputation+commitment)
-  // is meaningfully lower than the reference. The threshold ensures we don't
-  // thrash on negligible differences.
-  const improved = scoreImprovement > 0.0005;
-
-  if (improved) {
+  if (replacement.replace) {
     // Persist the new best, update reference, and execute.
     const persisted = await persistSingleRoute(execution.id, best);
     await db.execution.update({
@@ -618,10 +614,12 @@ async function advanceSearching(execution: Prisma.ExecutionGetPayload<{ include:
         previousRouteId: refRoute.id,
         newRouteId: persisted.id,
         improvementBps: Number(improvementBps.toFixed(2)),
-        scoreImprovement: Number(scoreImprovement.toFixed(6)),
+        absoluteQualityImprovement: Number(replacement.improvement.toFixed(6)),
+        replacementThreshold: ROUTE_REPLACEMENT_THRESHOLD,
+        replacementReason: replacement.reason,
         previousEffectiveCost: refRoute.effectiveCost.toString(),
         newEffectiveCost: best.effectiveCost.toString(),
-        scoringNote: "Full route scoring (cost+speed+risk+reputation+corridor+commitment)",
+        scoringNote: "Absolute route quality (stable cross-time, not candidate-set-normalized)",
       },
     });
     try {
@@ -653,7 +651,7 @@ async function advanceSearching(execution: Prisma.ExecutionGetPayload<{ include:
     return { advanced: true, reason: "timeout_executed" };
   }
 
-  return { advanced: false, reason: `waiting_score_improvement=${scoreImprovement.toFixed(6)}` };
+  return { advanced: false, reason: `waiting: ${replacement.reason}` };
 }
 
 // Persist a single candidate route (with its legs) for selection.
