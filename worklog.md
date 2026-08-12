@@ -450,3 +450,27 @@ Stage Summary:
 - Providers can see where demand exists (opportunity feed), how competitive their pricing is (pricing intelligence), how much they earn and why (provider economics from ledger), and how productive their capital is (capital efficiency).
 - The network health score is transparent: liquidityDepth + routeCompetition + providerReliability + executionSuccess + riskConcentration, each 0-100.
 - The acquisition funnel tracks: applied → approved → connected → published → received execution → completed → repeat, with conversion rates.
+
+---
+Task ID: P3.1-Hardening
+Agent: main (Z.ai Code)
+Task: Fix 6 economic-model inconsistencies in Prompt 3. Anti-gaming, corridor routing, multi-leg reputation, liquidity-gap, netEarnings, commitment integration. No new features.
+
+Work Log:
+- 1. Anti-gaming: $50 threshold now applies to ALL reputation components (reliability, speed, disputes, operational), not just sampleSize. Each meaningful transaction weighted by sqrt(value/$100) × recency_decay. 1000 tiny $1 txns → zero effect. Single huge txn → sqrt dampened + capped at 3.0×.
+- 2. Corridor-specific routing: rankAndTag uses getCorridorScoreMap() to look up per-provider-per-corridor scores. Corridor score used when available, global reputation as fallback. Provider B can win USD→NGN even if Provider A has higher global reputation.
+- 3. Multi-leg route reputation: route reliability = 70% weighted average across all legs + 30% minimum (weakest-leg penalty). A multi-hop route with a weak intermediate provider is penalized.
+- 4. Liquidity-gap: getCorridorSupply requires BOTH source AND destination asset to match. Generic offers sharing only the source asset no longer count as direct supply.
+- 5. netEarnings: now = grossEarnings (fees + incentives + rebates) - grossCosts (penalties + slashing). Added grossEarnings and grossCosts fields. compensation/refunds categorized separately.
+- 6. Commitment reliability: getCommitmentReliabilityMap() integrated into rankAndTag. High commitment reliability → up to 20% reputation penalty reduction (modest nudge, never overrides hard constraints).
+- Tests: tests/p3-hardening.test.ts (22 assertions) — anti-gaming (20 tiny txns → neutral, 1 meaningful → reliability=100), corridor routing (getCorridorScoreMap returns Map), multi-leg (routes ranked with combined reputation), liquidity-gap (USD→JPY supply=0), economics (netEarnings = gross - costs verified numerically), commitment (getCommitmentReliabilityMap returns Map).
+- All existing tests still pass (collateral 23, P3 economics 72). Lint + type-check clean.
+- Pushed to GitHub (commit ed869d6).
+
+Stage Summary:
+- Reputation anti-gaming is now real: sub-$50 transactions are excluded from ALL reputation components, not just sample count. Value weighting (sqrt) prevents both tiny-transaction gaming and single-transaction dominance.
+- Corridor-specific performance is now used by the router: a provider strong on USD→NGN but weak globally can win that corridor over a globally-stronger provider.
+- Multi-leg routes are evaluated across all legs: the weakest leg penalizes the route's combined reputation (30% weight on the minimum).
+- Liquidity gaps are now route-feasible: supply only counts offers that match both source and destination, preventing misleading gap numbers.
+- Provider economics are now correct: netEarnings subtracts penalties and slashing from gross earnings.
+- Commitment reliability nudges routing: committed liquidity is modestly more valuable than ephemeral liquidity.
