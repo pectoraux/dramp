@@ -578,3 +578,25 @@ Stage Summary:
 - A provider changing their offer between discovery and reservation causes the stale route to be rejected — not silently committed.
 - After reservation, execution never reads mutable marketplace economics. Missing snapshots fail with an explicit error, not a silent fallback.
 - The audit trail records exactly what was committed and when, including stale rejections.
+
+---
+Task ID: P3.7-Versioning
+Agent: main (Z.ai Code)
+Task: Offer versioning for optimistic concurrency at route commitment. Stale versions rejected. Legacy missing versions rejected. No new features.
+
+Work Log:
+- Schema: LiquidityOffer.version Int @default(1), Leg.snapshotOfferVersion Int?
+- Offer mutations increment version: provider API (PATCH/DELETE offers), market simulation (ticker PRICE_CHANGE/CAPACITY_CHANGE). Capacity reservation/release does NOT increment version (tracks reservedCapacity, not economic terms).
+- CandidateLeg.offerVersion added; AdjEdge.offer.version added; buildGraph populates version from DB.
+- persistSingleRoute + discoverAndPersistRoutes store snapshotOfferVersion from the CandidateLeg.
+- reserveRoute() checks: leg.snapshotOfferVersion present (reject LEGACY_ROUTE_SNAPSHOT_MISSING), offer.version === leg.snapshotOfferVersion (reject STALE_ROUTE). All inside the reservation transaction.
+- route_terms_frozen audit event includes offerVersion per leg.
+- Tests: tests/p3-versioning.test.ts (16 assertions) — version increments, unchanged succeeds, version changed rejected, legacy missing rejected, post-reservation frozen, multi-leg atomic rejection, audit includes version.
+- All existing tests pass (collateral 23, P3.6 commitment 22). Lint + type-check clean.
+- Pushed to GitHub (commit 7cb8ca4).
+
+Stage Summary:
+- Offer versioning provides deterministic optimistic concurrency: if a provider changes their offer between route discovery and reservation, the version mismatch is detected and the route is rejected atomically. No mixed economics can be committed.
+- Legacy routes with missing snapshotOfferVersion are rejected with LEGACY_ROUTE_SNAPSHOT_MISSING — no silent fill from the current offer.
+- The committed offer version is recorded in the route_terms_frozen audit event, making the committed market state fully reconstructable.
+- The core execution/economic architecture is now frozen.
