@@ -1006,6 +1006,15 @@ async function completeExecution(executionId: string) {
     eventType: "execution_completed",
     payload: {},
   });
+
+  // Accrue settlement-asset incentive earnings for qualifying completed legs.
+  // This is the ONLY place incentives are "earned" — never at route display.
+  try {
+    const { accrueIncentiveForExecution } = await import("@/lib/provider-api/incentives");
+    await accrueIncentiveForExecution(executionId);
+  } catch (err) {
+    console.error(`[dRamp] incentive accrual error for ${executionId}:`, err);
+  }
 }
 
 // ---- Cancellation --------------------------------------------------------

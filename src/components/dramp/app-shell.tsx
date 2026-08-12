@@ -21,6 +21,9 @@ import { ProvidersPanel } from "./providers-panel";
 import { MonitorPanel } from "./monitor-panel";
 import { AuditPanel } from "./audit-panel";
 import { WaitlistPanel } from "./waitlist-panel";
+import { MarketplacePanel } from "./marketplace-panel";
+import { OpsPanel } from "./ops-panel";
+import { ApiPanel } from "./api-panel";
 import { AuthScreen } from "./auth-screen";
 import { usePolling } from "@/hooks/use-polling";
 import { toast } from "sonner";
@@ -40,19 +43,42 @@ import {
   LogOut,
   ChevronDown,
   ShieldCheck,
+  Store,
+  Gauge,
+  Terminal,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { cn } from "@/lib/utils";
 import type { SeedStatusResponse, MonitorResponse } from "./types";
 
-type TabKey = "send" | "executions" | "providers" | "monitor" | "audit" | "waitlist";
+type TabKey =
+  | "send"
+  | "executions"
+  | "providers"
+  | "marketplace"
+  | "monitor"
+  | "audit"
+  | "ops"
+  | "api"
+  | "waitlist";
 
-const TABS: { key: TabKey; label: string; icon: React.ReactNode; adminOnly?: boolean }[] = [
+interface TabDef {
+  key: TabKey;
+  label: string;
+  icon: React.ReactNode;
+  adminOnly?: boolean;
+  operatorOnly?: boolean; // visible to PROVIDER_OPERATOR + ADMIN
+}
+
+const TABS: TabDef[] = [
   { key: "send", label: "Send", icon: <Send className="size-3.5" /> },
   { key: "executions", label: "Executions", icon: <ListChecks className="size-3.5" /> },
+  { key: "marketplace", label: "Marketplace", icon: <Store className="size-3.5" /> },
   { key: "providers", label: "Providers", icon: <Building2 className="size-3.5" /> },
   { key: "monitor", label: "Monitor", icon: <Activity className="size-3.5" /> },
   { key: "audit", label: "Audit", icon: <ScrollText className="size-3.5" /> },
+  { key: "ops", label: "Ops", icon: <Gauge className="size-3.5" />, adminOnly: true },
+  { key: "api", label: "API", icon: <Terminal className="size-3.5" />, operatorOnly: true },
   { key: "waitlist", label: "Waitlist", icon: <UserCog className="size-3.5" />, adminOnly: true },
 ];
 
@@ -74,6 +100,7 @@ export function AppShell() {
 
   const user = session?.user as any;
   const isAdmin = user?.role === "ADMIN";
+  const isOperator = user?.role === "PROVIDER_OPERATOR";
 
   // Seed status check — poll until seeded, then stop.
   const seedStatus = usePolling<SeedStatusResponse>("/api/seed", 3000);
@@ -160,7 +187,11 @@ export function AppShell() {
     );
   }
 
-  const visibleTabs = TABS.filter((t) => !t.adminOnly || isAdmin);
+  const visibleTabs = TABS.filter((t) => {
+    if (t.adminOnly) return isAdmin;
+    if (t.operatorOnly) return isAdmin || isOperator;
+    return true;
+  });
 
   return (
     <div className="min-h-screen flex flex-col bg-background">
@@ -296,12 +327,25 @@ export function AppShell() {
                 <TabsContent value="providers" className="focus-visible:outline-none">
                   <ProvidersPanel />
                 </TabsContent>
+                <TabsContent value="marketplace" className="focus-visible:outline-none">
+                  <MarketplacePanel />
+                </TabsContent>
                 <TabsContent value="monitor" className="focus-visible:outline-none">
                   <MonitorPanel onJumpToExecution={handleJumpToExecution} />
                 </TabsContent>
                 <TabsContent value="audit" className="focus-visible:outline-none">
                   <AuditPanel />
                 </TabsContent>
+                {isAdmin && (
+                  <TabsContent value="ops" className="focus-visible:outline-none">
+                    <OpsPanel />
+                  </TabsContent>
+                )}
+                {(isAdmin || isOperator) && (
+                  <TabsContent value="api" className="focus-visible:outline-none">
+                    <ApiPanel />
+                  </TabsContent>
+                )}
                 {isAdmin && (
                   <TabsContent value="waitlist" className="focus-visible:outline-none">
                     <WaitlistPanel />

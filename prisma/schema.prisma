@@ -117,6 +117,7 @@ model Execution {
   collateralLocks   CollateralLock[]
   ledgerEntries     LedgerEntry[]
   auditEvents       AuditEvent[]
+  disputes          Dispute[]
 
   @@index([intentId])
   @@index([status])
@@ -200,15 +201,29 @@ model LiquidityProvider {
   capabilities    String   // JSON array
   countries       String   // JSON array
   reputationScore Float
-  status          String   // ACTIVE | SUSPENDED
+  status          String   // APPLIED | REVIEW | APPROVED | ACTIVE | SUSPENDED | REJECTED
   vaultId         String?
   createdAt       DateTime @default(now())
+
+  // Onboarding profile (Prompt 2)
+  jurisdiction      String?
+  contactEmail      String?
+  supportedAssets   String?  // JSON array of asset symbols
+  settlementMethods String?  // JSON array
+  apiIntegrationStatus String? // NONE | PENDING | CONNECTED | FAILED
+  onboardingNote    String?
+  reviewedById      String?
+  reviewedAt        DateTime?
 
   offers          LiquidityOffer[]
   obligations     Obligation[]
   legs            Leg[]
   vault           Vault?
   operators       User[]    @relation("OperatedBy")
+  apiKeys         ApiKey[]
+  webhookEndpoints WebhookEndpoint[]
+  incentiveCampaigns SettlementIncentiveCampaign[]
+  disputes        Dispute[]
 
   @@index([status])
 }
@@ -269,6 +284,8 @@ model SettlementAsset {
   maximumNetworkExposure Decimal?
   status                String   // ACTIVE | INELIGIBLE | DELISTED
   createdAt             DateTime @default(now())
+
+  incentiveCampaigns   SettlementIncentiveCampaign[]
 }
 
 // ---------------------------------------------------------------------------
@@ -419,4 +436,187 @@ model MarketSignal {
   createdAt       DateTime @default(now())
 
   @@index([fired, triggerAt])
+}
+
+// ===========================================================================
+// PROMPT 2 — Open Liquidity Marketplace extensions
+//
+// These models extend the existing domain (never replace it). All economic
+// effects still flow through the existing LedgerEntry, ExecutionIntent,
+// Execution, Route, Leg, Obligation, CollateralLock, and AuditEvent entities.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// P2-1. ApiKey — provider-scoped API credentials for the Open Liquidity API
+// ---------------------------------------------------------------------------
+model ApiKey {
+  id            String   @id @default(cuid())
+  providerId    String
+  provider      LiquidityProvider @relation(fields: [providerId], references: [id])
+  keyId         String   @unique // public identifier (e.g. "pk_live_xxxx")
+  secretHash    String   // bcrypt hash of the secret; plaintext shown once on creation
+  label         String   // human-readable name
+  scopes        String   // JSON array: ["offers","executions","obligations","reconcile"]
+  status        String   @default("ACTIVE") // ACTIVE | REVOKED
+  lastUsedAt    DateTime?
+  createdAt     DateTime @default(now())
+  revokedAt     DateTime?
+
+  @@index([providerId])
+}
+
+// ---------------------------------------------------------------------------
+// P2-2. WebhookEndpoint — outbound webhook configuration per provider
+// ---------------------------------------------------------------------------
+model WebhookEndpoint {
+  id            String   @id @default(cuid())
+  providerId    String
+  provider      LiquidityProvider @relation(fields: [providerId], references: [id])
+  url           String
+  secret        String   // signing secret for HMAC payloads
+  events        String   // JSON array of event types to subscribe to
+  status        String   @default("ACTIVE") // ACTIVE | PAUSED
+  createdAt     DateTime @default(now())
+
+  deliveries    WebhookDelivery[]
+
+  @@index([providerId])
+}
+
+// ---------------------------------------------------------------------------
+// P2-3. WebhookDelivery — retryable, idempotent outbound webhook deliveries
+// ---------------------------------------------------------------------------
+model WebhookDelivery {
+  id            String   @id @default(cuid())
+  endpointId    String
+  endpoint      WebhookEndpoint @relation(fields: [endpointId], references: [id])
+  eventType     String
+  payloadJson   String
+  signature     String   // HMAC-SHA256 of payload
+  status        String   @default("PENDING") // PENDING | DELIVERED | FAILED | RETRYING
+  attempts      Int      @default(0)
+  responseStatus Int?
+  responseBody  String?
+  nextRetryAt   DateTime?
+  createdAt     DateTime @default(now())
+  deliveredAt   DateTime?
+
+  @@index([endpointId, status])
+  @@index([nextRetryAt])
+}
+
+// ---------------------------------------------------------------------------
+// P2-4. SettlementIncentiveCampaign — sponsor-funded incentive programs
+// ---------------------------------------------------------------------------
+model SettlementIncentiveCampaign {
+  id              String   @id @default(cuid())
+  settlementAssetId String
+  settlementAsset SettlementAsset @relation(fields: [settlementAssetId], references: [id])
+  sponsorProviderId String?
+  sponsorProvider  LiquidityProvider? @relation(fields: [sponsorProviderId], references: [id])
+  name            String
+  incentiveBps    Int      // bps subsidy applied to qualifying settlement volume
+  fundingSource   String   // issuer | sponsor | dramp
+  startDate       DateTime
+  endDate         DateTime
+  totalBudget     Decimal  // max total incentive payout (in settlement asset)
+  perTxnCap       Decimal? // max incentive per single execution
+  volumeCap       Decimal? // max qualifying settlement volume
+  accrued         Decimal  @default(0) // earned by completed executions (not yet paid)
+  paid            Decimal  @default(0) // actually credited
+  eligibleCorridors String? // JSON array of "SRC:DST" corridors; null = all
+  eligibleRiskLevels String? // JSON array; null = all
+  eligibleProviderTypes String? // JSON array; null = all
+  status          String   @default("ACTIVE") // DRAFT | ACTIVE | PAUSED | EXHAUSTED | EXPIRED
+  createdAt       DateTime @default(now())
+
+  earnings        IncentiveEarning[]
+
+  @@index([settlementAssetId, status])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// P2-5. IncentiveEarning — tracks accrued incentive per completed execution
+// ---------------------------------------------------------------------------
+model IncentiveEarning {
+  id              String   @id @default(cuid())
+  campaignId      String
+  campaign        SettlementIncentiveCampaign @relation(fields: [campaignId], references: [id])
+  executionId     String
+  providerId      String
+  amount          Decimal
+  status          String   @default("ACCRUED") // ACCRUED | PAID | REVERSED
+  createdAt       DateTime @default(now())
+  paidAt          DateTime?
+
+  @@index([campaignId])
+  @@index([executionId])
+}
+
+// ---------------------------------------------------------------------------
+// P2-6. Dispute — investigation workflow for execution/obligation failures
+// ---------------------------------------------------------------------------
+model Dispute {
+  id              String   @id @default(cuid())
+  executionId     String
+  execution       Execution @relation(fields: [executionId], references: [id])
+  obligationId    String?
+  providerId      String
+  provider        LiquidityProvider @relation(fields: [providerId], references: [id])
+  reason          String
+  description     String?
+  status          String   @default("OPEN") // OPEN | INVESTIGATING | RESOLVED_PROVIDER | RESOLVED_USER | PARTIAL_COMPENSATION | SLASHED | CLOSED
+  resolution      String?
+  compensationAmount Decimal? @default(0)
+  slashedAmount   Decimal? @default(0)
+  openedById      String
+  resolvedById    String?
+  createdAt       DateTime @default(now())
+  resolvedAt      DateTime?
+
+  @@index([executionId])
+  @@index([providerId, status])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// P2-7. ReconciliationItem — discrepancy detection + resolution workflow
+// ---------------------------------------------------------------------------
+model ReconciliationItem {
+  id              String   @id @default(cuid())
+  providerId      String
+  type            String   // MISSING_SETTLEMENT | AMOUNT_MISMATCH | DUPLICATE_SETTLEMENT | STALE_OBLIGATION | BALANCE_DIFFERENCE
+  severity        String   @default("MEDIUM") // LOW | MEDIUM | HIGH
+  status          String   @default("DETECTED") // DETECTED | INVESTIGATING | MATCHED | ADJUSTED | RESOLVED
+  executionId     String?
+  obligationId    String?
+  expectedAmount  Decimal?
+  reportedAmount  Decimal?
+  asset           String?
+  description     String?
+  resolution      String?
+  resolvedById    String?
+  createdAt       DateTime @default(now())
+  resolvedAt      DateTime?
+
+  @@index([providerId, status])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// P2-8. Notification — in-app notifications driven by domain events
+// ---------------------------------------------------------------------------
+model Notification {
+  id              String   @id @default(cuid())
+  userId          String
+  type            String   // ROUTE_FOUND | BETTER_ROUTE | EXECUTION_STARTED | EXECUTION_COMPLETED | CANCELLED | DISPUTE | OBLIGATION | COLLATERAL_WARNING | OFFER_EXPIRING | PROVIDER_OBLIGATION
+  title           String
+  body            String?
+  payloadJson     String?
+  read            Boolean  @default(false)
+  createdAt       DateTime @default(now())
+
+  @@index([userId, read])
+  @@index([createdAt])
 }

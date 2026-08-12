@@ -253,6 +253,13 @@ export interface Provider {
   vault?: ProviderVault | null;
   offers: ProviderOffer[];
   obligations: ProviderObligation[];
+  // Onboarding fields (optional — only included for operators/admins).
+  jurisdiction?: string | null;
+  contactEmail?: string | null;
+  supportedAssets?: string[] | null;
+  settlementMethods?: string[] | null;
+  apiIntegrationStatus?: string | null;
+  onboardingNote?: string | null;
 }
 
 export interface SettlementAsset {
@@ -368,4 +375,344 @@ export interface SeedStatusResponse {
   seeded: boolean;
   needsBootstrap?: boolean;
   settlementAssets: number;
+}
+
+// ---------------------------------------------------------------------------
+// Marketplace
+// ---------------------------------------------------------------------------
+export interface MarketplaceOfferProvider {
+  id: string;
+  name: string;
+  providerType: string;
+  trustModel: string;
+  reputationScore: number;
+}
+
+export interface MarketplaceOffer {
+  id: string;
+  provider: MarketplaceOfferProvider;
+  capability: string;
+  sourceAsset: string;
+  destinationAsset: string;
+  sourceCountry: string;
+  destinationCountry: string;
+  rate: string;
+  feeBps: number;
+  incentiveBps: number;
+  capacityBucket: string; // "none" | "low" | "medium" | "high" | "deep"
+  channelType: string;
+  expectedExecutionSeconds: number;
+  settlementAssetId?: string | null;
+  expiresAt?: string | null;
+  riskIndicator: number;
+}
+
+export interface MarketplaceResponse {
+  offers: MarketplaceOffer[];
+}
+
+export interface PendingDemand {
+  id: string;
+  sourceAsset: string;
+  destinationAsset: string;
+  sourceCountry: string;
+  destinationCountry: string;
+  amountBucket: string; // "<500" | "500-2k" | "2k-10k" | "10k-50k" | "50k+"
+  riskTolerance: string;
+  executionPolicy: string;
+  remainingWaitSeconds: number;
+  elapsedSeconds: number;
+}
+
+export interface PendingDemandResponse {
+  demand: PendingDemand[];
+}
+
+export interface CompetitionLeg {
+  providerName: string;
+  sourceAsset: string;
+  destinationAsset: string;
+  channelType: string;
+  feeBps: number;
+  incentiveBps: number;
+}
+
+export interface CompetitionRoute {
+  tag: string;
+  providerName: string;
+  providerType: string;
+  trustModel: string;
+  effectiveCost: string;
+  netOutput: string;
+  expectedExecutionSeconds: number;
+  hopCount: number;
+  risk: RiskDimensions;
+  explanation: string;
+  legs: CompetitionLeg[];
+}
+
+export interface CompetitionResponse {
+  routes: CompetitionRoute[];
+}
+
+// ---------------------------------------------------------------------------
+// Ops
+// ---------------------------------------------------------------------------
+export interface OpsOverview {
+  totalVolume: number | string;
+  completedCount: number;
+  activeExecutionCount: number;
+  activeProviders: number;
+  availableLiquidity: string;
+  reservedLiquidity: string;
+  aggregateExposure: string;
+  aggregateCollateral: string;
+  unsettledObligations: string;
+  incentiveBudget: string;
+  incentiveAccrued: string;
+  incentivePaid: string;
+}
+
+export interface OpsQueueItem {
+  executionId: string;
+  intentId: string;
+  sourceAsset: string;
+  destinationAsset: string;
+  sourceCountry: string;
+  destinationCountry: string;
+  amount: string;
+  riskTolerance: string;
+  executionPolicy: string;
+  elapsedSeconds: number;
+  remainingWaitSeconds: number;
+  referenceRouteId?: string | null;
+}
+
+export interface OpsQueueResponse {
+  queue: OpsQueueItem[];
+}
+
+export interface OpsCorridorDemand {
+  corridor: string;
+  count: number;
+  totalAmount: number;
+}
+
+export interface OpsProviderNearCapacity {
+  providerName: string;
+  providerType: string;
+  corridor: string;
+  available: string;
+  reserved: string;
+  utilization: number;
+}
+
+export interface OpsManualBottleneck {
+  providerName: string;
+  corridor: string;
+  expectedExecutionSeconds: number;
+}
+
+export interface OpsBottlenecks {
+  corridorDemand: OpsCorridorDemand[];
+  providersNearCapacity: OpsProviderNearCapacity[];
+  manualBottlenecks: OpsManualBottleneck[];
+}
+
+export interface OpsProviderRisk {
+  id: string;
+  name: string;
+  providerType: string;
+  trustModel: string;
+  reputationScore: number;
+  status: string;
+  counterpartyRisk: number;
+  exposure: string;
+  maxExposure: string;
+  utilization: number;
+  activeOffers: number;
+  activeObligations: number;
+  flagged: boolean;
+}
+
+export interface OpsProviderRiskResponse {
+  providers: OpsProviderRisk[];
+}
+
+export interface OpsAssetRisk {
+  id: string;
+  symbol: string;
+  assetType: string;
+  volatilityScore: number;
+  liquidityScore: number;
+  pegQuality: number;
+  incentiveRate: number;
+  riskScore: number;
+  status: string;
+  isEligibleCollateral: boolean;
+  dependentOfferCount: number;
+  providerCount: number;
+}
+
+export interface OpsAssetRiskResponse {
+  assets: OpsAssetRisk[];
+}
+
+export interface OpsConcentrationItem {
+  type?: string;
+  country?: string;
+  asset?: string;
+  count?: number;
+  amount?: string;
+  share?: number;
+}
+
+export interface OpsConcentration {
+  offersByProviderType: OpsConcentrationItem[];
+  offersByCountry: OpsConcentrationItem[];
+  collateralByAsset: OpsConcentrationItem[];
+  totalActiveProviders: number;
+  totalActiveOffers: number;
+}
+
+export interface OpsDispute {
+  id: string;
+  executionId: string;
+  providerId: string;
+  providerName: string;
+  reason: string;
+  description?: string | null;
+  status: string;
+  resolution?: string | null;
+  compensationAmount?: string | null;
+  slashedAmount?: string | null;
+  createdAt: string;
+  resolvedAt?: string | null;
+  corridor: string;
+}
+
+export interface OpsDisputesResponse {
+  disputes: OpsDispute[];
+}
+
+export interface OpsReconciliationItem {
+  id: string;
+  providerId: string;
+  type: string;
+  severity: string;
+  status: string;
+  executionId?: string | null;
+  obligationId?: string | null;
+  expectedAmount?: string | null;
+  reportedAmount?: string | null;
+  asset?: string | null;
+  description?: string | null;
+  resolution?: string | null;
+  resolvedById?: string | null;
+  createdAt: string;
+  resolvedAt?: string | null;
+}
+
+export interface OpsReconciliationResponse {
+  items: OpsReconciliationItem[];
+}
+
+export interface IncentiveCampaign {
+  id: string;
+  name: string;
+  settlementAsset: string;
+  sponsor: string | null;
+  incentiveBps: number;
+  fundingSource: string;
+  startDate: string;
+  endDate: string;
+  totalBudget: string;
+  accrued: string;
+  paid: string;
+  status: string;
+}
+
+export interface IncentivesResponse {
+  campaigns: IncentiveCampaign[];
+}
+
+// ---------------------------------------------------------------------------
+// Provider API management
+// ---------------------------------------------------------------------------
+export interface ApiKey {
+  id: string;
+  keyId: string;
+  label: string;
+  scopes: string[];
+  status: string;
+  lastUsedAt: string | null;
+  createdAt: string;
+  revokedAt: string | null;
+}
+
+export interface ApiKeysResponse {
+  keys: ApiKey[];
+}
+
+export interface CreateApiKeyResponse {
+  keyId: string;
+  secret: string;
+  apiKeyId: string;
+  note: string;
+}
+
+export interface WebhookDelivery {
+  id: string;
+  eventType: string;
+  status: string;
+  attempts: number;
+  deliveredAt: string | null;
+}
+
+export interface WebhookEndpoint {
+  id: string;
+  url: string;
+  events: string[];
+  status: string;
+  createdAt: string;
+  recentDeliveries: WebhookDelivery[];
+}
+
+export interface WebhooksResponse {
+  endpoints: WebhookEndpoint[];
+}
+
+export interface CreateWebhookResponse {
+  id: string;
+  secret: string;
+  note: string;
+}
+
+// ---------------------------------------------------------------------------
+// Onboarding
+// ---------------------------------------------------------------------------
+export interface OnboardingProvider {
+  id: string;
+  name: string;
+  providerType: string;
+  trustModel: string;
+  capabilities?: string[] | string;
+  countries?: string[] | string;
+  reputationScore: number;
+  status: string;
+  jurisdiction?: string | null;
+  contactEmail?: string | null;
+  supportedAssets?: string[] | string | null;
+  settlementMethods?: string[] | string | null;
+  apiIntegrationStatus?: string | null;
+  onboardingNote?: string | null;
+  reviewedAt?: string | null;
+  createdAt: string;
+  vault?: any | null;
+  offers?: any[];
+  operators?: any[];
+}
+
+export interface OnboardingProvidersResponse {
+  providers: OnboardingProvider[];
 }

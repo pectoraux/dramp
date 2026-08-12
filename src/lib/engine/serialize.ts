@@ -128,6 +128,14 @@ export function serializeProvider(p: any) {
     vault: p.vault ? serializeVault(p.vault) : null,
     offers: p.offers ? p.offers.map(serializeOffer) : [],
     obligations: p.obligations ? p.obligations.map(serializeObligation) : [],
+    // Onboarding fields (only meaningful to operators/admins — the providers
+    // route serializes the full view for those roles only).
+    jurisdiction: p.jurisdiction ?? null,
+    contactEmail: p.contactEmail ?? null,
+    supportedAssets: p.supportedAssets ? safeJson(p.supportedAssets) : null,
+    settlementMethods: p.settlementMethods ? safeJson(p.settlementMethods) : null,
+    apiIntegrationStatus: p.apiIntegrationStatus ?? null,
+    onboardingNote: p.onboardingNote ?? null,
   };
 }
 

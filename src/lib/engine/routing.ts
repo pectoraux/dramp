@@ -129,11 +129,28 @@ async function buildGraph(): Promise<Map<string, AdjEdge[]>> {
     where: { active: true },
     include: { provider: true },
   });
+  // Enrich offers with active settlement-incentive campaigns. The offer's own
+  // incentiveBps is the base; the campaign incentive is added if the campaign
+  // is active, within its date window, and has remaining budget. This reuses
+  // the existing incentive integration in computeHopOutput — no parallel
+  // pricing system.
+  const { getApplicableIncentiveBps } = await import("@/lib/provider-api/incentives");
   const adj = new Map<string, AdjEdge[]>();
   const now = new Date();
   for (const o of offers) {
     if (o.expiresAt && o.expiresAt < now) continue;
     if (o.provider.status !== "ACTIVE") continue;
+    // Compute the effective incentive: base offer incentive + active campaign.
+    let effectiveIncentiveBps = o.incentiveBps;
+    if (o.settlementAssetId) {
+      const { bps } = await getApplicableIncentiveBps(o.settlementAssetId, {
+        sourceAsset: o.sourceAsset,
+        destinationAsset: o.destinationAsset,
+        riskTolerance: "", // campaigns don't filter by risk at graph-build time
+        providerType: o.provider.providerType,
+      });
+      effectiveIncentiveBps += bps;
+    }
     const from = nodeKey(o.sourceAsset, o.sourceCountry);
     const to = nodeKey(o.destinationAsset, o.destinationCountry);
     const edge: AdjEdge = {
@@ -155,7 +172,7 @@ async function buildGraph(): Promise<Map<string, AdjEdge[]>> {
         settlementAssetId: o.settlementAssetId,
         channelType: o.channelType,
         expectedExecutionSeconds: o.expectedExecutionSeconds,
-        incentiveBps: o.incentiveBps,
+        incentiveBps: effectiveIncentiveBps,
         active: o.active,
         expiresAt: o.expiresAt,
       },

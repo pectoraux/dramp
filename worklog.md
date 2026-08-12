@@ -231,3 +231,67 @@ Stage Summary:
 - Collateral eligibility is now type-authoritative: a VOLATILE_TOKEN can never be collateral, even if the mutable isEligibleCollateral flag is set true (normalize forces it false at write time, assert throws at lock time, serialize returns false).
 - Intent status is consistently serialized after on-demand advancement: GET /api/intents/[id] re-fetches the intent post-advancement so intent.status and execution.status are always in sync.
 - No routing, state-machine, ledger, or UI behavior changed.
+
+---
+Task ID: P2-UI
+Agent: full-stack-developer
+Task: Build dRamp Prompt 2 UI (marketplace, ops console, provider API panel)
+
+Work Log:
+- Read app-shell.tsx, providers-panel.tsx, monitor-panel.tsx, send-panel.tsx, format.ts, types.ts, serialize.ts and the marketplace/ops/api route handlers to learn exact response shapes and existing styling patterns (dark theme, emerald accent, shadcn New York, dramp-scroll custom scrollbar, sticky footer via min-h-screen flex flex-col + mt-auto).
+- Extended `src/components/dramp/types.ts` with full TS interfaces for every new endpoint: MarketplaceOffer/PendingDemand/CompetitionRoute, OpsOverview/Queue/Bottlenecks/ProviderRisk/AssetRisk/Concentration/Dispute/Reconciliation, IncentiveCampaign, ApiKey/WebhookEndpoint/CreateApiKeyResponse/CreateWebhookResponse, OnboardingProvider. Added optional onboarding fields (jurisdiction, contactEmail, supportedAssets, settlementMethods, apiIntegrationStatus, onboardingNote) to the Provider interface.
+- Updated `src/lib/engine/serialize.ts` serializeProvider() to include the onboarding metadata fields so operators/admins see them in the providers response (ordinary USERs still get the redacted serializeProviderPublic view — no behavior change).
+- Built `src/components/dramp/settlement-asset-registry.tsx` — a reusable collapsible table that polls `/api/settlement-assets` and shows symbol/type/issuer/network/volatility/liquidity/peg/incentive/active offers/active campaigns/collateral-eligibility badge. VOLATILE_TOKEN rows (WETH) are tinted rose and stamped "NOT collateral" — the hard-invariant visual cue. Configurable URL, polling interval, default-open state, and withHeader flag.
+- Built `src/components/dramp/marketplace-panel.tsx` with 4 internal sub-tabs:
+  • Public offers — filter by source/dest asset, sortable table with provider, corridor, capability, rate, fee, incentive, capacity bucket (none/low/medium/high/deep), channel, speed, risk dot. Polls every 4s.
+  • Pending demand — anonymized demand cards with corridor, amount bucket, risk/policy badges, elapsed vs remaining countdown with progress bar (urgent when <60s remaining). Polls every 3s.
+  • Provider competition — corridor query form (source/dest asset+country, amount, risk tolerance) that POSTs to /api/marketplace/competition and renders up to 10 ranked route cards side-by-side, each with provider/type/trust badges, tag, hop count, expected speed, explanation, net output + eff cost metrics, compact risk bars, and full leg breakdown.
+  • Settlement assets — embeds the reusable SettlementAssetRegistry.
+- Built `src/components/dramp/ops-panel.tsx` (admin only) with 10 sub-nav views, all polling live:
+  • Overview — 12 stat cards (totalVolume, completedCount, activeExecutionCount, activeProviders, availableLiquidity, reservedLiquidity, aggregateExposure, aggregateCollateral, unsettledObligations, incentiveBudget, incentiveAccrued, incentivePaid) with semantic accent colors. Polls every 5s.
+  • Queue — waiting intents table with corridor, amount, risk/policy, elapsed, remaining, utilization bar. Long-waiting (>120s) rows tinted rose. Polls every 3s.
+  • Bottlenecks — three side-by-side cards: corridor demand, providers near capacity (>70% util with progress bars), manual bottlenecks.
+  • Provider risk — providers table with counterparty risk dot, exposure/max, utilization bar, offers/obligations, flagged badge. Flagged rows tinted rose.
+  • Asset risk — settlement assets table with volatility/liquidity/peg/incentive/risk score dot, status, collateral eligibility. WETH row tinted rose with "NOT collateral" badge.
+  • Concentration — two summary stat cards + three bar-chart cards: offers by provider type (with share %), offers by country, collateral by asset.
+  • Disputes — dispute cards with reason/status badges, corridor, compensation/slashed amounts, Resolve dialog (resolution type select + compensation/slashed amounts + note) that POSTs to /api/ops/disputes/[id]/resolve.
+  • Reconciliation — recon items with type/severity badges, expected vs reported amounts, Resolve dialog (status + resolution note) that POSTs to /api/ops/reconciliation/[id]/resolve.
+  • Incentives — campaign cards with budget/accrued/paid progress bar, Create campaign dialog (name/asset/incentive bps/funding source/budget/start-end dates) that POSTs to /api/incentives.
+  • Onboarding — pending applications card with Review/Approve/Activate/Reject buttons + full providers table with jurisdiction/contact/API integration status and inline lifecycle Select that PATCHes /api/onboarding/providers/[id].
+- Built `src/components/dramp/api-panel.tsx` (PROVIDER_OPERATOR + ADMIN) with 3 internal sub-tabs:
+  • API keys — keys table (label/keyId/scopes/status/lastUsed/createdAt) with Create key dialog (label + scope chips) and Revoke button. Created secret is shown ONCE in a modal with copy buttons for both keyId and secret, plus a "store securely" warning.
+  • Webhooks — endpoints list with URL, events, status, recent deliveries (eventType/status/attempts/timestamp), Register webhook dialog (URL + event chips). Signing secret shown ONCE in a modal with copy button.
+  • Docs — static Open Liquidity API contract: base URL, auth header, idempotency note, endpoints table (GET/POST/PATCH/DELETE for offers/executions/obligations/reconcile), example curl command with syntax-highlighted code block + copy button, and lifecycle summary.
+  • Admin gets a provider selector at the top; operator auto-binds to session.user.providerId (no selector).
+- Updated `src/components/dramp/provider-card.tsx` to render the onboarding metadata block (jurisdiction, API integration status badge, contact email, supported assets, settlement methods, onboarding note) when those fields are present — i.e. only for operators/admins. Ordinary USERs still see the public redacted view.
+- Updated `src/components/dramp/app-shell.tsx`:
+  • TabKey extended to 9 tabs: send, executions, marketplace, providers, monitor, audit, ops, api, waitlist.
+  • TabDef gains operatorOnly flag (visible to PROVIDER_OPERATOR + ADMIN).
+  • visibleTabs filter respects adminOnly and operatorOnly.
+  • New TabsContent blocks for marketplace (all users), ops (admin only), api (operator+admin) wired to the new panels.
+  • All existing tabs (send/executions/providers/monitor/audit/waitlist) unchanged.
+  • Sticky header + sticky footer preserved (min-h-screen flex flex-col, footer mt-auto).
+- All numbers shown come from API responses (Decimals as strings) — no fabricated metrics. Monetary amounts formatted with 2 decimals, rates 4 decimals, risk scores as colored dots/bars, percentages with 1 decimal.
+- Long lists use `max-h-96 overflow-y-auto dramp-scroll` with sticky table headers. Empty states ("No data") on every view. Skeletons during initial fetch. Toasts (sonner) on every mutation: create key, revoke key, register webhook, resolve dispute, resolve recon, create campaign, approve/reject/activate provider, run competition.
+- ESLint: 0 errors, 0 warnings. TypeScript strict.
+
+Self-verification (agent-browser):
+- Logged in as demo admin (admin@dramp.demo / Demo1234!). Verified all 9 tabs render in the header (Send, Executions, Marketplace, Providers, Monitor, Audit, Ops, API, Waitlist).
+- Marketplace tab: Public offers loaded 12 active offers (Sahara Cash, SwiftPay, OpenSwap, Northbridge, Continental Treasury, etc.) with corridor, rate, fee, capacity bucket, channel, speed, risk dot. Pending demand sub-tab shows anonymized demand cards. Provider competition sub-tab: ran corridor query USD/US → EUR/EU $1000 Balanced → "Found 10 competing routes" toast + 10 ranked route cards rendered with legs and risk bars. Settlement assets sub-tab shows the registry with WETH "NOT collateral" badge.
+- Ops tab: Overview shows 12 stat cards (7 active providers, 720,100 available liquidity, 71,750 aggregate collateral, 7,000 incentive budget, 0 active executions). Provider risk view shows 7 providers with Northbridge flagged. Asset risk view shows 4 assets, WETH row tinted rose with "NOT collateral". Concentration shows offers by type (Bank 2/PSP 1/Stablecoin LP 2/CEX 2/DEX 2/Local Fiat Agent 2/Treasury 1), by country (US 8/EU 8/Global 6/NG 4/PH 1), collateral by asset (USDC 65,000/SC 10,000). Disputes view shows 0 (empty state). Incentives view shows 2 active campaigns with progress bars + Create campaign button. Onboarding view shows 1 pending application (Pacific Rail FX, Market Maker, JP jurisdiction) with Review/Approve/Activate/Reject buttons + full providers table with jurisdiction/contact/API status columns.
+- API tab: Admin sees a provider selector at top. Selected Northbridge → API keys sub-tab lists 2 existing keys (Northbridge API Key + test). Clicked "Create key" → dialog opened with label input + 4 scope chips → entered "Test UI key" → clicked Create → success toast + modal showing "API key created" with Key ID (pk_9c77baa25b668a706a99e71c) and Secret (sk_...) each with copy buttons, plus "store securely" warning. Closed modal → new key visible in table. Webhooks sub-tab shows 1 endpoint (https://mock.northbridge.example/webhooks/dramp, Active, events execution.accepted/execution.rejected). Docs sub-tab renders the full API contract: base URL, auth header, idempotency note, endpoints table, example curl with copy button, lifecycle summary.
+- Providers tab: 8 provider cards now show the onboarding metadata block — "Jurisdiction EU/US/JP/NG/GLOBAL", "API CONNECTED/PENDING/NONE" badge, "Contact ops@...". WETH still shows "NOT collateral" badge in the settlement assets reference.
+- Existing tabs verified working: Send tab → "Preview routes" returns BEST and FASTEST route cards; Audit tab shows "Chain intact"; Waitlist tab shows 2 pending entries with Approve/Reject; Monitor tab polls.
+- Signed out and logged in as Alice (alice@dramp.demo / Demo1234!). Verified only 6 tabs visible: Send, Executions, Marketplace, Providers, Monitor, Audit. Ops, API, and Waitlist are correctly HIDDEN. Marketplace tab works for Alice (12 public offers load, demand cards render). Audit tab shows "0 events" (correct — global audit is admin-only).
+- Signed out and logged in as Operator (operator@dramp.demo / Demo1234!). Verified 7 tabs visible: Send, Executions, Marketplace, Providers, Monitor, Audit, API. Ops and Waitlist are correctly HIDDEN. API tab auto-binds to the operator's provider (Northbridge) — no provider selector shown, keys list loads directly. Providers tab shows full vault detail (Utilization + Holdings) for collateralized providers.
+- Mobile (390×844): tabs collapse to icons, all content scrolls, footer pushes down naturally. Sticky header + footer preserved.
+- Dev server log: only 200 OK responses (and the expected 403 on /api/audit for Alice — admin-only, existing behavior). No 500s, no compile errors, no console errors in the browser. Fast Refresh rebuilds succeed cleanly.
+- ESLint: 0 errors, 0 warnings.
+
+Stage Summary:
+- 4 new panel components delivered: marketplace-panel.tsx, ops-panel.tsx, api-panel.tsx, settlement-asset-registry.tsx (reusable).
+- app-shell.tsx extended to 9 role-gated tabs (Marketplace for all, Ops for admin, API for operator+admin) — all existing tabs unchanged.
+- providers-panel.tsx + provider-card.tsx extended to render onboarding metadata for operators/admins.
+- serializeProvider() extended to include jurisdiction/contactEmail/apiIntegrationStatus/supportedAssets/settlementMethods/onboardingNote.
+- Every view consumes the existing API; no second routing engine / ledger / risk model / state machine was created. All numbers come from real API responses.
+- Browser verification PASSED end-to-end across all three roles (admin, operator, alice). Existing tabs (Send/Executions/Providers/Monitor/Audit/Waitlist) all verified still working.

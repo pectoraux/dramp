@@ -136,89 +136,144 @@ export async function seedDatabase(opts: { reset?: boolean } = {}) {
     throw new Error("Hard invariant violated: WETH must not be eligible collateral");
   }
 
-  // ---- Providers ---------------------------------------------------------
+  // ---- Providers (Prompt 2 network: realistic mock providers) ------------
+  // Onboarding fields populated so the Ops console + provider portal work.
 
   const northbridge = await db.liquidityProvider.create({
     data: {
-      name: "Northbridge Fiat",
-      providerType: PROVIDER_TYPE.LOCAL_FIAT_AGENT,
+      name: "Northbridge Bank",
+      providerType: PROVIDER_TYPE.BANK,
       trustModel: TRUST_MODEL.COLLATERALIZED,
-      capabilities: JSON.stringify([CAPABILITY.FIAT_IN, CAPABILITY.FIAT_OUT, CAPABILITY.CASH, CAPABILITY.BANK_TRANSFER]),
+      capabilities: JSON.stringify([CAPABILITY.FIAT_IN, CAPABILITY.FIAT_OUT, CAPABILITY.BANK_TRANSFER]),
       countries: JSON.stringify(["US", "EU"]),
       reputationScore: 0.85,
       status: "ACTIVE",
+      jurisdiction: "US",
+      contactEmail: "ops@northbridge.example",
+      supportedAssets: JSON.stringify(["USD", "EUR", "USDC"]),
+      settlementMethods: JSON.stringify(["BANK_TRANSFER"]),
+      apiIntegrationStatus: "CONNECTED",
     },
   });
 
   const sahel = await db.liquidityProvider.create({
     data: {
-      name: "Sahel Pay",
-      providerType: PROVIDER_TYPE.LOCAL_FIAT_AGENT,
-      trustModel: TRUST_MODEL.COLLATERALIZED,
+      name: "SwiftPay PSP",
+      providerType: PROVIDER_TYPE.PSP,
+      trustModel: TRUST_MODEL.PRE_FUNDED,
       capabilities: JSON.stringify([CAPABILITY.FIAT_IN, CAPABILITY.FIAT_OUT, CAPABILITY.MOBILE_MONEY]),
-      countries: JSON.stringify(["US", "EU", "PH"]),
-      reputationScore: 0.7,
+      countries: JSON.stringify(["US", "EU", "NG", "PH"]),
+      reputationScore: 0.78,
       status: "ACTIVE",
+      jurisdiction: "EU",
+      contactEmail: "api@swift-pay.example",
+      supportedAssets: JSON.stringify(["USD", "EUR", "NGN", "USDC"]),
+      settlementMethods: JSON.stringify(["MOBILE_MONEY", "BANK_TRANSFER"]),
+      apiIntegrationStatus: "CONNECTED",
     },
   });
 
   const apexBank = await db.liquidityProvider.create({
     data: {
-      name: "Apex Bank",
-      providerType: PROVIDER_TYPE.BANK,
-      trustModel: TRUST_MODEL.INSTITUTIONALLY_TRUSTED,
-      capabilities: JSON.stringify([CAPABILITY.FIAT_IN, CAPABILITY.FIAT_OUT, CAPABILITY.BANK_TRANSFER]),
-      countries: JSON.stringify(["US", "EU"]),
-      reputationScore: 0.95,
-      status: "ACTIVE",
-    },
-  });
-
-  const novapay = await db.liquidityProvider.create({
-    data: {
-      name: "NovaPay PSP",
-      providerType: PROVIDER_TYPE.PSP,
-      trustModel: TRUST_MODEL.PRE_FUNDED,
-      capabilities: JSON.stringify([CAPABILITY.FIAT_IN, CAPABILITY.SETTLEMENT_IN, CAPABILITY.CARD]),
-      countries: JSON.stringify(["US", "EU"]),
-      reputationScore: 0.8,
-      status: "ACTIVE",
-    },
-  });
-
-  const centrex = await db.liquidityProvider.create({
-    data: {
-      name: "Centrex CEX",
-      providerType: PROVIDER_TYPE.CEX,
-      trustModel: TRUST_MODEL.PRE_FUNDED,
-      capabilities: JSON.stringify([CAPABILITY.CEX_EXECUTION, CAPABILITY.SWAP, CAPABILITY.ONCHAIN_TRANSFER]),
-      countries: JSON.stringify(["GLOBAL"]),
-      reputationScore: 0.85,
-      status: "ACTIVE",
-    },
-  });
-
-  const fluidex = await db.liquidityProvider.create({
-    data: {
-      name: "Fluidex DEX",
-      providerType: PROVIDER_TYPE.DEX,
-      trustModel: TRUST_MODEL.NON_CUSTODIAL,
-      capabilities: JSON.stringify([CAPABILITY.DEX_EXECUTION, CAPABILITY.ONCHAIN_SWAP]),
-      countries: JSON.stringify(["GLOBAL"]),
-      reputationScore: 0.75,
-      status: "ACTIVE",
-    },
-  });
-
-  const anchor = await db.liquidityProvider.create({
-    data: {
-      name: "Anchor Stable LP",
+      name: "Meridian Liquidity",
       providerType: PROVIDER_TYPE.STABLECOIN_LP,
       trustModel: TRUST_MODEL.COLLATERALIZED,
       capabilities: JSON.stringify([CAPABILITY.SETTLEMENT_IN, CAPABILITY.SETTLEMENT_OUT, CAPABILITY.ONCHAIN_TRANSFER, CAPABILITY.FIAT_IN]),
       countries: JSON.stringify(["GLOBAL", "US", "EU"]),
       reputationScore: 0.9,
       status: "ACTIVE",
+      jurisdiction: "US",
+      contactEmail: "treasury@meridian-lp.example",
+      supportedAssets: JSON.stringify(["USDC", "EURC", "SC"]),
+      settlementMethods: JSON.stringify(["ONCHAIN_TRANSFER"]),
+      apiIntegrationStatus: "CONNECTED",
+    },
+  });
+
+  const novapay = await db.liquidityProvider.create({
+    data: {
+      name: "Atlas Exchange",
+      providerType: PROVIDER_TYPE.CEX,
+      trustModel: TRUST_MODEL.PRE_FUNDED,
+      capabilities: JSON.stringify([CAPABILITY.CEX_EXECUTION, CAPABILITY.SWAP, CAPABILITY.ONCHAIN_TRANSFER]),
+      countries: JSON.stringify(["GLOBAL"]),
+      reputationScore: 0.85,
+      status: "ACTIVE",
+      jurisdiction: "EU",
+      contactEmail: "api@atlas-exchange.example",
+      supportedAssets: JSON.stringify(["USDC", "EURC", "WETH"]),
+      settlementMethods: JSON.stringify(["ONCHAIN_TRANSFER"]),
+      apiIntegrationStatus: "CONNECTED",
+    },
+  });
+
+  const centrex = await db.liquidityProvider.create({
+    data: {
+      name: "OpenSwap",
+      providerType: PROVIDER_TYPE.DEX,
+      trustModel: TRUST_MODEL.NON_CUSTODIAL,
+      capabilities: JSON.stringify([CAPABILITY.DEX_EXECUTION, CAPABILITY.ONCHAIN_SWAP]),
+      countries: JSON.stringify(["GLOBAL"]),
+      reputationScore: 0.75,
+      status: "ACTIVE",
+      jurisdiction: "GLOBAL",
+      contactEmail: "info@openswap.example",
+      supportedAssets: JSON.stringify(["USDC", "EURC", "WETH"]),
+      settlementMethods: JSON.stringify(["ONCHAIN_SWAP"]),
+      apiIntegrationStatus: "CONNECTED",
+    },
+  });
+
+  const fluidex = await db.liquidityProvider.create({
+    data: {
+      name: "Sahara Cash",
+      providerType: PROVIDER_TYPE.LOCAL_FIAT_AGENT,
+      trustModel: TRUST_MODEL.COLLATERALIZED,
+      capabilities: JSON.stringify([CAPABILITY.FIAT_IN, CAPABILITY.FIAT_OUT, CAPABILITY.CASH, CAPABILITY.MOBILE_MONEY]),
+      countries: JSON.stringify(["US", "EU", "NG"]),
+      reputationScore: 0.7,
+      status: "ACTIVE",
+      jurisdiction: "NG",
+      contactEmail: "ops@sahara-cash.example",
+      supportedAssets: JSON.stringify(["USD", "EUR", "NGN"]),
+      settlementMethods: JSON.stringify(["CASH", "MOBILE_MONEY"]),
+      apiIntegrationStatus: "PENDING",
+    },
+  });
+
+  const anchor = await db.liquidityProvider.create({
+    data: {
+      name: "Continental Treasury",
+      providerType: PROVIDER_TYPE.TREASURY,
+      trustModel: TRUST_MODEL.INSTITUTIONALLY_TRUSTED,
+      capabilities: JSON.stringify([CAPABILITY.FIAT_IN, CAPABILITY.FIAT_OUT, CAPABILITY.SETTLEMENT_IN, CAPABILITY.SETTLEMENT_OUT, CAPABILITY.BANK_TRANSFER]),
+      countries: JSON.stringify(["US", "EU", "NG"]),
+      reputationScore: 0.95,
+      status: "ACTIVE",
+      jurisdiction: "US",
+      contactEmail: "treasury@continental.example",
+      supportedAssets: JSON.stringify(["USD", "EUR", "NGN", "USDC"]),
+      settlementMethods: JSON.stringify(["BANK_TRANSFER"]),
+      apiIntegrationStatus: "CONNECTED",
+    },
+  });
+
+  // A pending provider application (for the Ops onboarding demo).
+  await db.liquidityProvider.create({
+    data: {
+      name: "Pacific Rail FX",
+      providerType: PROVIDER_TYPE.MARKET_MAKER,
+      trustModel: TRUST_MODEL.COLLATERALIZED,
+      capabilities: JSON.stringify([CAPABILITY.SWAP, CAPABILITY.FX]),
+      countries: JSON.stringify(["US", "EU", "JP"]),
+      reputationScore: 0.6,
+      status: "APPLIED",
+      jurisdiction: "JP",
+      contactEmail: "apply@pacific-rail.example",
+      supportedAssets: JSON.stringify(["USD", "EUR", "JPY", "USDC"]),
+      settlementMethods: JSON.stringify(["BANK_TRANSFER"]),
+      apiIntegrationStatus: "NONE",
+      onboardingNote: "Market maker seeking to provide USD/JPY/EUR liquidity.",
     },
   });
 
@@ -396,11 +451,71 @@ export async function seedDatabase(opts: { reset?: boolean } = {}) {
     data: { email: "lucia.rivera@example.com", name: "Lucia Rivera", requestedRole: "PROVIDER_OPERATOR", status: "PENDING", note: "Fiat agent in Mexico." },
   });
 
+  // ---- Prompt 2: incentive campaign + API key + webhook ------------------
+  // An active EURC incentive campaign (40 bps, $5000 budget).
+  await db.settlementIncentiveCampaign.create({
+    data: {
+      settlementAssetId: eurc.id,
+      sponsorProviderId: null,
+      name: "EURC Summer Settlement Incentive",
+      incentiveBps: 40,
+      fundingSource: "issuer",
+      startDate: new Date(Date.now() - 86400000),
+      endDate: new Date(Date.now() + 30 * 86400000),
+      totalBudget: new Decimal(5000),
+      perTxnCap: new Decimal(100),
+      volumeCap: null,
+      eligibleCorridors: null,
+      eligibleRiskLevels: JSON.stringify(["BALANCED", "LOWEST_COST"]),
+      eligibleProviderTypes: null,
+      status: "ACTIVE",
+      accrued: new Decimal(0),
+      paid: new Decimal(0),
+    },
+  });
+  // An active SC incentive campaign (smaller, to show competition).
+  await db.settlementIncentiveCampaign.create({
+    data: {
+      settlementAssetId: sc.id,
+      sponsorProviderId: apexBank.id,
+      name: "SC Internal Settlement Reward",
+      incentiveBps: 25,
+      fundingSource: "sponsor",
+      startDate: new Date(Date.now() - 86400000),
+      endDate: new Date(Date.now() + 60 * 86400000),
+      totalBudget: new Decimal(2000),
+      perTxnCap: new Decimal(50),
+      volumeCap: null,
+      eligibleCorridors: null,
+      eligibleRiskLevels: null,
+      eligibleProviderTypes: null,
+      status: "ACTIVE",
+      accrued: new Decimal(0),
+      paid: new Decimal(0),
+    },
+  });
+
+  // API key for the demo operator's provider (Northbridge).
+  const { createApiKey } = await import("@/lib/provider-api/auth");
+  const apiKeyResult = await createApiKey(northbridge.id, "Northbridge API Key", ["offers", "executions", "obligations", "reconcile"]);
+
+  // Webhook endpoint for Northbridge.
+  await db.webhookEndpoint.create({
+    data: {
+      providerId: northbridge.id,
+      url: "https://mock.northbridge.example/webhooks/dramp",
+      secret: "whsec_demo_northbridge_001",
+      events: JSON.stringify(["execution.accepted", "execution.rejected", "execution.completed", "obligation.created"]),
+      status: "ACTIVE",
+    },
+  });
+
   return {
     seeded: true,
-    providers: 7,
+    providers: 8,
     settlementAssets: 4,
-    offers: 12,
+    offers: 13,
+    incentiveCampaigns: 2,
     aliceId: alice.id,
     adminId: admin.id,
     operatorId: operator.id,
@@ -411,6 +526,7 @@ export async function seedDatabase(opts: { reset?: boolean } = {}) {
       demoAdmin: { email: "admin@dramp.demo", password: "Demo1234!", role: "ADMIN" },
       realAdmin: { email: "ekontetevi@gmail.com", password: "Payswap123456", role: "ADMIN" },
     },
+    providerApiKey: { keyId: apiKeyResult.keyId, secret: apiKeyResult.secret, note: "Use as Bearer pk_xxx:sk_xxx in the Open Liquidity API. Store securely." },
     note: "Volatile asset WETH is NEVER eligible collateral (hard invariant enforced).",
   };
 }

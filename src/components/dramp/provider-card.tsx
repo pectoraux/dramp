@@ -114,6 +114,33 @@ export function ProviderCard({ provider }: ProviderCardProps) {
             </div>
           </div>
 
+          {/* Onboarding metadata (operators/admins only — present when the API
+              returns the full provider view). */}
+          {(provider.jurisdiction || provider.contactEmail || provider.apiIntegrationStatus || (provider.supportedAssets && provider.supportedAssets.length > 0)) && (
+            <div className="rounded-md border bg-muted/20 p-2 text-[10px] space-y-1">
+              <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
+                {provider.jurisdiction && (
+                  <div className="text-muted-foreground">Jurisdiction <span className="font-mono text-foreground">{provider.jurisdiction}</span></div>
+                )}
+                {provider.apiIntegrationStatus && (
+                  <div className="text-muted-foreground">API <Badge variant="outline" className={cn("text-[9px] py-0 h-3.5 ml-1", provider.apiIntegrationStatus === "CONNECTED" ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300" : provider.apiIntegrationStatus === "PENDING" ? "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-300" : "border-zinc-500/40 bg-zinc-500/10 text-zinc-600 dark:text-zinc-300")}>{provider.apiIntegrationStatus}</Badge></div>
+                )}
+                {provider.contactEmail && (
+                  <div className="text-muted-foreground col-span-2 truncate">Contact <span className="font-mono text-foreground">{provider.contactEmail}</span></div>
+                )}
+                {provider.supportedAssets && provider.supportedAssets.length > 0 && (
+                  <div className="text-muted-foreground col-span-2">Assets <span className="font-mono text-foreground">{provider.supportedAssets.join(", ")}</span></div>
+                )}
+                {provider.settlementMethods && provider.settlementMethods.length > 0 && (
+                  <div className="text-muted-foreground col-span-2">Methods <span className="font-mono text-foreground">{provider.settlementMethods.map(prettyEnum).join(", ")}</span></div>
+                )}
+              </div>
+              {provider.onboardingNote && (
+                <div className="text-muted-foreground italic mt-1">"{provider.onboardingNote}"</div>
+              )}
+            </div>
+          )}
+
           {/* Vault */}
           {provider.vault && <VaultCard vault={provider.vault} />}
 
