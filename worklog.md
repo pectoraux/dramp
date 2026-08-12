@@ -421,3 +421,32 @@ Stage Summary:
 - serializeProvider + serializeProviderPublic extended to include the `tier` field.
 - Every view consumes the existing API; no second reputation system / routing engine / pricing engine / ledger was created. All numbers come from real API responses (Decimals as strings).
 - Browser verification PASSED end-to-end across all three roles (admin, operator, alice). Existing tabs (Send/Executions/Marketplace/Providers/Monitor/Audit/Ops/API/Waitlist) all verified still working.
+
+---
+Task ID: P3-Core
+Agent: main (Z.ai Code)
+Task: Prompt 3 — network economics, reputation & liquidity competition. Make dRamp economically intelligent: provider reputation from observable behavior, reputation affects route ranking, liquidity commitments, market intelligence, provider economics from ledger. No second reputation/routing/pricing/ledger system.
+
+Work Log:
+- Schema: 5 new models (ProviderPerformanceSnapshot, LiquidityCommitment, ProviderCorridorScore, QuoteWinLoss, NetworkFeeConfig) + tier/tierUpdatedAt on LiquidityProvider. Pushed to Neon.
+- ReputationService: 7 explainable components (reliability, speed, liquidityQuality, pricing, disputes, operational, history), time-weighted decay (<7d=1.0, 7-30d=0.5, 30-90d=0.25, older=0.1), anti-gaming (min $50 volume for meaningful executions), tier derivation (PREMIUM needs rep≥85 + 10 execs + 30d + no slashes). getReputationMap() for batch computation.
+- ProviderPerformanceService: records execution outcomes on completion (hooked into completeExecution), updates per-provider-per-corridor scores (ProviderCorridorScore), performance snapshots.
+- LiquidityCommitmentService: create/sample/list commitments, reliability tracking (samples/samplesMet/reliabilityPct), breach detection.
+- MarketIntelligenceService: demand pressure (aggregated pending WAIT_FOR_BETTER intents by corridor), liquidity gaps (demand - supply), provider opportunities (high demand + low supply = HIGH opportunity), pricing intelligence (median/cheapest/fastest per corridor), quote win/loss analytics.
+- ProviderEconomicsService: earnings from ledger entries (FEE, INCENTIVE, SLASH, COMPENSATION, REFUND), capital efficiency (earnings/liquidity, capital turnover), provider statements (reconcile against ledger).
+- NetworkHealthService: transparent health score (liquidityDepth, routeCompetition, providerReliability, executionSuccess, riskConcentration), unit economics (per-corridor volume/fees/take-rate), acquisition funnel (applied→approved→connected→published→received→completed→repeat with conversion rates).
+- Routing integration: rankAndTag now accepts reputationMap, includes reputation as 15% weight in composite score. NEVER overrides hard constraints. findRoutes fetches reputation via getReputationMap() before ranking. Route explanations mention "provider reliability".
+- API routes: 15+ new endpoints under /api/economics/ and /api/commitments/.
+- Seed: provider tiers set (Continental=PREMIUM, Meridian=TRUSTED, Northbridge/SwiftPay/Atlas=VERIFIED, OpenSwap/Sahara=NEW). Cleanup order fixed for new FK constraints.
+- UI: 11 new components (economics-panel, reputation-explorer, opportunity-feed, pricing-intelligence, provider-economics-view, provider-statement, quote-winloss, network-health-view, unit-economics-view, acquisition-funnel, commitments-panel). Economics tab added with 9 role-gated sub-nav views. Provider cards show tier badges. Ops panel has 3 new sub-nav items.
+- Tests: tests/p3-economics.test.ts (72 assertions) — reputation components (7 dimensions + overall + tier + decay note), routing integration (hard constraints still reject WETH, route explanations mention reliability), provider economics from ledger, network health transparency, commitments CRUD + sampling, provider tiers, funnel monotonicity. All pass.
+- All existing tests still pass (collateral 23, hardening 28). Lint + type-check clean.
+- Pushed to GitHub (commit c51c7b0).
+
+Stage Summary:
+- The flywheel is now visible: more providers → more liquidity → better execution → more demand → more flow → more earnings → more providers. And within that: reliable liquidity → better outcomes → higher reputation → better routing priority → more flow → more earnings.
+- Reputation is explainable: "Why is this provider rated 91?" → shows 7 component scores with a progress bar for each.
+- Reputation affects routing: a highly reputable provider gets a modest 15% ranking advantage, but an expensive route cannot magically become cheapest. Hard constraints always win.
+- Providers can see where demand exists (opportunity feed), how competitive their pricing is (pricing intelligence), how much they earn and why (provider economics from ledger), and how productive their capital is (capital efficiency).
+- The network health score is transparent: liquidityDepth + routeCompetition + providerReliability + executionSuccess + riskConcentration, each 0-100.
+- The acquisition funnel tracks: applied → approved → connected → published → received execution → completed → repeat, with conversion rates.
