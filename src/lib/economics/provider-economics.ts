@@ -67,8 +67,14 @@ export async function getProviderEconomics(providerId: string): Promise<any> {
   const completed = legs.filter((l) => l.execution?.status === "COMPLETED").length;
 
   // Capital efficiency: earnings per unit of deployed capital.
-  const totalEarnings = executionFees + incentives + rebates;
-  const earningsPerLiquidity = committedCapital > 0 ? totalEarnings / committedCapital : 0;
+  // netEarnings = gross earnings (fees + incentives + rebates)
+  //               - gross costs (penalties + slashing)
+  // compensation and refunds are categorized separately (they are not
+  // deductions from earnings — they are separate economic events).
+  const grossEarnings = executionFees + incentives + rebates;
+  const grossCosts = penalties + slashing;
+  const netEarnings = grossEarnings - grossCosts;
+  const earningsPerLiquidity = committedCapital > 0 ? netEarnings / committedCapital : 0;
   const capitalTurnover = committedCapital > 0
     ? legs.reduce((s, l) => s + Number(l.amount.toString()), 0) / committedCapital
     : 0;
@@ -81,7 +87,9 @@ export async function getProviderEconomics(providerId: string): Promise<any> {
       penalties: penalties.toFixed(2),
       slashing: slashing.toFixed(2),
       compensation: compensation.toFixed(2),
-      netEarnings: totalEarnings.toFixed(2),
+      grossEarnings: grossEarnings.toFixed(2),
+      grossCosts: grossCosts.toFixed(2),
+      netEarnings: netEarnings.toFixed(2),
     },
     capital: {
       committed: committedCapital.toFixed(2),
@@ -100,6 +108,7 @@ export async function getProviderEconomics(providerId: string): Promise<any> {
     efficiency: {
       earningsPerLiquidity: earningsPerLiquidity.toFixed(6),
       capitalTurnover: Math.round(capitalTurnover * 100) / 100,
+      netEarnings: netEarnings.toFixed(2),
       note: "Prototype analytics — based on simulated valuations.",
     },
   };

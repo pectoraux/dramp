@@ -59,15 +59,17 @@ export async function getDemandPressure(): Promise<any[]> {
   return result.sort((a, b) => Math.abs(b.gap) - Math.abs(a.gap));
 }
 
+// Calculate route-feasible supply for a specific corridor.
+// Only offers that match BOTH source AND destination asset count — generic
+// offers that merely share the source asset do NOT count as direct supply
+// for the requested corridor. This prevents misleading liquidity-gap numbers.
 async function getCorridorSupply(srcAsset: string, dstAsset: string, srcCountry: string, dstCountry: string): Promise<number> {
   const offers = await db.liquidityOffer.findMany({
     where: {
       active: true,
       provider: { status: "ACTIVE" },
-      OR: [
-        { sourceAsset: srcAsset, destinationAsset: dstAsset },
-        { sourceAsset: srcAsset }, // any offer that takes the source asset
-      ],
+      sourceAsset: srcAsset,
+      destinationAsset: dstAsset,
     },
     select: { availableCapacity: true, reservedCapacity: true },
   });

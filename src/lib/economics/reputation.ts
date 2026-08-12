@@ -61,20 +61,40 @@ export async function getProviderReputation(providerId: string): Promise<Reputat
   const disputes = await db.dispute.count({ where: { providerId, createdAt: { gte: cutoff90d } } });
   const slashes = await db.dispute.count({ where: { providerId, status: "SLASHED", createdAt: { gte: cutoff90d } } });
 
-  // Compute weighted metrics.
+  // Compute weighted metrics — ANTI-GAMING: only transactions >= $50
+  // (MEANINGFUL_THRESHOLD) contribute to reputation components. Each
+  // meaningful transaction is weighted by sqrt(volume / base) × recency_decay,
+  // so a thousand $1 transactions have zero effect, and a single huge
+  // transaction doesn't dominate either (sqrt dampens large values).
+  const MEANINGFUL_THRESHOLD = 50;
+  const VALUE_BASE = 100; // $100 = weight 1.0 (before recency)
   let totalWeight = 0;
   let weightedCompleted = 0;
   let weightedFailed = 0;
   let weightedCancelled = 0;
   let weightedDurationSum = 0;
   let weightedDurationCount = 0;
-  let meaningfulExecutions = 0; // anti-gaming: only count transactions >= $50
+  let meaningfulExecutions = 0;
 
   for (const leg of legs) {
     const exec = leg.execution;
     if (!exec) continue;
+    const volume = Number(leg.amount.toString());
+
+    // Anti-gaming: skip sub-threshold transactions entirely.
+    // They do NOT contribute to reliability, speed, disputes, or operational
+    // scores — only meaningful transactions (≥ $50) count.
+    if (volume < MEANINGFUL_THRESHOLD) continue;
+
+    meaningfulExecutions++;
     const ageMs = now - exec.startedAt.getTime();
-    const weight = decayWeight(ageMs);
+    const recency = decayWeight(ageMs);
+    // Value weighting: sqrt(volume / base) × recency. This ensures:
+    //   - $50 tx → sqrt(0.5) ≈ 0.71 × recency
+    //   - $100 tx → 1.0 × recency
+    //   - $10,000 tx → sqrt(100) = 10 × recency (capped at 3.0 to prevent dominance)
+    const valueWeight = Math.min(3.0, Math.sqrt(volume / VALUE_BASE));
+    const weight = valueWeight * recency;
     totalWeight += weight;
 
     if (exec.status === "COMPLETED") weightedCompleted += weight;
@@ -85,12 +105,6 @@ export async function getProviderReputation(providerId: string): Promise<Reputat
       const durationSec = (exec.completedAt.getTime() - exec.startedAt.getTime()) / 1000;
       weightedDurationSum += durationSec * weight;
       weightedDurationCount += weight;
-    }
-
-    // Anti-gaming: only count meaningful volume (>= $50 equivalent).
-    const volume = Number(leg.amount.toString());
-    if (volume >= 50) {
-      meaningfulExecutions += 1;
     }
   }
 
@@ -164,7 +178,7 @@ export async function getProviderReputation(providerId: string): Promise<Reputat
       history: Math.round(history),
       overall,
       sampleSize: meaningfulExecutions,
-      decayNote: "Weighted by recency: <7d full weight, 7-30d 0.5×, 30-90d 0.25×.",
+      decayNote: "Anti-gaming: only transactions ≥ $50 count. Weighted by sqrt(value/$100) × recency (<7d=1.0, 7-30d=0.5, 30-90d=0.25).",
     },
     tier,
     tierReason,
@@ -238,4 +252,19 @@ export async function getCorridorScore(
     },
   });
   return score ? score.score : 0.5;
+}
+
+// Batch compute corridor scores for ALL provider+corridor combinations.
+// Returns a map keyed by "providerId:srcAsset:dstAsset:srcCountry:dstCountry".
+// Used by the routing engine to look up corridor-specific reputation.
+export async function getCorridorScoreMap(): Promise<Map<string, number>> {
+  const scores = await db.providerCorridorScore.findMany({
+    select: { providerId: true, sourceAsset: true, destinationAsset: true, sourceCountry: true, destinationCountry: true, score: true },
+  });
+  const map = new Map<string, number>();
+  for (const s of scores) {
+    const key = `${s.providerId}:${s.sourceAsset}:${s.destinationAsset}:${s.sourceCountry}:${s.destinationCountry}`;
+    map.set(key, s.score);
+  }
+  return map;
 }

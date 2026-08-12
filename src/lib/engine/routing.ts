@@ -481,7 +481,7 @@ function requireSettlementAssetRisk(input: ReturnType<typeof settlementAssetRisk
 // overrides hard constraints. A highly reputable provider gets a small
 // ranking advantage; an expensive route does not magically become cheapest.
 
-function rankAndTag(routes: CandidateRoute[], riskTolerance: string, reputationMap?: Map<string, number>): CandidateRoute[] {
+function rankAndTag(routes: CandidateRoute[], riskTolerance: string, reputationMap?: Map<string, number>, corridorScores?: Map<string, number>, commitmentReliability?: Map<string, number>): CandidateRoute[] {
   const valid = routes.filter((r) => !r.hardFilterRejection);
   if (valid.length === 0) return routes;
 
@@ -489,17 +489,40 @@ function rankAndTag(routes: CandidateRoute[], riskTolerance: string, reputationM
   const fastest = [...valid].sort((a, b) => a.expectedExecutionSeconds - b.expectedExecutionSeconds)[0];
   const safest = [...valid].sort((a, b) => a.risk.composite - b.risk.composite)[0];
 
-  // Best: weighted by risk tolerance + reputation
+  // Best: weighted by risk tolerance + reputation + corridor + commitment
   const weights = weightFor(riskTolerance);
 
-  // Compute the min/max reputation across candidates for normalization.
-  // If no reputationMap is provided, all routes get neutral (0.5) reputation.
+  // Compute route-level reputation across ALL material legs (not just legs[0]).
+  // For each leg, use corridor-specific score when available, falling back to
+  // the provider's global reputation. The route's combined reputation is the
+  // weighted average across legs, but penalized by the weakest leg (a chain is
+  // only as strong as its weakest link for reliability).
   const repScores = valid.map((r) => {
-    const firstLegProvider = r.legs[0]?.providerId;
-    return firstLegProvider ? (reputationMap?.get(firstLegProvider) ?? 0.5) : 0.5;
+    if (r.legs.length === 0) return 0.5;
+    const legScores = r.legs.map((l) => {
+      // Try corridor-specific score first.
+      const corridorKey = `${l.providerId}:${l.sourceAsset}:${l.destinationAsset}:${l.sourceCountry}:${l.destinationCountry}`;
+      const corridorScore = corridorScores?.get(corridorKey);
+      if (corridorScore !== undefined) return corridorScore;
+      // Fall back to global reputation.
+      return reputationMap?.get(l.providerId) ?? 0.5;
+    });
+    // Combined reputation: 70% weighted average + 30% minimum (weakest-leg penalty).
+    // This ensures a multi-leg route with a weak intermediate provider is penalized.
+    const avg = legScores.reduce((s, x) => s + x, 0) / legScores.length;
+    const minScore = Math.min(...legScores);
+    return avg * 0.7 + minScore * 0.3;
   });
   const repMax = Math.max(...repScores, 0.5);
   const repMin = Math.min(...repScores, 0.5);
+
+  // Compute commitment reliability boost per route (from the first leg's provider).
+  // A committed provider gets a modest reliability boost — it promises to maintain
+  // liquidity, which is more valuable than ephemeral liquidity.
+  const commitBoost = valid.map((r) => {
+    const firstProvider = r.legs[0]?.providerId;
+    return firstProvider ? (commitmentReliability?.get(firstProvider) ?? 0) : 0;
+  });
 
   const scored = valid.map((r, idx) => {
     // Normalize each axis to 0..1 across the candidate set.
@@ -514,8 +537,13 @@ function rankAndTag(routes: CandidateRoute[], riskTolerance: string, reputationM
     const normRisk = riskMax === riskMin ? 0 : (r.risk.composite - riskMin) / (riskMax - riskMin);
     // Reputation: higher = better, so we invert (1 - normalized) to get a penalty.
     const normRep = repMax === repMin ? 0 : (repMax - repScores[idx]) / (repMax - repMin);
+    // Commitment reliability boost: reduces the reputation penalty by up to 20%
+    // for providers with high commitment reliability. This is a MODEST nudge —
+    // it never overrides hard constraints or makes a bad route appear good.
+    const commitReduction = commitBoost[idx] * 0.2;
+    const adjustedRepPenalty = weights.reputation * normRep * (1 - commitReduction);
     // score = 1 - weighted penalty (higher is better)
-    const penalty = weights.cost * normCost + weights.speed * normDur + weights.risk * normRisk + weights.reputation * normRep;
+    const penalty = weights.cost * normCost + weights.speed * normDur + weights.risk * normRisk + adjustedRepPenalty;
     return { route: r, score: 1 - penalty };
   });
   const best = scored.sort((a, b) => b.score - a.score)[0].route;
@@ -668,21 +696,24 @@ export async function findRoutes(input: FindRoutesInput): Promise<CandidateRoute
   };
   const filtered = candidates.map((c) => applyHardFilters(c, ctx));
 
-  // Fetch provider reputation map for ranking integration.
-  // Reputation is a modest factor that nudges ranking but never overrides
-  // hard constraints. Uses a dynamic import to avoid a circular dependency
-  // (routing.ts → reputation.ts → routing.ts is not a cycle, but the import
-  // keeps the module graph clean).
+  // Fetch provider reputation + corridor scores + commitment reliability for
+  // ranking integration. All are modest factors that nudge ranking but never
+  // override hard constraints.
   let reputationMap: Map<string, number> | undefined;
+  let corridorScoreMap: Map<string, number> | undefined;
+  let commitmentReliabilityMap: Map<string, number> | undefined;
   try {
-    const { getReputationMap } = await import("@/lib/economics/reputation");
+    const { getReputationMap, getCorridorScoreMap } = await import("@/lib/economics/reputation");
+    const { getCommitmentReliabilityMap } = await import("@/lib/economics/commitments");
     reputationMap = await getReputationMap();
+    corridorScoreMap = await getCorridorScoreMap();
+    commitmentReliabilityMap = await getCommitmentReliabilityMap();
   } catch {
     // If reputation service is unavailable, fall back to neutral scores.
   }
 
-  // Rank and tag (with reputation as a factor)
-  return rankAndTag(filtered, input.riskTolerance, reputationMap);
+  // Rank and tag (with reputation + corridor + commitment as factors)
+  return rankAndTag(filtered, input.riskTolerance, reputationMap, corridorScoreMap, commitmentReliabilityMap);
 }
 
 // Quick helper used by the engine ticker to check whether a *better* route
