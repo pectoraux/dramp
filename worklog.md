@@ -339,3 +339,27 @@ Stage Summary:
 - volumeCap is enforced cumulatively: the campaign tracks qualifiedVolume and stops paying incentives once the cap is reached.
 - Incentive accrual is concurrency-safe: a unique constraint on (campaignId, executionId, providerId) prevents duplicates; budget + volume reservation happen atomically via conditional updates; two concurrent completions cannot overspend a campaign.
 - Dispute slashing is amount-aware: the actual collateral deduction equals the approved slashedAmount, never implicitly slashes an entire execution's locked collateral. Rejects amounts above eligible collateral, zero/negative amounts, and double resolution.
+
+---
+Task ID: P2.2-Accounting
+Agent: main (Z.ai Code)
+Task: Fix incentive budget accounting semantics (remaining = totalBudget - accrued, not - accrued - paid). Add concurrent accrual tests for budget + volume caps. Add partial-slash collateral-release regression test. No routing/provider-API/state-machine/marketplace changes.
+
+Work Log:
+- Fixed budget formula in 4 locations: getApplicableIncentiveBps, tryAccrueLeg (budget enforcement + post-accrual exhaustion check), accrueWithCappedVolume, getCampaignStats. All now use remainingBudget = totalBudget - accrued (paid is a subset of accrued, not additional consumption).
+- getCampaignStats now exposes unpaidAccrued = accrued - paid as a separate field.
+- ops overview now exposes incentiveRemaining + incentiveUnpaidAccrued.
+- Documented accounting semantics in the module header.
+- Increased MAX_RETRIES from 3 to 5 with exponential backoff (50ms × attempt) for concurrent accrual conflict resolution.
+- Tests: tests/p2-accounting.test.ts (21 assertions, direct DB):
+  - Budget accounting: verified remaining = 70 when accrued=30, paid=30 (not 40). unpaidAccrued = 0. After accruing $20 more: remaining=50, unpaidAccrued=20.
+  - Concurrent budget: 10 parallel accruals against $100 budget (each earns $20). accrued = exactly $100, 5 earnings created. Budget never overspent.
+  - Concurrent volume cap: 10 parallel accruals against 5000 volume cap (each 1000 volume). qualifiedVolume = exactly 5000.
+  - Partial slash: $1000 locked, slash $100. usable decreases by exactly $100. locked=0 (all locks released). $900 released back. SLASH ledger entry for exact $100.
+- All existing tests still pass (collateral 23, hardening 28). Lint + type-check clean.
+- Pushed to GitHub (commit 1577a65).
+
+Stage Summary:
+- Incentive budget accounting is now correct: remainingBudget = totalBudget - accrued. paid is a disbursement of already-accrued earnings, not an additional consumption. No double-counting.
+- Concurrent accrual is proven safe: 10 parallel accruals against a tight budget result in accrued <= totalBudget, with exactly the right number of earnings. The unique constraint + optimistic locking + retry backoff prevents overspending.
+- Partial slash is proven correct: the un-slashed portion of locked collateral is released back to available, while usable collateral decreases by exactly the slash amount.
