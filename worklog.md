@@ -474,3 +474,22 @@ Stage Summary:
 - Liquidity gaps are now route-feasible: supply only counts offers that match both source and destination, preventing misleading gap numbers.
 - Provider economics are now correct: netEarnings subtracts penalties and slashing from gross earnings.
 - Commitment reliability nudges routing: committed liquidity is modestly more valuable than ephemeral liquidity.
+
+---
+Task ID: P3.2-Scoring
+Agent: main (Z.ai Code)
+Task: Fix remaining 3 economic-ranking inconsistencies. Shared route scoring, commitment aggregation across all legs, dispute/slash recency weighting. No new features.
+
+Work Log:
+- 1. Shared scoreRoute function: created a SINGLE source of truth for route quality scoring in routing.ts. scoreRoute(route, ctx) computes cost+speed+risk+reputation+corridor+commitment. Used by rankAndTag, isBetterRoute, and advanceSearching — all three now use the EXACT same scoring semantics. A route that wins on reputation during initial ranking also wins during re-evaluation.
+- 2. Commitment aggregation: computeRouteCommitment() now aggregates across ALL material legs (average), not just legs[0]. Consistent with the multi-leg reputation model.
+- 3. Dispute/slash recency weighting: disputes and slashes are now recency-weighted (same decay function as executions). Fixes the inconsistency where raw dispute counts were divided by weighted execution totals. Disputes are NOT value-weighted (safety events), but ARE recency-weighted.
+- Race condition fix: advanceSearching now gracefully handles the case where selectRoute is called after the execution has already advanced past ROUTE_FOUND (returns 'already_advancing' instead of throwing).
+- Tests: tests/p3-scoring.test.ts (12 assertions) — scoreRoute consistency, isBetterRoute uses same scoring, computeRouteCommitment multi-leg aggregation, dispute recency weighting, WAIT_FOR_BETTER higher-reputation route wins.
+- All existing tests pass (collateral 23, P3 economics 72, P3.1 hardening 25). Lint + type-check clean.
+- Pushed to GitHub (commit bdf28ac).
+
+Stage Summary:
+- Route scoring is now deterministic and shared: rankAndTag, isBetterRoute, and advanceSearching all use scoreRoute(). No drift between initial ranking and WAIT_FOR_BETTER re-evaluation.
+- Commitment reliability aggregates across all legs (consistent with multi-leg reputation).
+- Disputes and slashes are recency-weighted (consistent with the meaningful-transaction + recency framework).
