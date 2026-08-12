@@ -20,7 +20,7 @@
 
 import { db } from "@/lib/db";
 import { Prisma } from "@prisma/client";
-import { Decimal, moneyAdd, moneySub, moneyMul, moneyGte, moneyGt, moneyLte, bpsToFactor, feeForAmount, incentiveForAmount, roundMoney } from "./money";
+import { Decimal, moneyAdd, moneySub, moneyMul, moneyGte, moneyGt, moneyLte, moneyLt, bpsToFactor, feeForAmount, incentiveForAmount, roundMoney } from "./money";
 import { findRoutes, type CandidateRoute } from "./routing";
 import {
   appendAuditEvent,
@@ -319,124 +319,214 @@ export async function reserveRoute(executionId: string) {
   if (!routeId) throw new Error("No route selected");
 
   // Run the whole reservation in a single interactive transaction.
-  await db.$transaction(async (tx) => {
-    const route = await tx.route.findUnique({
-      where: { id: routeId },
-      include: { legs: { include: { provider: true, offer: true } } },
-    });
-    if (!route) throw new Error("Route not found");
+  // This transaction atomically:
+  //   1. Revalidates every leg's live offer against the indicative snapshot
+  //   2. Rejects stale routes (STALE_ROUTE) if the offer materially changed
+  //   3. Freezes the committed economic terms from the LIVE offer
+  //   4. Reserves capacity
+  //   5. Locks collateral
+  //   6. Creates obligations
+  //   7. Transitions to ROUTE_RESERVED
+  // If any step fails, the entire transaction rolls back — no partial state.
+  try {
+    await db.$transaction(async (tx) => {
+      const route = await tx.route.findUnique({
+        where: { id: routeId },
+        include: { legs: { include: { provider: true, offer: true } } },
+      });
+      if (!route) throw new StaleRouteError("Route not found");
 
-    // 1. Reserve capacity on each offer (conditional updates).
-    // 2. For collateralized providers, lock collateral (assert eligibility).
-    // 3. Create obligations.
-    // 4. Update execution + route status.
-    const expiresAt = new Date(Date.now() + 5 * 60_000);
-    const obligationIds: string[] = [];
+      const expiresAt = new Date(Date.now() + 5 * 60_000);
+      const obligationIds: string[] = [];
 
-    // Group legs by sequence to handle split routes.
-    const bySequence = new Map<number, typeof route.legs>();
-    for (const leg of route.legs) {
-      if (!bySequence.has(leg.sequence)) bySequence.set(leg.sequence, []);
-      bySequence.get(leg.sequence)!.push(leg);
-    }
-    const sequences = [...bySequence.keys()].sort((a, b) => a - b);
+      // ---- STEP 1: Revalidate every leg against the live offer ----
+      // If the offer has materially changed since discovery, reject the route.
+      for (const leg of route.legs) {
+        const offer = leg.offer;
+        if (!offer || !offer.active) {
+          throw new StaleRouteError(`Leg ${leg.id}: offer is no longer active`);
+        }
+        if (offer.expiresAt && offer.expiresAt < new Date()) {
+          throw new StaleRouteError(`Leg ${leg.id}: offer has expired`);
+        }
+        // Verify assets/countries still match.
+        if (offer.sourceAsset !== leg.sourceAsset || offer.destinationAsset !== leg.destinationAsset) {
+          throw new StaleRouteError(`Leg ${leg.id}: offer assets changed (${offer.sourceAsset}→${offer.destinationAsset} vs leg ${leg.sourceAsset}→${leg.destinationAsset})`);
+        }
+        if (offer.sourceCountry !== (leg.snapshotSourceCountry ?? "") || offer.destinationCountry !== (leg.snapshotDestinationCountry ?? "")) {
+          throw new StaleRouteError(`Leg ${leg.id}: offer countries changed`);
+        }
+        // Verify amount is still within min/max.
+        if (moneyGt(leg.amount, offer.maximumAmount) || moneyLt(leg.amount, offer.minimumAmount)) {
+          throw new StaleRouteError(`Leg ${leg.id}: amount ${leg.amount} no longer within offer limits [${offer.minimumAmount}, ${offer.maximumAmount}]`);
+        }
+        // Verify settlement asset hasn't changed.
+        if (offer.settlementAssetId !== leg.settlementAssetId) {
+          throw new StaleRouteError(`Leg ${leg.id}: settlement asset changed`);
+        }
+        // Verify channel type hasn't changed.
+        if (offer.channelType !== leg.channelType) {
+          throw new StaleRouteError(`Leg ${leg.id}: channel type changed`);
+        }
+        // Verify pricing hasn't materially changed (fee, rate, incentive).
+        // The snapshot represents the indicative terms at discovery time.
+        // At reservation, we re-freeze from the live offer — but if the live
+        // offer has changed, we reject rather than silently committing new terms.
+        // This ensures the user's route preview matches what gets committed.
+        if (leg.snapshotFeeBps !== null && leg.snapshotFeeBps !== undefined && offer.feeBps !== leg.snapshotFeeBps) {
+          throw new StaleRouteError(`Leg ${leg.id}: fee changed from ${leg.snapshotFeeBps} to ${offer.feeBps}`);
+        }
+        if (leg.snapshotRate !== null && leg.snapshotRate !== undefined) {
+          const snapshotRateStr = leg.snapshotRate.toString();
+          const offerRateStr = offer.rate.toString();
+          // Compare with 6 decimal precision to avoid floating-point noise.
+          if (Math.abs(Number(snapshotRateStr) - Number(offerRateStr)) > 0.000001) {
+            throw new StaleRouteError(`Leg ${leg.id}: rate changed from ${snapshotRateStr} to ${offerRateStr}`);
+          }
+        }
+        if (leg.snapshotIncentiveBps !== null && leg.snapshotIncentiveBps !== undefined && offer.incentiveBps !== leg.snapshotIncentiveBps) {
+          throw new StaleRouteError(`Leg ${leg.id}: incentive changed from ${leg.snapshotIncentiveBps} to ${offer.incentiveBps}`);
+        }
+      }
 
-    for (const seq of sequences) {
-      const legs = bySequence.get(seq)!;
-      for (const leg of legs) {
-        // Reserve capacity.
-        await reserveCapacity({
-          offerId: leg.offerId,
-          executionId,
-          amount: leg.amount,
-          expiresAt,
-          idempotencyKey: `reserve:${executionId}:${leg.id}`,
-          tx,
-        });
-
-        // Update leg status.
+      // ---- STEP 2: All legs validated — freeze committed terms from live offer ----
+      // The snapshot is now refreshed to the live offer's current values.
+      // This is redundant if nothing changed, but it's the authoritative freeze point.
+      for (const leg of route.legs) {
+        const offer = leg.offer!;
         await tx.leg.update({
           where: { id: leg.id },
-          data: { status: LEG_STATUS.RESERVED },
+          data: {
+            snapshotFeeBps: offer.feeBps,
+            snapshotIncentiveBps: offer.incentiveBps,
+            snapshotRate: offer.rate,
+            snapshotSourceCountry: offer.sourceCountry,
+            snapshotDestinationCountry: offer.destinationCountry,
+            snapshotExpectedExecutionSeconds: offer.expectedExecutionSeconds,
+          },
         });
+      }
 
-        // Lock collateral if the provider is collateralized.
-        if (leg.provider.trustModel === "COLLATERALIZED") {
-          const vault = await tx.vault.findUnique({ where: { providerId: leg.providerId } });
-          if (!vault) throw new Error(`Collateralized provider ${leg.provider.name} has no vault`);
-          // Determine the collateral asset (first stable holding).
-          const holdings = JSON.parse(vault.holdingsJson) as { asset: string; amount: string }[];
-          const collateralAsset = holdings[0]?.asset;
-          if (!collateralAsset) throw new Error(`Vault for ${leg.provider.name} has no holdings`);
-          const sa = await tx.settlementAsset.findUnique({ where: { symbol: collateralAsset } });
-          if (!sa) throw new Error(`Collateral asset ${collateralAsset} not found`);
-          assertCollateralEligible(sa);
-          const { lock: lk } = await lockCollateral({
-            providerId: leg.providerId,
+      // ---- STEP 3: Reserve capacity, lock collateral, create obligations ----
+      const bySequence = new Map<number, typeof route.legs>();
+      for (const leg of route.legs) {
+        if (!bySequence.has(leg.sequence)) bySequence.set(leg.sequence, []);
+        bySequence.get(leg.sequence)!.push(leg);
+      }
+      const sequences = [...bySequence.keys()].sort((a, b) => a - b);
+
+      for (const seq of sequences) {
+        const legs = bySequence.get(seq)!;
+        for (const leg of legs) {
+          // Reserve capacity.
+          await reserveCapacity({
+            offerId: leg.offerId,
             executionId,
             amount: leg.amount,
-            asset: collateralAsset,
-            idempotencyKey: `lock:${executionId}:${leg.id}`,
+            expiresAt,
+            idempotencyKey: `reserve:${executionId}:${leg.id}`,
             tx,
           });
 
-          // Post a LOCK ledger entry.
-          await tx.ledgerEntry.create({
-            data: {
-              debitAccount: `provider:${leg.providerId}:vault:${collateralAsset}`,
-              creditAccount: `provider:${leg.providerId}:operational:${collateralAsset}`,
+          // Update leg status.
+          await tx.leg.update({
+            where: { id: leg.id },
+            data: { status: LEG_STATUS.RESERVED },
+          });
+
+          // Lock collateral if the provider is collateralized.
+          if (leg.provider.trustModel === "COLLATERALIZED") {
+            const vault = await tx.vault.findUnique({ where: { providerId: leg.providerId } });
+            if (!vault) throw new Error(`Collateralized provider ${leg.provider.name} has no vault`);
+            const holdings = JSON.parse(vault.holdingsJson) as { asset: string; amount: string }[];
+            const collateralAsset = holdings[0]?.asset;
+            if (!collateralAsset) throw new Error(`Vault for ${leg.provider.name} has no holdings`);
+            const sa = await tx.settlementAsset.findUnique({ where: { symbol: collateralAsset } });
+            if (!sa) throw new Error(`Collateral asset ${collateralAsset} not found`);
+            assertCollateralEligible(sa);
+            const { lock: lk } = await lockCollateral({
+              providerId: leg.providerId,
+              executionId,
               amount: leg.amount,
               asset: collateralAsset,
-              entryType: "LOCK",
+              idempotencyKey: `lock:${executionId}:${leg.id}`,
+              tx,
+            });
+
+            await tx.ledgerEntry.create({
+              data: {
+                debitAccount: `provider:${leg.providerId}:vault:${collateralAsset}`,
+                creditAccount: `provider:${leg.providerId}:operational:${collateralAsset}`,
+                amount: leg.amount,
+                asset: collateralAsset,
+                entryType: "LOCK",
+                executionId,
+                idempotencyKey: `ledger-lock:${executionId}:${leg.id}`,
+                description: `Collateral locked for leg ${leg.id}`,
+              },
+            });
+            void lk;
+          }
+
+          // Create the obligation.
+          const obligation = await tx.obligation.create({
+            data: {
               executionId,
-              idempotencyKey: `ledger-lock:${executionId}:${leg.id}`,
-              description: `Collateral locked for leg ${leg.id}`,
+              legId: leg.id,
+              providerId: leg.providerId,
+              amount: leg.amount,
+              asset: leg.sourceAsset,
+              dueAt: new Date(Date.now() + 10 * 60_000),
+              status: OBLIGATION_STATUS.CREATED,
+              collateralBackingId: null,
             },
           });
-          void lk;
+          obligationIds.push(obligation.id);
         }
-
-        // Create the obligation.
-        const obligation = await tx.obligation.create({
-          data: {
-            executionId,
-            legId: leg.id,
-            providerId: leg.providerId,
-            amount: leg.amount,
-            asset: leg.sourceAsset,
-            dueAt: new Date(Date.now() + 10 * 60_000),
-            status: OBLIGATION_STATUS.CREATED,
-            collateralBackingId: null,
-          },
-        });
-        obligationIds.push(obligation.id);
       }
+
+      // ---- STEP 4: Transition to ROUTE_RESERVED ----
+      await tx.execution.update({
+        where: { id: executionId },
+        data: {
+          status: EXECUTION_STATUS.ROUTE_RESERVED,
+          commitmentStatus: COMMITMENT_STATUS.REVERSIBLE,
+          lastTickAt: new Date(),
+        },
+      });
+      await tx.route.update({
+        where: { id: routeId },
+        data: { status: ROUTE_STATUS.RESERVED },
+      });
+    }, { timeout: 30000, maxWait: 15000 });
+  } catch (err) {
+    if (err instanceof StaleRouteError) {
+      // Stale route — do not reserve. Return the execution to SEARCHING so it
+      // can re-discover a fresh route on the next tick.
+      await db.execution.update({
+        where: { id: executionId },
+        data: { status: EXECUTION_STATUS.SEARCHING, lastTickAt: new Date() },
+      });
+      await appendAuditEvent({
+        executionId,
+        eventType: "route_stale_rejected",
+        payload: { routeId, reason: err.message },
+      });
+      return;
     }
+    throw err;
+  }
 
-    // Update execution + route.
-    await tx.execution.update({
-      where: { id: executionId },
-      data: {
-        status: EXECUTION_STATUS.ROUTE_RESERVED,
-        commitmentStatus: COMMITMENT_STATUS.REVERSIBLE,
-        lastTickAt: new Date(),
-      },
-    });
-    await tx.route.update({
-      where: { id: routeId },
-      data: { status: ROUTE_STATUS.RESERVED },
-    });
-  }, { timeout: 30000, maxWait: 15000 });
-
+  // ---- Audit: route reserved + terms frozen (only after successful reservation) ----
   await appendAuditEvent({
     executionId,
     eventType: "route_reserved",
     payload: { routeId },
   });
-  // Audit the frozen economic terms so the committed contract is reconstructable.
+  // Audit the frozen committed economic terms.
   const frozenRoute = await db.route.findUnique({
     where: { id: routeId },
-    include: { legs: { select: { id: true, providerId: true, snapshotFeeBps: true, snapshotRate: true, snapshotIncentiveBps: true, settlementAssetId: true, amount: true, sourceAsset: true, destinationAsset: true } } },
+    include: { legs: { select: { id: true, providerId: true, snapshotFeeBps: true, snapshotRate: true, snapshotIncentiveBps: true, settlementAssetId: true, amount: true, sourceAsset: true, destinationAsset: true, snapshotSourceCountry: true, snapshotDestinationCountry: true, snapshotExpectedExecutionSeconds: true, channelType: true } } },
   });
   await appendAuditEvent({
     executionId,
@@ -453,8 +543,13 @@ export async function reserveRoute(executionId: string) {
         amount: l.amount.toString(),
         sourceAsset: l.sourceAsset,
         destinationAsset: l.destinationAsset,
+        sourceCountry: l.snapshotSourceCountry,
+        destinationCountry: l.snapshotDestinationCountry,
+        expectedExecutionSeconds: l.snapshotExpectedExecutionSeconds,
+        channelType: l.channelType,
       })) ?? [],
       frozenAt: new Date().toISOString(),
+      note: "Committed economic terms — frozen at reservation, immutable for execution",
     },
   });
   await appendAuditEvent({
@@ -462,6 +557,14 @@ export async function reserveRoute(executionId: string) {
     eventType: "obligations_created",
     payload: { count: obligationIdsPlaceholder(executionId) },
   });
+}
+
+// Error class for stale route detection.
+class StaleRouteError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StaleRouteError";
+  }
 }
 
 // helper to count obligations without leaking tx scope
@@ -821,8 +924,11 @@ async function tokenize(executionId: string) {
       leg.sourceAsset,
       { executionId, idempotencyKey: `tokenize-in:${executionId}:${leg.id}`, description: `Source funds to ${leg.provider.name}` },
     );
-    // Charge the fee — using the FROZEN SNAPSHOT (not the mutable offer).
-    const feeBps = leg.snapshotFeeBps ?? leg.offer?.feeBps ?? 0;
+    // Charge the fee — using the FROZEN SNAPSHOT exclusively (not the mutable offer).
+    const feeBps = leg.snapshotFeeBps;
+    if (feeBps === null || feeBps === undefined) {
+      throw new Error(`LEGACY_EXECUTION_SNAPSHOT_MISSING: leg ${leg.id} has no snapshotFeeBps — cannot execute with mutable offer`);
+    }
     const feeAmt = feeForAmount(leg.amount, feeBps);
     if (feeAmt.gt(0)) {
       await feeEntry(
@@ -833,8 +939,11 @@ async function tokenize(executionId: string) {
       );
     }
     // Mint / credit the settlement asset (or destination asset) to escrow.
-    // Using the FROZEN SNAPSHOT rate.
-    const rate = leg.snapshotRate ?? leg.offer?.rate ?? new Decimal(1);
+    // Using the FROZEN SNAPSHOT rate exclusively.
+    const rate = leg.snapshotRate;
+    if (!rate) {
+      throw new Error(`LEGACY_EXECUTION_SNAPSHOT_MISSING: leg ${leg.id} has no snapshotRate`);
+    }
     const outAmount = moneySub(moneyMul(moneySub(leg.amount, feeAmt), rate), new Decimal(0));
     await mint(
       `execution:${executionId}:escrow:${leg.destinationAsset}`,
@@ -842,8 +951,8 @@ async function tokenize(executionId: string) {
       leg.destinationAsset,
       { executionId, idempotencyKey: `mint:${executionId}:${leg.id}`, description: `Tokenized ${leg.destinationAsset} from ${leg.provider.name}` },
     );
-    // Apply incentive if any (rebate to execution escrow) — using FROZEN SNAPSHOT.
-    const incentiveBps = leg.snapshotIncentiveBps ?? leg.offer?.incentiveBps ?? 0;
+    // Apply incentive if any (rebate to execution escrow) — using FROZEN SNAPSHOT exclusively.
+    const incentiveBps = leg.snapshotIncentiveBps ?? 0;
     if (incentiveBps > 0) {
       const inc = incentiveForAmount(outAmount, incentiveBps);
       await incentiveEntry(
@@ -915,9 +1024,11 @@ async function settle(executionId: string) {
       leg.sourceAsset,
       { executionId, idempotencyKey: `burn:${executionId}:${leg.id}`, description: `Settlement asset consumed by ${leg.provider.name}` },
     );
-    // Using FROZEN SNAPSHOT fee/rate (not the mutable offer).
-    const feeBps = leg.snapshotFeeBps ?? leg.offer?.feeBps ?? 0;
-    const rate = leg.snapshotRate ?? leg.offer?.rate ?? new Decimal(1);
+    // Using FROZEN SNAPSHOT fee/rate exclusively (not the mutable offer).
+    const feeBps = leg.snapshotFeeBps;
+    if (feeBps === null || feeBps === undefined) throw new Error(`LEGACY_EXECUTION_SNAPSHOT_MISSING: leg ${leg.id} has no snapshotFeeBps`);
+    const rate = leg.snapshotRate;
+    if (!rate) throw new Error(`LEGACY_EXECUTION_SNAPSHOT_MISSING: leg ${leg.id} has no snapshotRate`);
     const feeAmt = feeForAmount(leg.amount, feeBps);
     if (feeAmt.gt(0)) {
       await feeEntry(
@@ -1009,9 +1120,11 @@ async function confirmDestination(executionId: string): Promise<{ advanced: bool
       leg.sourceAsset,
       { executionId, idempotencyKey: `dest-in:${executionId}:${leg.id}`, description: `Funds to payout provider ${leg.provider.name}` },
     );
-    // Using FROZEN SNAPSHOT fee/rate (not the mutable offer).
-    const feeBps = leg.snapshotFeeBps ?? leg.offer?.feeBps ?? 0;
-    const rate = leg.snapshotRate ?? leg.offer?.rate ?? new Decimal(1);
+    // Using FROZEN SNAPSHOT fee/rate exclusively (not the mutable offer).
+    const feeBps = leg.snapshotFeeBps;
+    if (feeBps === null || feeBps === undefined) throw new Error(`LEGACY_EXECUTION_SNAPSHOT_MISSING: leg ${leg.id} has no snapshotFeeBps`);
+    const rate = leg.snapshotRate;
+    if (!rate) throw new Error(`LEGACY_EXECUTION_SNAPSHOT_MISSING: leg ${leg.id} has no snapshotRate`);
     const feeAmt = feeForAmount(leg.amount, feeBps);
     if (feeAmt.gt(0)) {
       await feeEntry(
@@ -1129,10 +1242,10 @@ async function completeExecution(executionId: string) {
         sourceAsset: leg.sourceAsset,
         destinationAsset: leg.destinationAsset,
         // Use snapshot fields for performance recording (historical accuracy).
-        sourceCountry: leg.snapshotSourceCountry ?? leg.offer?.sourceCountry ?? "GLOBAL",
-        destinationCountry: leg.snapshotDestinationCountry ?? leg.offer?.destinationCountry ?? "GLOBAL",
+        sourceCountry: leg.snapshotSourceCountry ?? "GLOBAL",
+        destinationCountry: leg.snapshotDestinationCountry ?? "GLOBAL",
         amount: leg.amount,
-        offer: { feeBps: leg.snapshotFeeBps ?? leg.offer?.feeBps ?? 0 },
+        offer: { feeBps: leg.snapshotFeeBps ?? 0 },
       });
     }
   } catch (err) {
