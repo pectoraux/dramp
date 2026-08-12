@@ -38,14 +38,38 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
     await advanceOneOnDemand(execution.id);
   }
 
-  let audit: any[] = [];
-  let ledger: any[] = [];
-  if (execution) {
-    audit = await getAuditTrailForExecution(execution.id);
-    ledger = await getLedgerForExecution(execution.id);
-  }
+  // Re-fetch BOTH the intent and the execution after advancement so the
+  // serialized status is consistent with the current DB state. The
+  // advancement may have updated intent.status (e.g. → COMPLETED) and/or
+  // execution.status; returning the pre-advancement objects would give a
+  // stale view (e.g. intent.status="ACTIVE" while execution.status="COMPLETED").
+  const freshIntent = execution
+    ? await db.executionIntent.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          userId: true,
+          sourceAmount: true,
+          sourceAsset: true,
+          sourceCountry: true,
+          destinationAsset: true,
+          destinationCountry: true,
+          minimumDestinationAmount: true,
+          maximumTotalCost: true,
+          targetRate: true,
+          riskTolerance: true,
+          executionPolicy: true,
+          maxWaitSeconds: true,
+          cancellationPolicy: true,
+          allowedSettlementAssets: true,
+          prohibitedSettlementAssets: true,
+          status: true,
+          createdAt: true,
+          expiresAt: true,
+        },
+      })
+    : intent;
 
-  // Re-fetch execution after advancement to return fresh state.
   const freshExecution = execution
     ? await db.execution.findUnique({
         where: { id: execution.id },
@@ -57,8 +81,15 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
       })
     : null;
 
+  let audit: any[] = [];
+  let ledger: any[] = [];
+  if (execution) {
+    audit = await getAuditTrailForExecution(execution.id);
+    ledger = await getLedgerForExecution(execution.id);
+  }
+
   return NextResponse.json({
-    intent: serializeIntent(intent),
+    intent: serializeIntent(freshIntent ?? intent),
     execution: freshExecution ? serializeExecution(freshExecution) : null,
     routes: freshExecution?.routes?.map(serializeRoute) ?? [],
     obligations: freshExecution?.obligations?.map(serializeObligation) ?? [],

@@ -15,6 +15,7 @@ import {
   PROVIDER_TYPE,
   SETTLEMENT_ASSET_TYPE,
   TRUST_MODEL,
+  normalizeCollateralEligibility,
 } from "./types";
 import { assertCollateralEligible } from "./collateral";
 
@@ -60,7 +61,7 @@ export async function seedDatabase(opts: { reset?: boolean } = {}) {
       incentiveRate: 0,
       settlementHaircut: 0.0,
       collateralHaircut: 0.05,
-      isEligibleCollateral: true,
+      isEligibleCollateral: normalizeCollateralEligibility(SETTLEMENT_ASSET_TYPE.STABLECOIN, true),
       maximumNetworkExposure: new Decimal(5000000),
       status: "ACTIVE",
     },
@@ -80,7 +81,7 @@ export async function seedDatabase(opts: { reset?: boolean } = {}) {
       incentiveSource: "issuer",
       settlementHaircut: 0.0,
       collateralHaircut: 0.1,
-      isEligibleCollateral: true,
+      isEligibleCollateral: normalizeCollateralEligibility(SETTLEMENT_ASSET_TYPE.STABLECOIN, true),
       maximumNetworkExposure: new Decimal(1000000),
       status: "ACTIVE",
     },
@@ -100,7 +101,7 @@ export async function seedDatabase(opts: { reset?: boolean } = {}) {
       incentiveSource: "dRamp",
       settlementHaircut: 0.0,
       collateralHaircut: 0.0,
-      isEligibleCollateral: true,
+      isEligibleCollateral: normalizeCollateralEligibility(SETTLEMENT_ASSET_TYPE.INTERNAL_SETTLEMENT_UNIT, true),
       maximumNetworkExposure: new Decimal(2000000),
       status: "ACTIVE",
     },
@@ -119,16 +120,18 @@ export async function seedDatabase(opts: { reset?: boolean } = {}) {
       incentiveRate: 0,
       settlementHaircut: 0.0,
       collateralHaircut: 0.5, // irrelevant — can never be collateral
-      isEligibleCollateral: false, // HARD INVARIANT
+      isEligibleCollateral: normalizeCollateralEligibility(SETTLEMENT_ASSET_TYPE.VOLATILE_TOKEN, false),
       maximumNetworkExposure: new Decimal(500000),
       status: "ACTIVE",
     },
   });
 
   // Verify the hard invariant on the volatile asset: WETH must NEVER be
-  // eligible collateral. (The assertCollateralEligible guard throws when an
-  // attempt is made to USE a volatile asset as collateral — that is enforced
-  // at lock time. Here we only verify the seed config is correct.)
+  // eligible collateral. The asset TYPE is authoritative — even if the
+  // mutable flag were somehow set true, normalizeCollateralEligibility
+  // would have forced it false at write time, and assertCollateralEligible
+  // would reject it at lock time. Here we verify the stored flag is
+  // consistent with the type.
   if (weth.assetType === SETTLEMENT_ASSET_TYPE.VOLATILE_TOKEN && weth.isEligibleCollateral) {
     throw new Error("Hard invariant violated: WETH must not be eligible collateral");
   }

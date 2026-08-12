@@ -222,14 +222,57 @@ export const AUDIT_ACTOR = {
 } as const;
 
 // Hard invariant: volatile assets can never be collateral.
+//
+// Asset TYPE is the authoritative determinant of collateral eligibility —
+// not the mutable `isEligibleCollateral` flag. The flag can only RESTRICT
+// eligibility (operational delisting of a stablecoin) but can never GRANT it
+// for a type that is structurally ineligible (VOLATILE_TOKEN).
+//
+// Eligibility logic:
+//   VOLATILE_TOKEN          → never eligible (type-based, immutable)
+//   STABLECOIN / ISU        → eligible IF flag is true AND status is ACTIVE
+//
+// `normalizeCollateralEligibility` enforces the type→flag consistency at
+// write time so the stored flag can never contradict the type.
+
 export function isCollateralEligible(
   assetType: string,
   isEligibleCollateral: boolean,
   status: string,
 ): boolean {
+  // Asset type is authoritative — volatile tokens are NEVER eligible,
+  // regardless of the mutable flag.
   if (assetType === SETTLEMENT_ASSET_TYPE.VOLATILE_TOKEN) return false;
   if (status !== "ACTIVE") return false;
+  // For non-volatile types, the flag may restrict (delist) but the type
+  // is what makes them eligible candidates.
   return isEligibleCollateral;
+}
+
+// Enforce type→flag consistency at every write path. A VOLATILE_TOKEN must
+// always have isEligibleCollateral=false; if a caller tries to set it true,
+// this function silently corrects it so the stored data can never contradict
+// the invariant. Returns the normalized flag value.
+export function normalizeCollateralEligibility(
+  assetType: string,
+  isEligibleCollateral: boolean,
+): boolean {
+  if (assetType === SETTLEMENT_ASSET_TYPE.VOLATILE_TOKEN) return false;
+  return isEligibleCollateral;
+}
+
+// Detect a data-integrity violation: a volatile asset whose stored
+// isEligibleCollateral flag is true (the flag contradicts the type). This
+// should never happen if normalizeCollateralEligibility was used at write
+// time, but we check defensively at lock time.
+export function isCollateralFlagConsistent(
+  assetType: string,
+  isEligibleCollateral: boolean,
+): boolean {
+  if (assetType === SETTLEMENT_ASSET_TYPE.VOLATILE_TOKEN && isEligibleCollateral) {
+    return false; // inconsistent: volatile asset claims eligibility
+  }
+  return true;
 }
 
 // Default collateralization ratio (150%).

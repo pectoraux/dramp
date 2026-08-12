@@ -2,6 +2,7 @@
 // JSON-safe objects for API responses.
 
 import { Decimal } from "./money";
+import { normalizeCollateralEligibility } from "./types";
 
 export function dec(v: Decimal | string | number | null | undefined): string {
   if (v === null || v === undefined) return "0";
@@ -240,7 +241,10 @@ export function serializeSettlementAsset(a: any) {
     incentiveSource: a.incentiveSource,
     settlementHaircut: a.settlementHaircut,
     collateralHaircut: a.collateralHaircut,
-    isEligibleCollateral: a.isEligibleCollateral,
+    // Serialize the TYPE-AUTHORITATIVE eligibility, not the raw mutable flag.
+    // A volatile asset is always serialized as not eligible even if the
+    // stored flag were somehow true.
+    isEligibleCollateral: normalizeCollateralEligibility(a.assetType, a.isEligibleCollateral),
     maximumNetworkExposure: a.maximumNetworkExposure ? dec(a.maximumNetworkExposure) : null,
     status: a.status,
   };

@@ -17,6 +17,7 @@ import {
   RESERVATION_STATUS,
   SETTLEMENT_ASSET_TYPE,
   isCollateralEligible,
+  isCollateralFlagConsistent,
 } from "./types";
 
 type Tx = PrismaClient | Parameters<Parameters<PrismaClient["$transaction"]>[0]>[0];
@@ -31,9 +32,20 @@ export function assertCollateralEligible(asset: {
   status: string;
   symbol: string;
 }) {
+  // Asset TYPE is authoritative. A volatile token is never collateral,
+  // regardless of any mutable flag.
   if (asset.assetType === SETTLEMENT_ASSET_TYPE.VOLATILE_TOKEN) {
     throw new CollateralInvariantError(
       `Volatile asset ${asset.symbol} can never be collateral (assetType=VOLATILE_TOKEN).`,
+    );
+  }
+  // Data-integrity check: if the stored isEligibleCollateral flag is true on
+  // a volatile asset, the flag contradicts the type — this is a corruption
+  // that should never happen if normalizeCollateralEligibility was used at
+  // write time. Reject defensively.
+  if (!isCollateralFlagConsistent(asset.assetType, asset.isEligibleCollateral)) {
+    throw new CollateralInvariantError(
+      `Data integrity violation: asset ${asset.symbol} has assetType=${asset.assetType} but isEligibleCollateral=true — the flag contradicts the type.`,
     );
   }
   if (!isCollateralEligible(asset.assetType, asset.isEligibleCollateral, asset.status)) {
