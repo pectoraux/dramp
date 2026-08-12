@@ -133,3 +133,38 @@ Stage Summary:
 - All 8 failure scenarios pass.
 - Hard invariant (volatile assets never collateral) enforced in backend, seed, and UI.
 - Professional, responsive dark-themed UI with sticky footer and compliance notice.
+
+---
+Task ID: Auth+Deploy
+Agent: main (Z.ai Code)
+Task: Add authentication system (waitlist signup, admin approval, demo quick-login), migrate to Neon Postgres, push to GitHub, deploy to Vercel.
+
+Work Log:
+- Migrated Prisma datasource from SQLite to PostgreSQL (Neon): `url` = pooled connection, `directUrl` = direct connection.
+- Added User fields (password, role, status, isDemo) and WaitlistEntry model.
+- Installed next-auth@4 + bcryptjs; configured CredentialsProvider with role-aware JWT/session callbacks.
+- Built auth API: /api/auth/[...nextauth], /api/auth/signup (creates WaitlistEntry, not a User), /api/admin/waitlist (list), /api/admin/waitlist/[id]/approve (admin creates User + password, optional auto-generate), DELETE to reject.
+- Created auth-guard.ts helpers (requireUser, requireAdmin, requireOperatorOrAdmin).
+- Gated all existing API routes with session checks; intents use the session user's id.
+- Updated seed: creates real admin (ekontetevi@gmail.com / Payswap123456), demo users (alice/operator/admin@dramp.demo / Demo1234!), and 2 pending waitlist entries.
+- Seed route bootstrap logic: unauthenticated seeding allowed only when no admin exists yet; reseed requires admin auth.
+- Added on-demand execution advancement (advanceActiveExecutions / advanceOneOnDemand) for Vercel serverless — the background setInterval ticker can't persist on serverless, so read endpoints advance the viewed execution. UI polling (2s) drives the state machine.
+- Restricted advancement to detail endpoints only (kept list/monitor lightweight) to avoid Neon-latency slowdowns.
+- Increased Prisma interactive transaction timeout to 30s (reserveRoute/completeExecution/cancel) to accommodate Neon latency.
+- instrumentation.ts skips the background ticker on Vercel (process.env.VERCEL).
+- Fixed build script (next build), added postinstall (prisma generate), removed output:standalone for Vercel.
+- Updated UI: AuthScreen (login + waitlist signup + demo quick-login buttons for Alice/Operator/Admin), user menu with role badge + sign out, conditional Waitlist tab for admins, WaitlistPanel with approve/reject + password generation.
+- Fixed .gitignore to exclude .env but allow .env.example.
+- Pushed to GitHub repo pectoraux/dramp (PAT-authenticated).
+- Created Vercel project (prj_uINd363FDCtC0w0Z4U9wal8ffKFR) linked to the GitHub repo, set 4 env vars (DATABASE_URL, DIRECT_URL, NEXTAUTH_SECRET, NEXTAUTH_URL).
+- Deployed to Vercel: READY at dramp-smoky.vercel.app (dramp.vercel.app was already taken by another Vercel account).
+- Verified on Vercel: auth screen renders, login as Alice works, route preview (71 routes), execution creation + on-demand advancement progresses the state machine on serverless, admin login (ekontetevi@gmail.com) returns role=ADMIN, Waitlist tab visible for admins with approve/reject.
+
+Stage Summary:
+- GitHub repo: https://github.com/pectoraux/dramp
+- Vercel deployment: https://dramp-smoky.vercel.app (dramp.vercel.app was globally taken)
+- Auth: NextAuth credentials provider. Sign-up → waitlist. Admin (ekontetevi@gmail.com / Payswap123456) approves waitlist entries and creates accounts. Demo quick-login for Alice (USER), Operator (PROVIDER_OPERATOR), Admin (ADMIN).
+- DB: Neon PostgreSQL (shared between local dev and Vercel).
+- The app behaves the same on Vercel as locally: same UI, same engine, same DB. The only difference is the background ticker (local only) vs on-demand advancement (Vercel) — both drive the same state machine.
+- Env vars set on Vercel: DATABASE_URL, DIRECT_URL, NEXTAUTH_SECRET, NEXTAUTH_URL.
+- Note: user should rotate the GitHub PAT and Vercel token after this session.
