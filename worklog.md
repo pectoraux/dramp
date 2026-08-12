@@ -493,3 +493,26 @@ Stage Summary:
 - Route scoring is now deterministic and shared: rankAndTag, isBetterRoute, and advanceSearching all use scoreRoute(). No drift between initial ranking and WAIT_FOR_BETTER re-evaluation.
 - Commitment reliability aggregates across all legs (consistent with multi-leg reputation).
 - Disputes and slashes are recency-weighted (consistent with the meaningful-transaction + recency framework).
+
+---
+Task ID: P3.3-CrossTime
+Agent: main (Z.ai Code)
+Task: Fix cross-time route scoring — reconstruct persisted routes with real data, use absolute quality (not candidate-set normalized), explicit replacement threshold. No new features.
+
+Work Log:
+- reconstructPersistedRoute(): rebuilds a real CandidateRoute from persisted Route + Leg[] with provider IDs, corridors, amounts, risk dimensions, channel types, settlement assets. No fake/empty fields.
+- calculateAbsoluteRouteQuality(): stable cross-time score using bounded absolute dimensions (cost/notional/1%, duration/600s, risk 0..1, reputation 0..1). Same route gets same quality regardless of candidate set.
+- shouldReplaceRoute(): canonical replacement decision using absolute quality + ROUTE_REPLACEMENT_THRESHOLD (0.01). Returns {replace, improvement, reason}.
+- advanceSearching refactored: reconstructPersistedRoute → shouldReplaceRoute. No fake provider IDs. Audit event records absoluteQualityImprovement + threshold.
+- isBetterRoute() delegates to shouldReplaceRoute() — one canonical path.
+- rankAndTag() still uses candidate-set-relative normalization (correct for ranking among alternatives). Only waiting comparison uses absolute quality.
+- Tests: tests/p3-cross-time.test.ts (20 assertions) — reconstruction preserves real data, shouldReplaceRoute returns structured result, candidate-set independence, replacement threshold, multi-leg weak provider penalized, reputation improvement triggers replacement, risk preference affects selection.
+- All existing tests pass (collateral 23, P3.2 scoring 12). Lint + type-check clean.
+- Pushed to GitHub (commit d6fe692).
+
+Stage Summary:
+- Persisted routes are now reconstructed with their real provider/corridor data — no fake provider IDs, no empty assets, no default 0.5 reputation.
+- Waiting comparison uses absolute route quality (stable across time) — the same route gets the same quality score regardless of what other candidates exist.
+- Route replacement only occurs when absolute quality improvement exceeds ROUTE_REPLACEMENT_THRESHOLD (0.01) — no unexplained magic numbers.
+- Initial ranking still uses candidate-set-relative normalization (correct for ranking among currently available alternatives).
+- Multi-leg routes are penalized consistently in both initial ranking and waiting comparison.
