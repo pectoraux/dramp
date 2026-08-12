@@ -192,6 +192,106 @@ export async function slashCollateralForExecution(
   }
 }
 
+// ---- Amount-aware slashing (Prompt 2.1) ---------------------------------
+// Slashes EXACTLY `amount` from the execution's locked collateral, not the
+// entire locked balance. Rejects amounts above eligible locked collateral.
+// All locks for the execution (matching the asset) are marked SLASHED, but
+// the vault's usableCollateral is only reduced by `amount`. The un-slashed
+// portion of the locked collateral is released back to the vault (available
+// again).
+
+export class SlashExceedsEligibleError extends Error {}
+
+export async function slashCollateralAmount(
+  executionId: string,
+  amount: Decimal | string | number,
+  asset: string,
+  compensationAccount: string,
+  tx: Tx,
+): Promise<{ slashedAmount: Decimal; totalEligibleLocked: Decimal }> {
+  const slashAmount = new Decimal(amount);
+  if (moneyLte(slashAmount, 0)) {
+    throw new Error("slash amount must be positive");
+  }
+
+  // Find all LOCKED collateral locks for this execution with the matching asset.
+  const locks = await tx.collateralLock.findMany({
+    where: { executionId, status: COLLATERAL_LOCK_STATUS.LOCKED, asset },
+    orderBy: { createdAt: "asc" },
+  });
+  if (locks.length === 0) {
+    throw new SlashExceedsEligibleError(
+      `No eligible locked collateral for execution ${executionId} (asset ${asset}).`,
+    );
+  }
+
+  const totalEligibleLocked = locks.reduce(
+    (sum, lk) => sum.plus(new Decimal(lk.amount)),
+    new Decimal(0),
+  );
+  if (moneyGt(slashAmount, totalEligibleLocked)) {
+    throw new SlashExceedsEligibleError(
+      `Slash amount ${slashAmount.toString()} exceeds eligible locked collateral ${totalEligibleLocked.toString()} for execution ${executionId}.`,
+    );
+  }
+
+  // Mark all eligible locks as SLASHED (they are consumed regardless — the
+  // un-slashed portion is released back to the vault).
+  const vaultIds = new Set<string>();
+  for (const lk of locks) {
+    await tx.collateralLock.update({
+      where: { id: lk.id },
+      data: { status: COLLATERAL_LOCK_STATUS.SLASHED },
+    });
+    vaultIds.add(lk.vaultId);
+  }
+
+  // Update each affected vault: reduce usableCollateral by the EXACT slash
+  // amount (distributed across vaults proportionally to their locked amounts),
+  // and reduce lockedCollateral by the total eligible locked (all locks are
+  // released). The difference (totalEligibleLocked - slashAmount) is released
+  // back to available.
+  for (const vaultId of vaultIds) {
+    const vaultLocks = locks.filter((lk) => lk.vaultId === vaultId);
+    const vaultLockedTotal = vaultLocks.reduce(
+      (sum, lk) => sum.plus(new Decimal(lk.amount)),
+      new Decimal(0),
+    );
+    // Pro-rata share of the slash for this vault.
+    const vaultSlashShare = totalEligibleLocked.gt(0)
+      ? slashAmount.times(vaultLockedTotal).dividedBy(totalEligibleLocked)
+      : slashAmount;
+
+    const vault = await tx.vault.findUnique({ where: { id: vaultId } });
+    if (vault) {
+      await tx.vault.update({
+        where: { id: vault.id, lockedCollateral: vault.lockedCollateral },
+        data: {
+          usableCollateral: moneySub(vault.usableCollateral, vaultSlashShare),
+          lockedCollateral: moneySub(vault.lockedCollateral, vaultLockedTotal),
+        },
+      });
+    }
+  }
+
+  // Create a single SLASH ledger entry for the EXACT slash amount.
+  const providerId = locks[0].providerId;
+  await tx.ledgerEntry.create({
+    data: {
+      debitAccount: compensationAccount,
+      creditAccount: `provider:${providerId}:vault:${asset}`,
+      amount: slashAmount,
+      asset,
+      entryType: "SLASH",
+      executionId,
+      idempotencyKey: `slash-amount:${executionId}:${asset}:${slashAmount.toString()}`,
+      description: `Collateral slashed (dispute resolution) for execution ${executionId}`,
+    },
+  });
+
+  return { slashedAmount: slashAmount, totalEligibleLocked };
+}
+
 // ---- Concurrency-safe capacity reservation -------------------------------
 
 export interface ReserveCapacityInput {

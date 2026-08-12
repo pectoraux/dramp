@@ -2,10 +2,15 @@
 // Deliveries are retryable and idempotent. Each delivery is signed with HMAC-SHA256.
 // In the prototype, actual HTTP delivery is simulated (recorded as DELIVERED)
 // but the delivery records are real and queryable.
+//
+// SECURITY: webhook signing secrets are encrypted at rest (AES-256-GCM).
+// The plaintext is shown ONCE at creation and never stored. At signing time,
+// the secret is decrypted in memory to compute the HMAC.
 
 import { db } from "@/lib/db";
 import { createHmac } from "node:crypto";
 import { appendAuditEvent } from "@/lib/engine/audit";
+import { encryptSecret, decryptSecret } from "@/lib/crypto";
 
 const MAX_ATTEMPTS = 5;
 
@@ -19,7 +24,9 @@ export async function emitProviderEvent(providerId: string, eventType: string, p
     const events = JSON.parse(ep.events) as string[];
     if (events.length > 0 && !events.includes(eventType) && !events.includes("*")) continue;
     const payloadJson = JSON.stringify(payload);
-    const signature = createHmac("sha256", ep.secret).update(payloadJson).digest("hex");
+    // Decrypt the signing secret in memory (never stored plaintext).
+    const secret = decryptSecret(ep.encryptedSecret);
+    const signature = createHmac("sha256", secret).update(payloadJson).digest("hex");
     await db.webhookDelivery.create({
       data: {
         endpointId: ep.id,
@@ -34,9 +41,8 @@ export async function emitProviderEvent(providerId: string, eventType: string, p
 }
 
 // Process pending deliveries (called by the ticker / on-demand).
-// In the prototype we simulate successful delivery for endpoints whose URL
-// starts with "mock://" or "https://"; real HTTP is not attempted to avoid
-// external network calls from the sandbox.
+// In the prototype we simulate successful delivery; real HTTP is not attempted
+// to avoid external network calls from the sandbox.
 export async function processPendingWebhooks(limit = 20): Promise<number> {
   const now = new Date();
   const pending = await db.webhookDelivery.findMany({
@@ -71,11 +77,13 @@ export async function processPendingWebhooks(limit = 20): Promise<number> {
 }
 
 // Register a webhook endpoint for a provider.
+// Returns the plaintext secret ONCE — the caller must store it securely.
 export async function registerWebhook(providerId: string, url: string, events: string[]): Promise<{ id: string; secret: string }> {
   const { randomBytes } = await import("node:crypto");
   const secret = `whsec_${randomBytes(16).toString("hex")}`;
+  const { encryptedSecret, encryptionKeyVersion } = encryptSecret(secret);
   const ep = await db.webhookEndpoint.create({
-    data: { providerId, url, secret, events: JSON.stringify(events), status: "ACTIVE" },
+    data: { providerId, url, encryptedSecret, encryptionKeyVersion, events: JSON.stringify(events), status: "ACTIVE" },
   });
   await appendAuditEvent({
     eventType: "webhook_registered",

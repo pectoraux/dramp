@@ -1,12 +1,15 @@
 // Dispute + reconciliation services.
 // ARCHITECTURE RULE: all economic effects (slash, compensation, adjustments)
 // flow through the existing LedgerEntry + AuditEvent infrastructure.
+//
+// SLASHING (Prompt 2.1): the actual collateral deduction equals the approved
+// `slashedAmount` — never implicitly slashes an entire execution's locked
+// collateral. Rejects amounts above eligible locked collateral.
 
 import { db } from "@/lib/db";
 import { Decimal } from "@/lib/engine/money";
 import { appendAuditEvent } from "@/lib/engine/audit";
-import { slashCollateralForExecution } from "@/lib/engine/collateral";
-import { slash as slashEntry } from "@/lib/engine/ledger";
+import { slashCollateralAmount, SlashExceedsEligibleError } from "@/lib/engine/collateral";
 
 // ---- Disputes ------------------------------------------------------------
 
@@ -29,7 +32,6 @@ export async function openDispute(input: {
       openedById: input.openedById,
     },
   });
-  // Mark the obligation as DISPUTED if provided.
   if (input.obligationId) {
     await db.obligation.update({ where: { id: input.obligationId }, data: { status: "DISPUTED" } });
   }
@@ -50,10 +52,95 @@ export async function resolveDispute(input: {
   compensationAmount?: Decimal | string | number;
   slashedAmount?: Decimal | string | number;
   note?: string;
-}): Promise<void> {
+}): Promise<{ slashed: boolean; slashedAmount?: string; error?: string }> {
   const d = await db.dispute.findUnique({ where: { id: input.disputeId } });
   if (!d) throw new Error("dispute not found");
 
+  // Prevent double-resolution.
+  if (d.status !== "OPEN" && d.status !== "INVESTIGATING") {
+    return { slashed: false, error: `dispute already resolved (status=${d.status})` };
+  }
+
+  // For SLASHED resolution, validate + execute the slash BEFORE updating the
+  // dispute status. If the slash fails, the dispute stays OPEN.
+  if (input.resolution === "SLASHED") {
+    const slashAmount = new Decimal(input.slashedAmount ?? 0);
+    if (slashAmount.lte(0)) {
+      return { slashed: false, error: "slash amount must be positive" };
+    }
+
+    // Determine the collateral asset from the execution's locked collateral.
+    const locks = await db.collateralLock.findMany({
+      where: { executionId: d.executionId, providerId: d.providerId, status: "LOCKED" },
+      select: { asset: true, amount: true },
+    });
+    if (locks.length === 0) {
+      return { slashed: false, error: "no eligible locked collateral for this provider + execution" };
+    }
+    const collateralAsset = locks[0].asset;
+
+    try {
+      const result = await db.$transaction(async (tx) => {
+        return slashCollateralAmount(
+          d.executionId,
+          slashAmount,
+          collateralAsset,
+          `dispute:${d.id}:compensation`,
+          tx,
+        );
+      }, { timeout: 30000, maxWait: 15000 });
+
+      // Slash succeeded — now update the dispute status.
+      await db.dispute.update({
+        where: { id: input.disputeId },
+        data: {
+          status: input.resolution,
+          resolution: input.note ?? input.resolution,
+          compensationAmount: input.compensationAmount ? new Decimal(input.compensationAmount) : null,
+          slashedAmount: result.slashedAmount,
+          resolvedById: input.resolvedById,
+          resolvedAt: new Date(),
+        },
+      });
+
+      // Update obligation status.
+      if (d.obligationId) {
+        await db.obligation.update({ where: { id: d.obligationId }, data: { status: "SLASHED" } });
+      }
+      // Update provider reputation.
+      const provider = await db.liquidityProvider.findUnique({ where: { id: d.providerId }, select: { reputationScore: true } });
+      if (provider) {
+        await db.liquidityProvider.update({
+          where: { id: d.providerId },
+          data: { reputationScore: Math.max(0, provider.reputationScore - 0.1) },
+        });
+      }
+
+      await appendAuditEvent({
+        executionId: d.executionId,
+        eventType: "dispute_resolved",
+        payload: {
+          disputeId: d.id,
+          resolution: input.resolution,
+          slashedAmount: result.slashedAmount.toString(),
+          totalEligibleLocked: result.totalEligibleLocked.toString(),
+          asset: collateralAsset,
+        },
+        actorType: "USER",
+        actorId: input.resolvedById,
+      });
+
+      return { slashed: true, slashedAmount: result.slashedAmount.toString() };
+    } catch (e) {
+      // Slash failed — dispute stays OPEN, no status update.
+      if (e instanceof SlashExceedsEligibleError) {
+        return { slashed: false, error: e.message };
+      }
+      throw e;
+    }
+  }
+
+  // Non-slash resolution — update status directly.
   await db.dispute.update({
     where: { id: input.disputeId },
     data: {
@@ -66,37 +153,18 @@ export async function resolveDispute(input: {
     },
   });
 
-  if (input.resolution === "SLASHED" && input.slashedAmount) {
-    // Slash collateral via the existing collateral engine — this creates the
-    // SLASH ledger entry and reduces the provider's usable collateral.
-    await db.$transaction(async (tx) => {
-      await slashCollateralForExecution(d.executionId, tx, `dispute:${d.id}:compensation`);
-    });
-    // Update obligation status.
-    if (d.obligationId) {
-      await db.obligation.update({ where: { id: d.obligationId }, data: { status: "SLASHED" } });
-    }
-    // Update provider reputation.
-    await db.liquidityProvider.update({
-      where: { id: d.providerId },
-      data: { reputationScore: Math.max(0, (await db.liquidityProvider.findUnique({ where: { id: d.providerId }, select: { reputationScore: true } }))!.reputationScore - 0.1) },
-    });
-  }
-
   await appendAuditEvent({
     executionId: d.executionId,
     eventType: "dispute_resolved",
-    payload: { disputeId: d.id, resolution: input.resolution, compensation: input.compensationAmount?.toString(), slashed: input.slashedAmount?.toString() },
+    payload: { disputeId: d.id, resolution: input.resolution, compensation: input.compensationAmount?.toString() },
     actorType: "USER",
     actorId: input.resolvedById,
   });
+  return { slashed: false };
 }
 
 // ---- Reconciliation ------------------------------------------------------
 
-// Detect discrepancies: compare dRamp ledger obligations vs provider-reported
-// settlement references. For the prototype, we detect stale obligations
-// (past due, not fulfilled) and missing settlements.
 export async function detectReconciliationItems(providerId: string): Promise<any[]> {
   const stale = await db.obligation.findMany({
     where: {
@@ -122,7 +190,6 @@ export async function detectReconciliationItems(providerId: string): Promise<any
   return items;
 }
 
-// Create a reconciliation item (Ops can also create manually).
 export async function createReconciliationItem(input: {
   providerId: string;
   type: string;

@@ -9,13 +9,21 @@
 //     COMPLETES)
 //   - paid incentives are credited via the existing ledger
 //
-// Campaign eligibility is enforced: corridor, risk level, provider type,
-// per-transaction cap, volume cap, total budget, and date window.
+// CONCURRENCY SAFETY (Prompt 2.1):
+//   - IncentiveEarning has a @@unique([campaignId, executionId, providerId])
+//     constraint, so duplicate accrual is prevented at the DB level.
+//   - Budget + volume reservation happen inside a single transaction using
+//     conditional updates (optimistic locking on `accrued` + `qualifiedVolume`),
+//     so two concurrent completions cannot overspend a campaign.
+//   - On unique-constraint violation, the earning already exists → skip.
+//   - On conditional-update failure (another txn modified the campaign), retry.
 
 import { db } from "@/lib/db";
-import { Decimal, moneyAdd, moneyGte, moneyLte, moneyMin, bpsToFactor, incentiveForAmount } from "@/lib/engine/money";
+import { Prisma } from "@prisma/client";
+import { Decimal, moneyAdd, moneyGte, moneyLte, moneyGt, moneyMin, bpsToFactor, incentiveForAmount } from "@/lib/engine/money";
 import { appendAuditEvent } from "@/lib/engine/audit";
-import { incentive as incentiveEntry } from "@/lib/engine/ledger";
+
+const MAX_RETRIES = 3;
 
 // Find the best active campaign for a given settlement asset + corridor context.
 // Returns the incentiveBps to apply, or 0 if none.
@@ -39,6 +47,11 @@ export async function getApplicableIncentiveBps(
     // Check budget remaining.
     const remaining = new Decimal(c.totalBudget).minus(new Decimal(c.accrued)).minus(new Decimal(c.paid));
     if (moneyLte(remaining, 0)) continue;
+    // Check volume cap remaining.
+    if (c.volumeCap) {
+      const volRemaining = new Decimal(c.volumeCap).minus(new Decimal(c.qualifiedVolume));
+      if (moneyLte(volRemaining, 0)) continue;
+    }
     if (c.incentiveBps > bestBps) {
       bestBps = c.incentiveBps;
       bestId = c.id;
@@ -63,6 +76,10 @@ function isCampaignEligible(c: any, ctx: { sourceAsset: string; destinationAsset
 // Accrue incentive earnings for a completed execution. Called from
 // completeExecution (via a hook). This is the ONLY place incentives are
 // "earned" — never at route display time.
+//
+// Concurrency-safe: each leg's earning is created inside a single transaction
+// with a conditional update on the campaign's accrued+qualifiedVolume, plus a
+// unique constraint that prevents duplicate (campaignId, executionId, providerId).
 export async function accrueIncentiveForExecution(executionId: string): Promise<void> {
   const execution = await db.execution.findUnique({
     where: { id: executionId },
@@ -83,49 +100,123 @@ export async function accrueIncentiveForExecution(executionId: string): Promise<
     });
     if (!campaignId) continue;
 
-    const campaign = await db.settlementIncentiveCampaign.findUnique({ where: { id: campaignId } });
-    if (!campaign) continue;
-
-    // Compute the incentive amount on this leg's settlement volume.
-    const incAmount = incentiveForAmount(leg.amount, campaign.incentiveBps);
-    if (moneyLte(incAmount, 0)) continue;
-
-    // Enforce per-transaction cap.
-    let amount = incAmount;
-    if (campaign.perTxnCap && moneyGt(amount, campaign.perTxnCap)) {
-      amount = new Decimal(campaign.perTxnCap);
+    // Try to accrue with retry on concurrency conflict.
+    let accrued = false;
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      const result = await tryAccrueLeg(campaignId, executionId, leg);
+      if (result === "ACCRUED") { accrued = true; break; }
+      if (result === "DUPLICATE") { accrued = false; break; } // already earned
+      if (result === "SKIP") { accrued = false; break; } // budget/volume exhausted
+      // result === "CONFLICT" → retry
     }
+    if (!accrued) continue;
 
-    // Enforce total budget remaining.
-    const remaining = new Decimal(campaign.totalBudget).minus(new Decimal(campaign.accrued)).minus(new Decimal(campaign.paid));
-    if (moneyLte(remaining, 0)) {
-      // Budget exhausted — mark campaign EXHAUSTED.
-      await db.settlementIncentiveCampaign.update({ where: { id: campaignId }, data: { status: "EXHAUSTED" } });
-      continue;
-    }
-    amount = moneyMin(amount, remaining);
-
-    // Create the earning record (idempotent: check if one already exists).
-    const existing = await db.incentiveEarning.findFirst({
-      where: { campaignId, executionId, providerId: leg.providerId },
+    await appendAuditEvent({
+      executionId,
+      eventType: "incentive_accrued",
+      payload: { campaignId, providerId: leg.providerId, legId: leg.id },
+      actorType: "SYSTEM",
     });
-    if (existing) continue;
+  }
+}
 
-    await db.$transaction(async (tx) => {
-      await tx.incentiveEarning.create({
+type AccrueResult = "ACCRUED" | "DUPLICATE" | "SKIP" | "CONFLICT";
+
+// Attempt to accrue a single leg's incentive inside one transaction.
+// Uses conditional update on the campaign to prevent overspending.
+async function tryAccrueLeg(campaignId: string, executionId: string, leg: any): Promise<AccrueResult> {
+  try {
+    return await db.$transaction(async (tx) => {
+      // Re-fetch the campaign INSIDE the transaction.
+      const campaign = await tx.settlementIncentiveCampaign.findUnique({ where: { id: campaignId } });
+      if (!campaign || campaign.status !== "ACTIVE") return "SKIP";
+
+      // Check date window.
+      const now = new Date();
+      if (now < campaign.startDate || now > campaign.endDate) return "SKIP";
+
+      // Compute the qualifying volume (the leg's settlement amount).
+      const legVolume = new Decimal(leg.amount);
+
+      // Enforce volume cap.
+      if (campaign.volumeCap) {
+        const volRemaining = new Decimal(campaign.volumeCap).minus(new Decimal(campaign.qualifiedVolume));
+        if (moneyLte(volRemaining, 0)) {
+          await markExhausted(tx, campaignId);
+          return "SKIP";
+        }
+        // If this leg's volume exceeds remaining volume cap, cap the qualifying
+        // volume to what remains. The earning is proportional.
+        if (moneyGt(legVolume, volRemaining)) {
+          // Qualifying volume is capped; the incentive is computed on the
+          // capped volume, not the full leg.
+          return await accrueWithCappedVolume(tx, campaign, executionId, leg, volRemaining);
+        }
+      }
+
+      // Compute the incentive amount on this leg's settlement volume.
+      const incAmount = incentiveForAmount(legVolume, campaign.incentiveBps);
+      if (moneyLte(incAmount, 0)) return "SKIP";
+
+      // Enforce per-transaction cap.
+      let amount = incAmount;
+      if (campaign.perTxnCap && moneyGt(amount, campaign.perTxnCap)) {
+        amount = new Decimal(campaign.perTxnCap);
+      }
+
+      // Enforce total budget remaining.
+      const budgetRemaining = new Decimal(campaign.totalBudget).minus(new Decimal(campaign.accrued)).minus(new Decimal(campaign.paid));
+      if (moneyLte(budgetRemaining, 0)) {
+        await markExhausted(tx, campaignId);
+        return "SKIP";
+      }
+      amount = moneyMin(amount, budgetRemaining);
+
+      // Try to create the earning record. The unique constraint on
+      // (campaignId, executionId, providerId) prevents duplicates.
+      try {
+        await tx.incentiveEarning.create({
+          data: {
+            campaignId,
+            executionId,
+            providerId: leg.providerId,
+            amount,
+            qualifiedVolume: legVolume,
+            status: "ACCRUED",
+          },
+        });
+      } catch (e) {
+        if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+          return "DUPLICATE"; // already earned for this (campaign, execution, provider)
+        }
+        throw e;
+      }
+
+      // Conditional update: only succeeds if accrued + qualifiedVolume haven't
+      // changed since we read them (optimistic locking).
+      const updated = await tx.settlementIncentiveCampaign.updateMany({
+        where: {
+          id: campaignId,
+          accrued: new Decimal(campaign.accrued),
+          qualifiedVolume: new Decimal(campaign.qualifiedVolume),
+        },
         data: {
-          campaignId,
-          executionId,
-          providerId: leg.providerId,
-          amount,
-          status: "ACCRUED",
+          accrued: moneyAdd(new Decimal(campaign.accrued), amount),
+          qualifiedVolume: moneyAdd(new Decimal(campaign.qualifiedVolume), legVolume),
         },
       });
-      await tx.settlementIncentiveCampaign.update({
-        where: { id: campaignId },
-        data: { accrued: moneyAdd(new Decimal(campaign.accrued), amount) },
-      });
-      // Post an INCENTIVE ledger entry crediting the provider's operational account.
+      if (updated.count === 0) {
+        // Another transaction modified the campaign — abort and retry.
+        throw new ConcurrencyConflictError();
+      }
+
+      // Check if budget is now exhausted.
+      const newRemaining = new Decimal(campaign.totalBudget).minus(moneyAdd(new Decimal(campaign.accrued), amount)).minus(new Decimal(campaign.paid));
+      if (moneyLte(newRemaining, 0)) {
+        await markExhausted(tx, campaignId);
+      }
+
+      // Post an INCENTIVE ledger entry.
       await tx.ledgerEntry.create({
         data: {
           debitAccount: `dramp:incentives:${leg.destinationAsset}`,
@@ -138,15 +229,87 @@ export async function accrueIncentiveForExecution(executionId: string): Promise<
           description: `Campaign "${campaign.name}" incentive accrued`,
         },
       });
-    });
 
-    await appendAuditEvent({
-      executionId,
-      eventType: "incentive_accrued",
-      payload: { campaignId, campaignName: campaign.name, providerId: leg.providerId, amount: amount.toString(), asset: leg.destinationAsset },
-      actorType: "SYSTEM",
-    });
+      return "ACCRUED";
+    }, { timeout: 30000, maxWait: 15000 });
+  } catch (e) {
+    if (e instanceof ConcurrencyConflictError) return "CONFLICT";
+    // Prisma unique constraint on the earning → duplicate
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") return "DUPLICATE";
+    throw e;
   }
+}
+
+// Accrue with volume capped to the remaining volume-cap headroom.
+async function accrueWithCappedVolume(tx: any, campaign: any, executionId: string, leg: any, cappedVolume: Decimal): Promise<AccrueResult> {
+  // Pro-rate the incentive: the qualifying volume is capped, so the incentive
+  // is computed on the capped volume.
+  const incAmount = incentiveForAmount(cappedVolume, campaign.incentiveBps);
+  if (moneyLte(incAmount, 0)) return "SKIP";
+
+  let amount = incAmount;
+  if (campaign.perTxnCap && moneyGt(amount, campaign.perTxnCap)) {
+    amount = new Decimal(campaign.perTxnCap);
+  }
+  const budgetRemaining = new Decimal(campaign.totalBudget).minus(new Decimal(campaign.accrued)).minus(new Decimal(campaign.paid));
+  if (moneyLte(budgetRemaining, 0)) {
+    await markExhausted(tx, campaign.id);
+    return "SKIP";
+  }
+  amount = moneyMin(amount, budgetRemaining);
+
+  try {
+    await tx.incentiveEarning.create({
+      data: {
+        campaignId: campaign.id,
+        executionId,
+        providerId: leg.providerId,
+        amount,
+        qualifiedVolume: cappedVolume,
+        status: "ACCRUED",
+      },
+    });
+  } catch (e) {
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") return "DUPLICATE";
+    throw e;
+  }
+
+  const updated = await tx.settlementIncentiveCampaign.updateMany({
+    where: {
+      id: campaign.id,
+      accrued: new Decimal(campaign.accrued),
+      qualifiedVolume: new Decimal(campaign.qualifiedVolume),
+    },
+    data: {
+      accrued: moneyAdd(new Decimal(campaign.accrued), amount),
+      qualifiedVolume: moneyAdd(new Decimal(campaign.qualifiedVolume), cappedVolume),
+    },
+  });
+  if (updated.count === 0) throw new ConcurrencyConflictError();
+
+  await tx.ledgerEntry.create({
+    data: {
+      debitAccount: `dramp:incentives:${leg.destinationAsset}`,
+      creditAccount: `provider:${leg.providerId}:operational:${leg.destinationAsset}`,
+      amount,
+      asset: leg.destinationAsset,
+      entryType: "INCENTIVE",
+      executionId,
+      idempotencyKey: `incentive-campaign:${executionId}:${leg.id}:${campaign.id}`,
+      description: `Campaign "${campaign.name}" incentive accrued (volume-capped)`,
+    },
+  });
+
+  return "ACCRUED";
+}
+
+class ConcurrencyConflictError extends Error {}
+
+async function markExhausted(tx: any, campaignId: string): Promise<void> {
+  await tx.settlementIncentiveCampaign.updateMany({
+    where: { id: campaignId, status: "ACTIVE" },
+    data: { status: "EXHAUSTED" },
+  });
 }
 
 // Create a new incentive campaign (admin or sponsor).
@@ -177,6 +340,7 @@ export async function createCampaign(input: {
       totalBudget: new Decimal(input.totalBudget),
       perTxnCap: input.perTxnCap ? new Decimal(input.perTxnCap) : null,
       volumeCap: input.volumeCap ? new Decimal(input.volumeCap) : null,
+      qualifiedVolume: new Decimal(0),
       eligibleCorridors: input.eligibleCorridors ? JSON.stringify(input.eligibleCorridors) : null,
       eligibleRiskLevels: input.eligibleRiskLevels ? JSON.stringify(input.eligibleRiskLevels) : null,
       eligibleProviderTypes: input.eligibleProviderTypes ? JSON.stringify(input.eligibleProviderTypes) : null,
@@ -204,6 +368,8 @@ export async function getCampaignStats(campaignId: string) {
   const paid = new Decimal(c.paid);
   const budget = new Decimal(c.totalBudget);
   const remaining = budget.minus(accrued).minus(paid);
+  const qualifiedVolume = new Decimal(c.qualifiedVolume);
+  const volRemaining = c.volumeCap ? new Decimal(c.volumeCap).minus(qualifiedVolume) : null;
   return {
     id: c.id,
     name: c.name,
@@ -216,10 +382,11 @@ export async function getCampaignStats(campaignId: string) {
     accrued: accrued.toString(),
     paid: paid.toString(),
     remaining: remaining.toString(),
+    volumeCap: c.volumeCap?.toString() ?? null,
+    qualifiedVolume: qualifiedVolume.toString(),
+    volumeRemaining: volRemaining?.toString() ?? null,
     status: c.status,
     earningCount: c.earnings.length,
     sponsor: c.sponsorProvider?.name ?? null,
   };
 }
-
-import { moneyGt } from "@/lib/engine/money";

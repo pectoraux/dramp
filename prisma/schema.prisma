@@ -473,7 +473,8 @@ model WebhookEndpoint {
   providerId    String
   provider      LiquidityProvider @relation(fields: [providerId], references: [id])
   url           String
-  secret        String   // signing secret for HMAC payloads
+  encryptedSecret String // AES-256-GCM encrypted signing secret (never plaintext)
+  encryptionKeyVersion Int @default(1) // key version for rotation
   events        String   // JSON array of event types to subscribe to
   status        String   @default("ACTIVE") // ACTIVE | PAUSED
   createdAt     DateTime @default(now())
@@ -522,6 +523,7 @@ model SettlementIncentiveCampaign {
   totalBudget     Decimal  // max total incentive payout (in settlement asset)
   perTxnCap       Decimal? // max incentive per single execution
   volumeCap       Decimal? // max qualifying settlement volume
+  qualifiedVolume Decimal  @default(0) // cumulative qualifying settlement volume actually earned
   accrued         Decimal  @default(0) // earned by completed executions (not yet paid)
   paid            Decimal  @default(0) // actually credited
   eligibleCorridors String? // JSON array of "SRC:DST" corridors; null = all
@@ -546,10 +548,14 @@ model IncentiveEarning {
   executionId     String
   providerId      String
   amount          Decimal
+  qualifiedVolume Decimal  @default(0) // settlement volume that earned this incentive
   status          String   @default("ACCRUED") // ACCRUED | PAID | REVERSED
   createdAt       DateTime @default(now())
   paidAt          DateTime?
 
+  // Concurrency safety: one earning per (campaign, execution, provider).
+  // Prevents duplicate accrual if two concurrent completion processes race.
+  @@unique([campaignId, executionId, providerId])
   @@index([campaignId])
   @@index([executionId])
 }

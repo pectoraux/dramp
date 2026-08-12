@@ -7,7 +7,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   const auth = await requireAdmin();
   if (!isAuthed(auth)) return auth.error;
   const body = await req.json();
-  await resolveDispute({
+  const result = await resolveDispute({
     disputeId: id,
     resolution: body.resolution,
     resolvedById: auth.id,
@@ -15,5 +15,8 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     slashedAmount: body.slashedAmount,
     note: body.note,
   });
-  return NextResponse.json({ resolved: true });
+  if (result.error) {
+    return NextResponse.json({ resolved: false, error: result.error }, { status: 400 });
+  }
+  return NextResponse.json({ resolved: true, slashed: result.slashed, slashedAmount: result.slashedAmount });
 }

@@ -499,12 +499,16 @@ export async function seedDatabase(opts: { reset?: boolean } = {}) {
   const { createApiKey } = await import("@/lib/provider-api/auth");
   const apiKeyResult = await createApiKey(northbridge.id, "Northbridge API Key", ["offers", "executions", "obligations", "reconcile"]);
 
-  // Webhook endpoint for Northbridge.
+  // Webhook endpoint for Northbridge (encrypted signing secret).
+  const { encryptSecret } = await import("@/lib/crypto");
+  const demoWebhookSecret = "whsec_demo_northbridge_001";
+  const { encryptedSecret, encryptionKeyVersion } = encryptSecret(demoWebhookSecret);
   await db.webhookEndpoint.create({
     data: {
       providerId: northbridge.id,
       url: "https://mock.northbridge.example/webhooks/dramp",
-      secret: "whsec_demo_northbridge_001",
+      encryptedSecret,
+      encryptionKeyVersion,
       events: JSON.stringify(["execution.accepted", "execution.rejected", "execution.completed", "obligation.created"]),
       status: "ACTIVE",
     },
