@@ -295,3 +295,27 @@ Stage Summary:
 - serializeProvider() extended to include jurisdiction/contactEmail/apiIntegrationStatus/supportedAssets/settlementMethods/onboardingNote.
 - Every view consumes the existing API; no second routing engine / ledger / risk model / state machine was created. All numbers come from real API responses.
 - Browser verification PASSED end-to-end across all three roles (admin, operator, alice). Existing tabs (Send/Executions/Providers/Monitor/Audit/Waitlist) all verified still working.
+
+---
+Task ID: P2-Core
+Agent: main (Z.ai Code)
+Task: Prompt 2 — open liquidity marketplace, provider network, ops console. Turn the execution engine into a network where independent providers connect, compete, manage liquidity, receive incentives, and operate through APIs. Reuse existing domain layer — no parallel systems.
+
+Work Log:
+- Extended Prisma schema with 8 new models (ApiKey, WebhookEndpoint, WebhookDelivery, SettlementIncentiveCampaign, IncentiveEarning, Dispute, ReconciliationItem, Notification) + LiquidityProvider onboarding fields (jurisdiction, contactEmail, supportedAssets, settlementMethods, apiIntegrationStatus, lifecycle). Pushed to Neon.
+- Built provider-api services: auth (bcrypt-hashed API keys), guard (provider-scoped), webhooks (HMAC-signed, retryable), incentives (campaign eligibility + accrue-on-completion + budget enforcement), marketplace (public redacted offers + anonymized demand + competition), ops (overview/queue/bottlenecks/risk/concentration), disputes (open/resolve/slash), onboarding (application + lifecycle), notifications.
+- Hooked incentive accrual into completeExecution so earnings are recorded ONLY on completion (never at route display).
+- Enriched routing buildGraph with active campaign incentives (no parallel pricing — reuses existing incentive integration in computeHopOutput).
+- Built 35+ new API routes: Open Liquidity API v1 (provider-key auth, idempotent), marketplace (public), ops (admin-only), incentives, onboarding, settlement-assets, notifications.
+- Updated seed: 8 realistic providers (Northbridge Bank, SwiftPay PSP, Meridian LP, Atlas Exchange, OpenSwap, Sahara Cash, Continental Treasury, Pacific Rail FX pending), 2 incentive campaigns, API key + webhook for Northbridge.
+- Delegated UI to full-stack subagent: 3 new tabs (Marketplace, Ops, API) with 10 ops sub-views, marketplace competition, settlement asset registry, API key/webhook management + docs. All role-gated.
+- Tests: tests/p2-marketplace.test.ts (40 assertions) — provider API auth + isolation, marketplace redaction, demand anonymization, competition, incentives, ops authorization, settlement asset registry, onboarding lifecycle. All pass.
+- Verified Prompt 1 golden demo still works (17 routes evaluated, execution progresses through state machine).
+- Lint clean, type-check clean. Pushed to GitHub (commit a1a73ce).
+
+Stage Summary:
+- The execution engine is now an open liquidity marketplace. Providers apply → admin approves → provider publishes offers via API or portal → router discovers and ranks routes → providers compete → user waits for better liquidity → new supply improves the route → execution proceeds → incentives accrue on completion → ops monitors the entire lifecycle.
+- Open Liquidity API v1 is live: /api/v1/provider/{offers,executions,obligations,reconcile} with provider-key auth, scope checks, idempotency, and webhook delivery.
+- Marketplace shows public (redacted) offers, anonymized pending demand, and provider competition — all derived from real data, no fabricated metrics.
+- Ops console has 10 sub-views covering the full network lifecycle: overview, execution queue, bottlenecks, provider/asset risk, concentration, disputes, reconciliation, incentives, onboarding.
+- Hard invariants preserved: volatile assets never collateral (enforced in schema, seed, routing, serialize, UI); all economic effects through the existing ledger; all state changes audited; authorization provider/user scoped.
