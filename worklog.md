@@ -516,3 +516,22 @@ Stage Summary:
 - Route replacement only occurs when absolute quality improvement exceeds ROUTE_REPLACEMENT_THRESHOLD (0.01) — no unexplained magic numbers.
 - Initial ranking still uses candidate-set-relative normalization (correct for ranking among currently available alternatives).
 - Multi-leg routes are penalized consistently in both initial ranking and waiting comparison.
+
+---
+Task ID: P3.4-Snapshot
+Agent: main (Z.ai Code)
+Task: Fix split-route absolute cost notional + make persisted routes historically stable via leg snapshots. No new features.
+
+Work Log:
+- Split-route notional: calculateAbsoluteRouteQuality now sums all SOURCE legs for the notional. A 60/40 split ($6k+$4k) correctly uses $10k, not $6k. Split and unsplit routes with identical economics receive equivalent absolute cost treatment.
+- Historical leg snapshot: added 6 snapshot fields to the Leg model (snapshotSourceCountry, snapshotDestinationCountry, snapshotFeeBps, snapshotIncentiveBps, snapshotRate, snapshotExpectedExecutionSeconds). Written once at route persistence time, never updated.
+- persistSingleRoute + discoverAndPersistRoutes: both store snapshot fields from CandidateLeg.
+- reconstructPersistedRoute: reads from leg's own snapshot fields, not the mutable LiquidityOffer. No offer join needed. A provider changing their offer after route selection does not affect the reconstructed historical route.
+- Tests: tests/p3-snapshot.test.ts (18 assertions) — split notional, split vs unsplit, offer mutation (feeBps 30→80, snapshot stays 30), multi-hop snapshot, patient execution with split reference, audit consistency.
+- All existing tests pass (collateral 23, P3.2 scoring 12, P3.3 cross-time 20). Lint + type-check clean.
+- Pushed to GitHub (commit 1f6cd0b).
+
+Stage Summary:
+- Split routes use total source notional (sum of all SOURCE legs), not just the first leg's amount.
+- Persisted routes are historically stable: leg snapshot fields capture the offer's economic terms at persistence time and never change. A provider modifying their offer after a route is selected does not alter the historical route's economics.
+- The route in the audit trail, the route used for WAIT_FOR_BETTER comparison, and the route shown in receipts all remain identical after the provider changes their current offer.
