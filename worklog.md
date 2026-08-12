@@ -319,3 +319,23 @@ Stage Summary:
 - Marketplace shows public (redacted) offers, anonymized pending demand, and provider competition — all derived from real data, no fabricated metrics.
 - Ops console has 10 sub-views covering the full network lifecycle: overview, execution queue, bottlenecks, provider/asset risk, concentration, disputes, reconciliation, incentives, onboarding.
 - Hard invariants preserved: volatile assets never collateral (enforced in schema, seed, routing, serialize, UI); all economic effects through the existing ledger; all state changes audited; authorization provider/user scoped.
+
+---
+Task ID: P2.1-Hardening
+Agent: main (Z.ai Code)
+Task: Financial-integrity/security hardening pass on Prompt 2. Encrypt webhook secrets at rest, enforce volumeCap cumulatively, make incentive accrual concurrency-safe, make dispute slashing amount-aware. No routing/state-machine/collateral-invariant/marketplace changes.
+
+Work Log:
+- 1. Webhook secret encryption: new src/lib/crypto.ts (AES-256-GCM, key versioning, GCM auth tag for tamper detection). Schema: WebhookEndpoint.secret → encryptedSecret + encryptionKeyVersion. registerWebhook encrypts before storing, returns plaintext once. emitProviderEvent decrypts in memory at signing time. Added WEBHOOK_ENCRYPTION_KEY env var.
+- 2. Volume cap enforcement: added qualifiedVolume to SettlementIncentiveCampaign + IncentiveEarning. getApplicableIncentiveBps checks volumeCap remaining. accrueIncentiveForExecution enforces qualifiedVolume + legVolume <= volumeCap inside the same transaction, pro-rates the earning if volume is capped.
+- 3. Concurrency-safe incentive accrual: added @@unique([campaignId, executionId, providerId]) to IncentiveEarning. Rewrote accrueIncentiveForExecution: everything inside ONE transaction with conditional updateMany on (accrued, qualifiedVolume) — optimistic locking. Retries on conflict (max 3). Unique constraint prevents duplicate earnings at DB level.
+- 4. Amount-aware slashing: new slashCollateralAmount(executionId, amount, asset, comp, tx) in collateral.ts — slashes EXACTLY the requested amount, rejects amounts > eligible (SlashExceedsEligibleError). resolveDispute validates + executes slash BEFORE updating dispute status (failed slash → dispute stays OPEN). Rejects zero/negative. Prevents double resolution.
+- Tests: tests/p2-hardening.test.ts (28 assertions) — crypto round-trip + tamper detection, webhook secret not exposed in API, volumeCap tracking, dispute slash rejection (excessive/zero), double-resolution prevention. All pass.
+- All existing tests still pass: collateral 23, authz 26, P2 marketplace 43. Lint + type-check clean.
+- Pushed to GitHub (commit a713756).
+
+Stage Summary:
+- Webhook signing secrets are now encrypted at rest (AES-256-GCM with key versioning). Plaintext is shown once at creation and never stored.
+- volumeCap is enforced cumulatively: the campaign tracks qualifiedVolume and stops paying incentives once the cap is reached.
+- Incentive accrual is concurrency-safe: a unique constraint on (campaignId, executionId, providerId) prevents duplicates; budget + volume reservation happen atomically via conditional updates; two concurrent completions cannot overspend a campaign.
+- Dispute slashing is amount-aware: the actual collateral deduction equals the approved slashedAmount, never implicitly slashes an entire execution's locked collateral. Rejects amounts above eligible collateral, zero/negative amounts, and double resolution.
