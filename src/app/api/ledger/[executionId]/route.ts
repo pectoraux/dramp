@@ -1,0 +1,24 @@
+import { NextRequest, NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { serializeLedgerEntry } from "@/lib/engine/serialize";
+
+export async function GET(_req: NextRequest, { params }: { params: Promise<{ executionId: string }> }) {
+  const { executionId } = await params;
+  const entries = await db.ledgerEntry.findMany({
+    where: { executionId },
+    orderBy: { timestamp: "asc" },
+  });
+  // Compute running balances per account.
+  const balances = new Map<string, { asset: string; balance: number }>();
+  for (const e of entries) {
+    const dKey = `${e.debitAccount}:${e.asset}`;
+    const cKey = `${e.creditAccount}:${e.asset}`;
+    const damt = Number(e.amount.toString());
+    balances.set(dKey, { asset: e.asset, balance: (balances.get(dKey)?.balance ?? 0) + damt });
+    balances.set(cKey, { asset: e.asset, balance: (balances.get(cKey)?.balance ?? 0) - damt });
+  }
+  return NextResponse.json({
+    entries: entries.map(serializeLedgerEntry),
+    balances: [...balances.entries()].map(([account, v]) => ({ account, asset: v.asset, balance: v.balance })),
+  });
+}

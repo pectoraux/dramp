@@ -1,0 +1,394 @@
+// dRamp — Cross-Border Value Execution Marketplace
+// Core economic engine schema.
+//
+// NOTE: This is a prototype. SQLite is used as the datastore. All monetary
+// values are stored as Decimal (TEXT under the hood). Concurrency is enforced
+// via Prisma interactive transactions with conditional re-checks inside the
+// transaction. Blockchain / bank / PSP rails are simulated.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Users (mocked identity for the prototype)
+// ---------------------------------------------------------------------------
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  intents   ExecutionIntent[]
+}
+
+// ---------------------------------------------------------------------------
+// 1. ExecutionIntent — what the user wants (stable, may outlive many attempts)
+// ---------------------------------------------------------------------------
+model ExecutionIntent {
+  id                          String   @id @default(cuid())
+  userId                      String
+  user                        User     @relation(fields: [userId], references: [id])
+
+  sourceAmount                Decimal
+  sourceAsset                 String
+  sourceCountry               String
+  destinationAsset            String
+  destinationCountry          String
+  minimumDestinationAmount    Decimal?
+  maximumTotalCost            Decimal?
+  targetRate                  Decimal?
+
+  riskTolerance               String // MAX_RELIABILITY | BALANCED | LOWEST_COST
+  executionPolicy             String // NOW | WAIT_FOR_BETTER
+  maxWaitSeconds              Int
+  cancellationPolicy          String
+  allowedSettlementAssets     String // JSON array of asset ids (empty = all eligible)
+  prohibitedSettlementAssets  String // JSON array of asset ids
+
+  status                      String // ACTIVE | COMPLETED | CANCELLED | EXPIRED | FAILED
+  createdAt                   DateTime @default(now())
+  expiresAt                   DateTime
+
+  executions                  Execution[]
+  auditEvents                 AuditEvent[]
+
+  @@index([status])
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// 2. Execution — a concrete attempt to fulfill an intent
+// ---------------------------------------------------------------------------
+model Execution {
+  id                String   @id @default(cuid())
+  intentId          String
+  intent            ExecutionIntent @relation(fields: [intentId], references: [id])
+
+  attemptNumber     Int
+  status            String // canonical state machine
+  commitmentStatus  String // REVERSIBLE | PARTIALLY_COMMITTED | IRREVERSIBLE
+  selectedRouteId   String?
+  referenceRouteId  String? // current best candidate while SEARCHING
+  selectedRouteJson String? // snapshot of the selected route for the receipt
+  startedAt         DateTime @default(now())
+  completedAt       DateTime?
+  failureReason     String?
+  waitedSeconds     Int      @default(0)
+  lastTickAt        DateTime @default(now())
+
+  routes            Route[]
+  obligations       Obligation[]
+  legs              Leg[]
+  reservations      Reservation[]
+  collateralLocks   CollateralLock[]
+  ledgerEntries     LedgerEntry[]
+  auditEvents       AuditEvent[]
+
+  @@index([intentId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// 3. Route — a candidate plan discovered by the routing engine
+// ---------------------------------------------------------------------------
+model Route {
+  id              String   @id @default(cuid())
+  executionId     String
+  execution       Execution @relation(fields: [executionId], references: [id])
+
+  legCount        Int
+  totalCost       Decimal
+  effectiveCost   Decimal
+  grossOutput     Decimal
+  netOutput       Decimal
+  incentiveBps    Int
+
+  // Separate risk dimensions (0..1)
+  riskCounterparty     Float
+  riskSettlementAsset  Float
+  riskLiquidity        Float
+  riskOperational      Float
+  riskDuration         Float
+  riskComposite        Float
+
+  expectedExecutionSeconds Int
+  explanation             String
+  tag                     String   // BEST | CHEAPEST | FASTEST | SAFEST | CANDIDATE
+  status                  String   // CANDIDATE | SELECTED | RESERVED | SUPERSEDED | EXPIRED | FAILED
+  splitRoute              Boolean  @default(false)
+  expiresAt               DateTime?
+  createdAt               DateTime @default(now())
+
+  legs            Leg[]
+
+  @@index([executionId])
+}
+
+// ---------------------------------------------------------------------------
+// 4. Leg — a single hop within a route (provider + offer + role)
+// ---------------------------------------------------------------------------
+model Leg {
+  id                String   @id @default(cuid())
+  routeId           String
+  route             Route    @relation(fields: [routeId], references: [id])
+  executionId       String?
+  execution         Execution? @relation(fields: [executionId], references: [id])
+
+  providerId        String
+  provider          LiquidityProvider @relation(fields: [providerId], references: [id])
+  offerId           String
+  offer             LiquidityOffer @relation(fields: [offerId], references: [id])
+  sequence          Int
+  role              String   // SOURCE | SETTLEMENT_HOP | DESTINATION
+  amount            Decimal
+  sourceAsset       String
+  destinationAsset  String
+  settlementAssetId String?
+  channelType       String   // AUTOMATIC | MANUAL
+  status            String   // PENDING | RESERVED | IN_PROGRESS | CONFIRMED | FAILED | CANCELLED
+  commitmentStatus  String   // REVERSIBLE | PARTIALLY_COMMITTED | IRREVERSIBLE
+  actorId           String?  // for manual confirmations
+  actorNote         String?
+  confirmedAt       DateTime?
+
+  @@index([routeId])
+  @@index([executionId])
+}
+
+// ---------------------------------------------------------------------------
+// 5. LiquidityProvider — any source of liquidity (not just "agents")
+// ---------------------------------------------------------------------------
+model LiquidityProvider {
+  id              String   @id @default(cuid())
+  name            String
+  providerType    String   // LOCAL_FIAT_AGENT | PSP | BANK | STABLECOIN_LP | CEX | DEX | TREASURY | MARKET_MAKER | SETTLEMENT_ASSET_SPONSOR | HYBRID
+  trustModel      String   // COLLATERALIZED | INSTITUTIONALLY_TRUSTED | PRE_FUNDED | EXTERNAL_ESCROW | NON_CUSTODIAL
+  capabilities    String   // JSON array
+  countries       String   // JSON array
+  reputationScore Float
+  status          String   // ACTIVE | SUSPENDED
+  vaultId         String?
+  createdAt       DateTime @default(now())
+
+  offers          LiquidityOffer[]
+  obligations     Obligation[]
+  legs            Leg[]
+  vault           Vault?
+
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// 6. LiquidityOffer — a published capability with pricing & capacity
+// ---------------------------------------------------------------------------
+model LiquidityOffer {
+  id                    String   @id @default(cuid())
+  providerId            String
+  provider              LiquidityProvider @relation(fields: [providerId], references: [id])
+
+  capability            String   // FIAT_IN | FIAT_OUT | SETTLEMENT_IN | SETTLEMENT_OUT | SWAP | FX | BANK_TRANSFER | MOBILE_MONEY | CASH | CARD | ONCHAIN_TRANSFER | ONCHAIN_SWAP | CEX_EXECUTION | DEX_EXECUTION
+  sourceAsset           String
+  destinationAsset      String
+  sourceCountry         String
+  destinationCountry    String
+  rate                  Decimal  // amount of destination asset per 1 unit of source asset
+  feeBps                Int
+  minimumAmount         Decimal
+  maximumAmount         Decimal
+  availableCapacity     Decimal  // current reservable capacity in source asset
+  reservedCapacity      Decimal  @default(0)
+  settlementAssetId     String?
+  channelType           String   // AUTOMATIC | MANUAL
+  expectedExecutionSeconds Int
+  incentiveBps          Int      @default(0)
+  active                Boolean  @default(true)
+  expiresAt             DateTime?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  legs            Leg[]
+  reservations    Reservation[]
+
+  @@index([providerId])
+  @@index([active])
+}
+
+// ---------------------------------------------------------------------------
+// 7. SettlementAsset — stablecoins, volatile tokens, internal settlement units
+// ---------------------------------------------------------------------------
+model SettlementAsset {
+  id                    String   @id @default(cuid())
+  symbol                String   @unique
+  issuer                String
+  assetType             String   // STABLECOIN | VOLATILE_TOKEN | INTERNAL_SETTLEMENT_UNIT
+  network               String
+  volatilityScore       Float    // 0..1 (0 = stable)
+  liquidityScore        Float    // 0..1 (1 = deep)
+  pegQuality            Float?
+  redemptionModel       String
+  incentiveRate         Int      @default(0) // bps subsidy for usage
+  incentiveSource       String?
+  settlementHaircut     Float    @default(0) // haircut applied when used for settlement
+  collateralHaircut     Float    @default(0) // haircut applied when used as collateral
+  isEligibleCollateral  Boolean  @default(false) // HARD INVARIANT: false if assetType == VOLATILE_TOKEN
+  maximumNetworkExposure Decimal?
+  status                String   // ACTIVE | INELIGIBLE | DELISTED
+  createdAt             DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// 8. Vault — collateral store for COLLATERALIZED providers
+// ---------------------------------------------------------------------------
+model Vault {
+  id                    String   @id @default(cuid())
+  providerId            String   @unique
+  provider              LiquidityProvider @relation(fields: [providerId], references: [id])
+
+  holdingsJson          String   // JSON: { assetId: amount }
+  usableCollateral      Decimal  // Σ market_value × (1 - collateral_haircut)
+  lockedCollateral      Decimal  @default(0)
+  collateralizationRatio Float   @default(1.5) // 150%
+  maxExposure           Decimal
+
+  collateralLocks       CollateralLock[]
+  createdAt             DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// 9. Obligation — the fundamental economic promise created by execution
+// ---------------------------------------------------------------------------
+model Obligation {
+  id                    String   @id @default(cuid())
+  executionId           String
+  execution             Execution @relation(fields: [executionId], references: [id])
+  legId                 String?
+  providerId            String
+  provider              LiquidityProvider @relation(fields: [providerId], references: [id])
+  counterpartyProviderId String?
+  amount                Decimal
+  asset                 String
+  collateralBackingId   String?
+  dueAt                 DateTime
+  status                String   // CREATED | ACTIVE | FULFILLED | EXPIRED | FAILED | DISPUTED | SLASHED
+  createdAt             DateTime @default(now())
+  fulfilledAt           DateTime?
+
+  @@index([executionId])
+  @@index([providerId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// 10. Reservation — capacity hold on an offer (concurrency-safe)
+// ---------------------------------------------------------------------------
+model Reservation {
+  id              String   @id @default(cuid())
+  executionId     String
+  execution       Execution @relation(fields: [executionId], references: [id])
+  offerId         String
+  offer           LiquidityOffer @relation(fields: [offerId], references: [id])
+  amount          Decimal
+  status          String   // ACTIVE | RELEASED | CONSUMED | EXPIRED
+  expiresAt       DateTime
+  createdAt       DateTime @default(now())
+
+  @@index([executionId])
+  @@index([offerId])
+}
+
+// ---------------------------------------------------------------------------
+// 11. CollateralLock — locked collateral backing an obligation
+// ---------------------------------------------------------------------------
+model CollateralLock {
+  id              String   @id @default(cuid())
+  vaultId         String
+  vault           Vault    @relation(fields: [vaultId], references: [id])
+  providerId      String
+  executionId     String
+  execution       Execution @relation(fields: [executionId], references: [id])
+  obligationId    String?
+  amount          Decimal
+  asset           String
+  status          String   // LOCKED | RELEASED | SLASHED
+  createdAt       DateTime @default(now())
+
+  @@index([executionId])
+  @@index([vaultId])
+}
+
+// ---------------------------------------------------------------------------
+// 12. LedgerEntry — double-entry internal ledger (immutable)
+// ---------------------------------------------------------------------------
+model LedgerEntry {
+  id              String   @id @default(cuid())
+  timestamp       DateTime @default(now())
+  debitAccount    String
+  creditAccount   String
+  amount          Decimal
+  asset           String
+  entryType       String   // MINT | BURN | TRANSFER | LOCK | RELEASE | SLASH | FEE | INCENTIVE | COMPENSATION | REFUND
+  executionId     String?
+  execution       Execution? @relation(fields: [executionId], references: [id])
+  obligationId    String?
+  idempotencyKey  String   @unique
+  description     String?
+
+  @@index([executionId])
+  @@index([debitAccount])
+  @@index([creditAccount])
+}
+
+// ---------------------------------------------------------------------------
+// 13. AuditEvent — immutable, hash-chained event stream
+// ---------------------------------------------------------------------------
+model AuditEvent {
+  id              String   @id @default(cuid())
+  timestamp       DateTime @default(now())
+  executionId     String?
+  execution       Execution? @relation(fields: [executionId], references: [id])
+  intentId        String?
+  intent          ExecutionIntent? @relation(fields: [intentId], references: [id])
+  eventType       String
+  payloadJson     String
+  actorType       String   // SYSTEM | USER | PROVIDER
+  actorId         String?
+  prevHash        String
+  hash            String
+
+  @@index([executionId])
+  @@index([intentId])
+}
+
+// ---------------------------------------------------------------------------
+// 14. IdempotencyRecord — guards all financial mutations
+// ---------------------------------------------------------------------------
+model IdempotencyRecord {
+  id              String   @id @default(cuid())
+  key             String   @unique
+  operation       String
+  requestPayload  String
+  responseStatus  Int
+  responseBody    String?
+  createdAt       DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// 15. MarketSignal — simulated market state (offers changing over time)
+// ---------------------------------------------------------------------------
+model MarketSignal {
+  id              String   @id @default(cuid())
+  kind            String   // NEW_LIQUIDITY | PRICE_CHANGE | CAPACITY_CHANGE | PROVIDER_JOIN | PROVIDER_LEAVE | ASSET_INELIGIBLE
+  payloadJson     String
+  triggerAt       DateTime
+  fired           Boolean  @default(false)
+  createdAt       DateTime @default(now())
+
+  @@index([fired, triggerAt])
+}

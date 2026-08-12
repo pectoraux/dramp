@@ -1,0 +1,23 @@
+import { NextRequest, NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { cancelExecution } from "@/lib/engine/execution";
+import { runIdempotent, makeKey } from "@/lib/engine/idempotency";
+
+export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const body = await req.json().catch(() => ({}));
+  const key = body.idempotencyKey ?? makeKey("cancel-intent", id);
+
+  const result = await runIdempotent<{ error?: string; cancelled?: boolean; reason?: string }>(key, "cancel-intent", { id }, async () => {
+    const intent = await db.executionIntent.findUnique({
+      where: { id },
+      include: { executions: true },
+    });
+    if (!intent) return { status: 404, body: { error: "intent not found" } };
+    const execution = intent.executions[0];
+    if (!execution) return { status: 404, body: { error: "no execution" } };
+    const r = await cancelExecution(execution.id, body.actorId);
+    return { status: 200, body: { cancelled: r.cancelled, reason: r.reason } };
+  });
+  return NextResponse.json(result.body, { status: result.status });
+}
