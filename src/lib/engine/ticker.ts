@@ -127,7 +127,7 @@ async function applyMarketSignal(sig: { id: string; kind: string; payloadJson: s
       if (payload.offerId) {
         await db.liquidityOffer.update({
           where: { id: payload.offerId },
-          data: { rate: payload.rate, feeBps: payload.feeBps ?? undefined },
+          data: { rate: payload.rate, feeBps: payload.feeBps ?? undefined, version: { increment: 1 } },
         });
       }
       await appendAuditEvent({
@@ -140,7 +140,7 @@ async function applyMarketSignal(sig: { id: string; kind: string; payloadJson: s
       if (payload.offerId) {
         await db.liquidityOffer.update({
           where: { id: payload.offerId },
-          data: { availableCapacity: payload.availableCapacity },
+          data: { availableCapacity: payload.availableCapacity, version: { increment: 1 } },
         });
       }
       await appendAuditEvent({

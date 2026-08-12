@@ -30,6 +30,8 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
       ...(body.incentiveBps !== undefined && { incentiveBps: body.incentiveBps }),
       ...(body.active !== undefined && { active: body.active }),
       ...(body.expiresAt !== undefined && { expiresAt: new Date(body.expiresAt) }),
+      // Increment version on every economically-relevant mutation.
+      version: { increment: 1 },
     },
   });
 
@@ -55,7 +57,7 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
     return NextResponse.json({ error: "not found" }, { status: 404 });
   }
 
-  await db.liquidityOffer.update({ where: { id }, data: { active: false } });
+  await db.liquidityOffer.update({ where: { id }, data: { active: false, version: { increment: 1 } } });
   await appendAuditEvent({
     eventType: "offer_withdrawn",
     payload: { offerId: id, providerId: auth.provider.providerId },

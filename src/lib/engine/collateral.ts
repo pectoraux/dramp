@@ -323,6 +323,9 @@ export async function reserveCapacity(input: ReserveCapacityInput) {
     where: { id: offer.id, reservedCapacity: offer.reservedCapacity },
     data: { reservedCapacity: moneyAdd(offer.reservedCapacity, input.amount) },
   });
+  // NOTE: reservedCapacity changes do NOT increment version — version tracks
+  // economically-relevant pricing/term changes, not capacity utilization.
+  // Capacity concurrency is handled by the conditional update above.
   const reservation = await tx.reservation.create({
     data: {
       executionId: input.executionId,

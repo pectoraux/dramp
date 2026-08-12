@@ -252,6 +252,7 @@ export async function discoverAndPersistRoutes(executionId: string, intent: { id
           snapshotIncentiveBps: leg.incentiveBps,
           snapshotRate: leg.rate,
           snapshotExpectedExecutionSeconds: leg.expectedExecutionSeconds,
+          snapshotOfferVersion: leg.offerVersion ?? 1,
         },
       });
     }
@@ -345,6 +346,14 @@ export async function reserveRoute(executionId: string) {
         const offer = leg.offer;
         if (!offer || !offer.active) {
           throw new StaleRouteError(`Leg ${leg.id}: offer is no longer active`);
+        }
+        // Prompt 3.7: Verify offer version hasn't changed (optimistic concurrency).
+        // If the snapshot is missing, this is a legacy route — reject, don't fill.
+        if (leg.snapshotOfferVersion === null || leg.snapshotOfferVersion === undefined) {
+          throw new StaleRouteError(`LEGACY_ROUTE_SNAPSHOT_MISSING: leg ${leg.id} has no snapshotOfferVersion — cannot commit without complete snapshot`);
+        }
+        if (offer.version !== leg.snapshotOfferVersion) {
+          throw new StaleRouteError(`Leg ${leg.id}: offer version changed from ${leg.snapshotOfferVersion} to ${offer.version}`);
         }
         if (offer.expiresAt && offer.expiresAt < new Date()) {
           throw new StaleRouteError(`Leg ${leg.id}: offer has expired`);
@@ -526,7 +535,7 @@ export async function reserveRoute(executionId: string) {
   // Audit the frozen committed economic terms.
   const frozenRoute = await db.route.findUnique({
     where: { id: routeId },
-    include: { legs: { select: { id: true, providerId: true, snapshotFeeBps: true, snapshotRate: true, snapshotIncentiveBps: true, settlementAssetId: true, amount: true, sourceAsset: true, destinationAsset: true, snapshotSourceCountry: true, snapshotDestinationCountry: true, snapshotExpectedExecutionSeconds: true, channelType: true } } },
+    include: { legs: { select: { id: true, providerId: true, snapshotFeeBps: true, snapshotRate: true, snapshotIncentiveBps: true, settlementAssetId: true, amount: true, sourceAsset: true, destinationAsset: true, snapshotSourceCountry: true, snapshotDestinationCountry: true, snapshotExpectedExecutionSeconds: true, snapshotOfferVersion: true, channelType: true } } },
   });
   await appendAuditEvent({
     executionId,
@@ -546,6 +555,7 @@ export async function reserveRoute(executionId: string) {
         sourceCountry: l.snapshotSourceCountry,
         destinationCountry: l.snapshotDestinationCountry,
         expectedExecutionSeconds: l.snapshotExpectedExecutionSeconds,
+        offerVersion: l.snapshotOfferVersion,
         channelType: l.channelType,
       })) ?? [],
       frozenAt: new Date().toISOString(),
@@ -838,6 +848,7 @@ async function persistSingleRoute(executionId: string, c: CandidateRoute) {
         snapshotIncentiveBps: leg.incentiveBps,
         snapshotRate: leg.rate,
         snapshotExpectedExecutionSeconds: leg.expectedExecutionSeconds,
+        snapshotOfferVersion: leg.offerVersion ?? 1,
       },
     });
   }

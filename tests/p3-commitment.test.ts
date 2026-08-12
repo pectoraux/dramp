@@ -100,6 +100,7 @@ async function main() {
         snapshotSourceCountry: "US", snapshotDestinationCountry: "GLOBAL",
         snapshotFeeBps: opts.feeBps, snapshotIncentiveBps: opts.incentiveBps,
         snapshotRate: new Decimal(opts.rate), snapshotExpectedExecutionSeconds: 30,
+        snapshotOfferVersion: testOffer.version,
       },
     });
     await db.execution.update({ where: { id: execId }, data: { selectedRouteId: route.id } });
@@ -248,9 +249,12 @@ async function main() {
   // NOT silently fall back to the live offer.
   const legF = await db.leg.findFirst({ where: { executionId: execF.id } });
   assert(legF!.snapshotFeeBps === null, "Legacy leg has null snapshotFeeBps");
+  assert(legF!.snapshotOfferVersion === null, "Legacy leg has null snapshotOfferVersion");
   // The execution code checks: if (feeBps === null || feeBps === undefined) throw LEGACY_EXECUTION_SNAPSHOT_MISSING
   const wouldThrow = legF!.snapshotFeeBps === null || legF!.snapshotFeeBps === undefined;
   assert(wouldThrow, "Legacy execution with missing snapshot would fail with LEGACY_EXECUTION_SNAPSHOT_MISSING (not fall back to live offer)");
+  // Reservation also rejects legacy routes with missing snapshotOfferVersion.
+  assert(legF!.snapshotOfferVersion === null, "Legacy leg also has null snapshotOfferVersion — reservation would reject with LEGACY_ROUTE_SNAPSHOT_MISSING");
 
   // =========================================================================
   // G. Audit — route_terms_frozen only after successful reservation

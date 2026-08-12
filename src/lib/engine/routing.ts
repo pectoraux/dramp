@@ -51,6 +51,7 @@ export interface GraphNode {
 export interface CandidateLeg {
   providerId: string;
   offerId: string;
+  offerVersion: number; // observed offer version for optimistic concurrency
   sequence: number; // hop index; parallel legs share a sequence
   role: string; // SOURCE | SETTLEMENT_HOP | DESTINATION
   amount: Decimal; // input amount in this leg's source asset
@@ -110,6 +111,7 @@ interface AdjEdge {
     incentiveBps: number;
     active: boolean;
     expiresAt: Date | null;
+    version: number;
   };
   provider: {
     id: string;
@@ -175,6 +177,7 @@ async function buildGraph(): Promise<Map<string, AdjEdge[]>> {
         incentiveBps: effectiveIncentiveBps,
         active: o.active,
         expiresAt: o.expiresAt,
+        version: o.version,
       },
       provider: {
         id: o.provider.id,
@@ -350,6 +353,7 @@ async function buildCandidateRoute(
         incentiveBps: e.offer.incentiveBps,
         rate: e.offer.rate,
         expectedExecutionSeconds: e.offer.expectedExecutionSeconds,
+        offerVersion: e.offer.version,
         providerRisk: providerRiskFromRecord(provRec),
         offerCapacity: e.offer.availableCapacity,
         settlementAssetRisk: saRec
@@ -876,6 +880,7 @@ export async function reconstructPersistedRoute(routeId: string): Promise<Candid
     .map((l) => ({
       providerId: l.providerId,
       offerId: l.offerId,
+      offerVersion: l.snapshotOfferVersion ?? 1,
       sequence: l.sequence,
       role: l.role,
       amount: l.amount,

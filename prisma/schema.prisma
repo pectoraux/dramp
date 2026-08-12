@@ -196,6 +196,9 @@ model Leg {
   snapshotIncentiveBps         Int?
   snapshotRate                 Decimal?
   snapshotExpectedExecutionSeconds Int?
+  // Prompt 3.7: the LiquidityOffer version observed at route persistence.
+  // Reservation rejects if the live offer's version has changed.
+  snapshotOfferVersion         Int?
 
   @@index([routeId])
   @@index([executionId])
@@ -273,6 +276,10 @@ model LiquidityOffer {
   incentiveBps          Int      @default(0)
   active                Boolean  @default(true)
   expiresAt             DateTime?
+  // Prompt 3.7: optimistic concurrency version. Incremented on every
+  // economically-relevant mutation. Route snapshots store the observed
+  // version; reservation rejects if the version has changed.
+  version               Int      @default(1)
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
 
