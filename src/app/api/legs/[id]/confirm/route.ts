@@ -1,12 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { manualConfirmLeg } from "@/lib/engine/providers/adapter";
 import { runIdempotent, makeKey } from "@/lib/engine/idempotency";
-import { requireOperatorOrAdmin, isAuthed } from "@/lib/auth-guard";
+import { requireUser, isAuthed, requireLegOwnership } from "@/lib/auth-guard";
 
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const auth = await requireOperatorOrAdmin();
-  if (!isAuthed(auth)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  const auth = await requireUser();
+  if (!isAuthed(auth)) return auth.error;
   const { id } = await params;
+
+  // Ownership check: operator must own the provider for this leg (admins bypass).
+  const owned = await requireLegOwnership(id, auth);
+  if (!owned.ok) return owned.error;
+
   const body = await req.json().catch(() => ({}));
   const key = body.idempotencyKey ?? makeKey("manual-confirm-leg", id);
   const result = await runIdempotent(key, "manual-confirm-leg", { id, body }, async () => {

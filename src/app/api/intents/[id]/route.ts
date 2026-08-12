@@ -3,13 +3,17 @@ import { db } from "@/lib/db";
 import { serializeIntent, serializeExecution, serializeRoute, serializeObligation, serializeLeg } from "@/lib/engine/serialize";
 import { getAuditTrailForExecution } from "@/lib/engine/audit";
 import { getLedgerForExecution } from "@/lib/engine/ledger";
-import { requireUser, isAuthed } from "@/lib/auth-guard";
+import { requireUser, isAuthed, requireIntentOwnership } from "@/lib/auth-guard";
 import { advanceOneOnDemand } from "@/lib/engine/ticker";
 
 export async function GET(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const auth = await requireUser();
-  if (!isAuthed(auth)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  if (!isAuthed(auth)) return auth.error;
   const { id } = await params;
+
+  // Ownership check: only the intent owner (or an admin) may read this.
+  const owned = await requireIntentOwnership(id, auth);
+  if (!owned.ok) return owned.error;
 
   const intent = await db.executionIntent.findUnique({
     where: { id },

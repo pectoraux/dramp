@@ -376,8 +376,10 @@ export async function seedDatabase(opts: { reset?: boolean } = {}) {
   const alice = await db.user.create({
     data: { email: "alice@dramp.demo", name: "Alice", password: demoHash, role: "USER", status: "ACTIVE", isDemo: true },
   });
+  // The demo operator is bound to Northbridge Fiat (a local fiat agent with
+  // manual legs) so they can confirm/fail legs on that provider only.
   const operator = await db.user.create({
-    data: { email: "operator@dramp.demo", name: "Provider Operator", password: demoHash, role: "PROVIDER_OPERATOR", status: "ACTIVE", isDemo: true },
+    data: { email: "operator@dramp.demo", name: "Provider Operator", password: demoHash, role: "PROVIDER_OPERATOR", status: "ACTIVE", isDemo: true, providerId: northbridge.id },
   });
   const demoAdmin = await db.user.create({
     data: { email: "admin@dramp.demo", name: "Demo Admin", password: demoHash, role: "ADMIN", status: "ACTIVE", isDemo: true },

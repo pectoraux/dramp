@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { serializeProvider } from "@/lib/engine/serialize";
-import { requireOperatorOrAdmin, isAuthed } from "@/lib/auth-guard";
+import { serializeProvider, serializeProviderPublic } from "@/lib/engine/serialize";
+import { requireUser, isAuthed, requireProviderOwnership } from "@/lib/auth-guard";
 
 export async function GET(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const auth = await requireOperatorOrAdmin();
-  if (!isAuthed(auth)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  const auth = await requireUser();
+  if (!isAuthed(auth)) return auth.error;
   const { id } = await params;
+
   const provider = await db.liquidityProvider.findUnique({
     where: { id },
     include: {
@@ -17,5 +18,13 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
     },
   });
   if (!provider) return NextResponse.json({ error: "not found" }, { status: 404 });
-  return NextResponse.json({ provider: serializeProvider(provider) });
+
+  // Operators see the full view ONLY for their own provider; admins see all.
+  // Everyone else (ordinary USERs) gets the public redacted view.
+  const owned = await requireProviderOwnership(id, auth);
+  const fullAccess = owned.ok; // admin or the operator bound to this provider
+
+  return NextResponse.json({
+    provider: fullAccess ? serializeProvider(provider) : serializeProviderPublic(provider),
+  });
 }

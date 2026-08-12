@@ -3,13 +3,17 @@ import { db } from "@/lib/db";
 import { serializeExecution } from "@/lib/engine/serialize";
 import { getAuditTrailForExecution } from "@/lib/engine/audit";
 import { getLedgerForExecution } from "@/lib/engine/ledger";
-import { requireUser, isAuthed } from "@/lib/auth-guard";
+import { requireUser, isAuthed, requireExecutionOwnership } from "@/lib/auth-guard";
 import { advanceOneOnDemand } from "@/lib/engine/ticker";
 
 export async function GET(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const auth = await requireUser();
-  if (!isAuthed(auth)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  if (!isAuthed(auth)) return auth.error;
   const { id } = await params;
+
+  // Ownership check.
+  const owned = await requireExecutionOwnership(id, auth);
+  if (!owned.ok) return owned.error;
 
   await advanceOneOnDemand(id);
 

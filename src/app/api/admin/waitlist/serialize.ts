@@ -1,6 +1,6 @@
 import { Prisma } from "@prisma/client";
 
-export function serializeWaitlistEntry(e: Prisma.WaitlistEntryGetPayload<{}>) {
+export function serializeWaitlistEntry(e: Prisma.WaitlistEntryGetPayload<object>) {
   return {
     id: e.id,
     email: e.email,

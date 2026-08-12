@@ -1,8 +1,8 @@
 // dRamp — Cross-Border Value Execution Marketplace
 // Core economic engine schema.
 //
-// NOTE: This is a prototype. SQLite is used as the datastore. All monetary
-// values are stored as Decimal (TEXT under the hood). Concurrency is enforced
+// NOTE: This is a prototype. PostgreSQL is the datastore (Neon). All monetary
+// values are stored as Decimal (native numeric type). Concurrency is enforced
 // via Prisma interactive transactions with conditional re-checks inside the
 // transaction. Blockchain / bank / PSP rails are simulated.
 
@@ -20,18 +20,20 @@ datasource db {
 // Users — authenticated marketplace participants
 // ---------------------------------------------------------------------------
 model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  name      String?
-  password  String? // null for waitlist-only / demo-as-pending; set when an account is created
-  role      String   @default("USER") // USER | PROVIDER_OPERATOR | ADMIN
-  status    String   @default("ACTIVE") // ACTIVE | SUSPENDED
-  isDemo    Boolean  @default(false)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id         String   @id @default(cuid())
+  email      String   @unique
+  name       String?
+  password   String? // null for waitlist-only / demo-as-pending; set when an account is created
+  role       String   @default("USER") // USER | PROVIDER_OPERATOR | ADMIN
+  status     String   @default("ACTIVE") // ACTIVE | SUSPENDED
+  isDemo     Boolean  @default(false)
+  providerId String?  // for PROVIDER_OPERATORs: the LiquidityProvider they operate
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 
   intents       ExecutionIntent[]
   waitlistApproved WaitlistEntry[] @relation("WaitlistReviewer")
+  operatedProvider LiquidityProvider? @relation("OperatedBy", fields: [providerId], references: [id])
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +208,7 @@ model LiquidityProvider {
   obligations     Obligation[]
   legs            Leg[]
   vault           Vault?
+  operators       User[]    @relation("OperatedBy")
 
   @@index([status])
 }

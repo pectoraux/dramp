@@ -1,22 +1,26 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { serializeExecution } from "@/lib/engine/serialize";
-import { requireUser, isAuthed } from "@/lib/auth-guard";
+import { requireUser, isAuthed, isAdmin } from "@/lib/auth-guard";
 
 export async function GET(req: NextRequest) {
   const auth = await requireUser();
-  if (!isAuthed(auth)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  if (!isAuthed(auth)) return auth.error;
 
   const url = new URL(req.url);
   const limit = Number(url.searchParams.get("limit") ?? 50);
   const status = url.searchParams.get("status");
-  // Lightweight list query — no advancement here (keeps it fast on Neon).
-  // Advancement happens on the detail endpoints via advanceOneOnDemand.
+
+  // Ownership scoping: ordinary users see only their own executions; admins
+  // see all. We join through Execution → ExecutionIntent to filter by userId.
+  const where = {
+    ...(status ? { status } : {}),
+    ...(isAdmin(auth) ? {} : { intent: { userId: auth.id } }),
+  };
+
   const executions = await db.execution.findMany({
-    where: status ? { status } : undefined,
-    include: {
-      intent: true,
-    },
+    where,
+    include: { intent: true },
     orderBy: { startedAt: "desc" },
     take: limit,
   });

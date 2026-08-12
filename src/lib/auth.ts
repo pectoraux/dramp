@@ -45,6 +45,7 @@ export const authOptions: NextAuthOptions = {
           name: user.name ?? user.email,
           role: user.role,
           isDemo: user.isDemo,
+          providerId: user.providerId ?? undefined,
         } as any;
       },
     }),
@@ -55,6 +56,7 @@ export const authOptions: NextAuthOptions = {
         token.id = (user as any).id;
         token.role = (user as any).role;
         token.isDemo = (user as any).isDemo;
+        token.providerId = (user as any).providerId ?? null;
       }
       return token;
     },
@@ -63,6 +65,7 @@ export const authOptions: NextAuthOptions = {
         (session.user as any).id = token.id;
         (session.user as any).role = token.role;
         (session.user as any).isDemo = token.isDemo;
+        (session.user as any).providerId = token.providerId;
       }
       return session;
     },
@@ -75,6 +78,7 @@ declare module "next-auth" {
   interface User {
     role?: string;
     isDemo?: boolean;
+    providerId?: string | null;
   }
   interface Session {
     user: {
@@ -83,6 +87,7 @@ declare module "next-auth" {
       name?: string | null;
       role: string;
       isDemo: boolean;
+      providerId: string | null;
     };
   }
 }
@@ -92,6 +97,7 @@ declare module "next-auth/jwt" {
     id: string;
     role: string;
     isDemo: boolean;
+    providerId: string | null;
   }
 }
 

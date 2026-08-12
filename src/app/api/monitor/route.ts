@@ -1,19 +1,23 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { serializeExecution, serializeIntent } from "@/lib/engine/serialize";
-import { requireUser, isAuthed } from "@/lib/auth-guard";
+import { requireUser, isAuthed, isAdmin } from "@/lib/auth-guard";
 
 export async function GET() {
   const auth = await requireUser();
-  if (!isAuthed(auth)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  if (!isAuthed(auth)) return auth.error;
+
+  const userFilter = isAdmin(auth) ? {} : { intent: { userId: auth.id } };
+  const intentFilter = isAdmin(auth) ? {} : { userId: auth.id };
 
   // Lightweight monitor query — no advancement here (keeps it fast on Neon).
   const activeExecutions = await db.execution.findMany({
-    where: { status: { notIn: ["COMPLETED", "EXPIRED", "CANCELLED", "FAILED", "REFUNDED"] } },
+    where: { status: { notIn: ["COMPLETED", "EXPIRED", "CANCELLED", "FAILED", "REFUNDED"] }, ...userFilter },
     include: { intent: true },
     orderBy: { startedAt: "desc" },
   });
   const recentIntents = await db.executionIntent.findMany({
+    where: intentFilter,
     orderBy: { createdAt: "desc" },
     take: 20,
   });

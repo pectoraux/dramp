@@ -130,6 +130,46 @@ export function serializeProvider(p: any) {
   };
 }
 
+// Public (redacted) view of a provider for ordinary USERs. Omits vault
+// internals, reserved capacity, and obligations — competitively sensitive
+// operational data that ordinary users should not see.
+export function serializeProviderPublic(p: any) {
+  return {
+    id: p.id,
+    name: p.name,
+    providerType: p.providerType,
+    trustModel: p.trustModel,
+    capabilities: safeJson(p.capabilities),
+    countries: safeJson(p.countries),
+    reputationScore: p.reputationScore,
+    status: p.status,
+    // Offers: public pricing/corridor info only (no reservedCapacity).
+    offers: p.offers
+      ? p.offers
+          .filter((o: any) => o.active)
+          .map((o: any) => ({
+            id: o.id,
+            capability: o.capability,
+            sourceAsset: o.sourceAsset,
+            destinationAsset: o.destinationAsset,
+            sourceCountry: o.sourceCountry,
+            destinationCountry: o.destinationCountry,
+            rate: dec(o.rate),
+            feeBps: o.feeBps,
+            minimumAmount: dec(o.minimumAmount),
+            maximumAmount: dec(o.maximumAmount),
+            availableCapacity: dec(o.availableCapacity),
+            settlementAssetId: o.settlementAssetId,
+            channelType: o.channelType,
+            expectedExecutionSeconds: o.expectedExecutionSeconds,
+            incentiveBps: o.incentiveBps,
+            active: o.active,
+          }))
+      : [],
+    // No vault, no obligations, no reservedCapacity.
+  };
+}
+
 export function serializeOffer(o: any) {
   return {
     id: o.id,

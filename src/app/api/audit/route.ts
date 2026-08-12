@@ -2,11 +2,13 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { serializeAuditEvent } from "@/lib/engine/serialize";
 import { verifyAuditChain } from "@/lib/engine/audit";
-import { requireUser, isAuthed } from "@/lib/auth-guard";
+import { requireAdmin, isAuthed } from "@/lib/auth-guard";
 
+// The full audit trail is admin-only: it contains cross-user events with
+// actorId, executionId, and payload for every user in the system.
 export async function GET() {
-  const auth = await requireUser();
-  if (!isAuthed(auth)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  const auth = await requireAdmin();
+  if (!isAuthed(auth)) return auth.error;
   const events = await db.auditEvent.findMany({
     orderBy: { timestamp: "asc" },
     take: 300,
