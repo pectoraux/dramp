@@ -535,3 +535,26 @@ Stage Summary:
 - Split routes use total source notional (sum of all SOURCE legs), not just the first leg's amount.
 - Persisted routes are historically stable: leg snapshot fields capture the offer's economic terms at persistence time and never change. A provider modifying their offer after a route is selected does not alter the historical route's economics.
 - The route in the audit trail, the route used for WAIT_FOR_BETTER comparison, and the route shown in receipts all remain identical after the provider changes their current offer.
+
+---
+Task ID: P3.5-FrozenEconomics
+Agent: main (Z.ai Code)
+Task: Freeze execution economics at route commitment. Settlement, payout, incentives, and receipts use the frozen leg snapshot — not the mutable LiquidityOffer. No new features.
+
+Work Log:
+- tokenize(): uses leg.snapshotFeeBps, leg.snapshotRate, leg.snapshotIncentiveBps (with offer fallback for pre-3.4 routes).
+- settle(): uses snapshot fee/rate for settlement hop calculations.
+- confirmDestination(): uses snapshot fee/rate for payout calculations.
+- recordExecutionOutcome(): uses snapshot sourceCountry/destinationCountry/feeBps.
+- buildRouteSnapshot (receipt): uses snapshot feeBps/incentiveBps. No offer join needed.
+- reserveRoute(): emits route_terms_frozen audit event with all leg economics at reservation time.
+- Tests: tests/p3-frozen.test.ts (22 assertions) — fee mutation (30→80, uses 30), rate mutation (0.92→0.90, uses 0.92), incentive mutation (10→50, uses 10), destination payout snapshot, multi-leg integrity, receipt stability, audit event.
+- All existing tests pass (collateral 23, P3.4 snapshot 18). Lint + type-check clean.
+- Pushed to GitHub (commit 14cbf9e).
+
+Stage Summary:
+- Once a route is reserved, its economic terms are FROZEN. The execution uses leg.snapshotFeeBps, leg.snapshotRate, leg.snapshotIncentiveBps — not the mutable LiquidityOffer.
+- A provider changing their offer after route reservation cannot alter the economics of an already-committed execution.
+- The receipt is built entirely from the route's own persisted data (no offer join).
+- The audit trail records route_terms_frozen with all leg economics at reservation time, making the committed contract fully reconstructable.
+- The lifecycle is now: market quote → committed execution contract → immutable economic snapshot → settlement → ledger.
