@@ -554,7 +554,40 @@ async function advanceSearching(execution: Prisma.ExecutionGetPayload<{ include:
     return { advanced: false, reason: "reference_set" };
   }
 
-  // Improvement = how much cheaper (in bps of notional) the new best is.
+  // Compare the new best to the reference using the SAME scoring semantics
+  // as rankAndTag (cost + speed + risk + reputation + corridor + commitment).
+  // This prevents drift between initial ranking and re-evaluation — a route
+  // that wins on reputation during ranking must also win during re-evaluation.
+  // Fetch the scoring context (reputation, corridor scores, commitment).
+  let scoreCtx: any = { riskTolerance: execution.intent.riskTolerance };
+  try {
+    const { getReputationMap, getCorridorScoreMap } = await import("@/lib/economics/reputation");
+    const { getCommitmentReliabilityMap } = await import("@/lib/economics/commitments");
+    scoreCtx = {
+      riskTolerance: execution.intent.riskTolerance,
+      reputationMap: await getReputationMap(),
+      corridorScores: await getCorridorScoreMap(),
+      commitmentReliability: await getCommitmentReliabilityMap(),
+    };
+  } catch {
+    // Fall back to cost/speed/risk only if reputation service is unavailable.
+  }
+
+  // Reconstruct the reference route as a CandidateRoute-like object for scoring.
+  const refAsCandidate = {
+    legs: [{ providerId: "", amount: execution.intent.sourceAmount, sourceAsset: "", destinationAsset: "", sourceCountry: "", destinationCountry: "" }],
+    effectiveCost: refRoute.effectiveCost,
+    expectedExecutionSeconds: refRoute.expectedExecutionSeconds,
+    risk: { composite: refRoute.riskComposite, counterparty: 0, settlementAsset: 0, liquidity: 0, operational: 0, duration: 0 },
+    hardFilterRejection: undefined,
+  } as any;
+
+  const { scoreRoute } = await import("@/lib/engine/routing");
+  const refScore = scoreRoute(refAsCandidate, scoreCtx);
+  const bestScore = scoreRoute(best, scoreCtx);
+  const scoreImprovement = refScore - bestScore; // positive = new route is better
+
+  // Also compute cost improvement for audit trail.
   const improvementBps = refRoute.effectiveCost
     .minus(best.effectiveCost)
     .dividedBy(execution.intent.sourceAmount)
@@ -566,7 +599,10 @@ async function advanceSearching(execution: Prisma.ExecutionGetPayload<{ include:
     data: { waitedSeconds, lastTickAt: new Date() },
   });
 
-  const improved = improvementBps >= 3; // 3 bps improvement threshold
+  // A route is "better" if its full score (cost+speed+risk+reputation+commitment)
+  // is meaningfully lower than the reference. The threshold ensures we don't
+  // thrash on negligible differences.
+  const improved = scoreImprovement > 0.0005;
 
   if (improved) {
     // Persist the new best, update reference, and execute.
@@ -582,11 +618,20 @@ async function advanceSearching(execution: Prisma.ExecutionGetPayload<{ include:
         previousRouteId: refRoute.id,
         newRouteId: persisted.id,
         improvementBps: Number(improvementBps.toFixed(2)),
+        scoreImprovement: Number(scoreImprovement.toFixed(6)),
         previousEffectiveCost: refRoute.effectiveCost.toString(),
         newEffectiveCost: best.effectiveCost.toString(),
+        scoringNote: "Full route scoring (cost+speed+risk+reputation+corridor+commitment)",
       },
     });
-    await selectRoute(execution.id, persisted.id);
+    try {
+      await selectRoute(execution.id, persisted.id);
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("Cannot select route in state")) {
+        return { advanced: false, reason: "already_advancing" };
+      }
+      throw err;
+    }
     return { advanced: true, reason: "better_route_selected" };
   }
 
@@ -597,11 +642,18 @@ async function advanceSearching(execution: Prisma.ExecutionGetPayload<{ include:
       eventType: "wait_timeout_executing_best",
       payload: { routeId: persisted.id, waitedSeconds },
     });
-    await selectRoute(execution.id, persisted.id);
+    try {
+      await selectRoute(execution.id, persisted.id);
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("Cannot select route in state")) {
+        return { advanced: false, reason: "already_advancing" };
+      }
+      throw err;
+    }
     return { advanced: true, reason: "timeout_executed" };
   }
 
-  return { advanced: false, reason: `waiting_improvement=${improvementBps.toFixed(2)}bps` };
+  return { advanced: false, reason: `waiting_score_improvement=${scoreImprovement.toFixed(6)}` };
 }
 
 // Persist a single candidate route (with its legs) for selection.

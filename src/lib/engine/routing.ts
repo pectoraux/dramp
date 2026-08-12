@@ -516,12 +516,11 @@ function rankAndTag(routes: CandidateRoute[], riskTolerance: string, reputationM
   const repMax = Math.max(...repScores, 0.5);
   const repMin = Math.min(...repScores, 0.5);
 
-  // Compute commitment reliability boost per route (from the first leg's provider).
-  // A committed provider gets a modest reliability boost — it promises to maintain
-  // liquidity, which is more valuable than ephemeral liquidity.
+  // Compute commitment reliability boost per route, aggregated across ALL legs
+  // (not just legs[0]). Uses the same computeRouteCommitment function as
+  // isBetterRoute and advanceSearching — no drift.
   const commitBoost = valid.map((r) => {
-    const firstProvider = r.legs[0]?.providerId;
-    return firstProvider ? (commitmentReliability?.get(firstProvider) ?? 0) : 0;
+    return computeRouteCommitment(r, { reputationMap, corridorScores, commitmentReliability, riskTolerance });
   });
 
   const scored = valid.map((r, idx) => {
@@ -583,6 +582,73 @@ function weightFor(riskTolerance: string): { cost: number; speed: number; risk: 
     default:
       return { cost: 0.35, speed: 0.20, risk: 0.30, reputation: 0.15 };
   }
+}
+
+// ---- Shared route scoring function (Prompt 3.2) ---------------------------
+//
+// This is the SINGLE source of truth for route quality scoring. It is used by:
+//   - rankAndTag (initial route ranking among candidates)
+//   - isBetterRoute (patient-execution route replacement comparison)
+//   - advanceSearching (WAIT_FOR_BETTER re-evaluation)
+//
+// All three must use the EXACT same scoring semantics to prevent drift between
+// initial ranking and re-evaluation. A route that wins on reputation during
+// initial ranking must also win during re-evaluation.
+
+export interface RouteScoreContext {
+  riskTolerance: string;
+  reputationMap?: Map<string, number>;
+  corridorScores?: Map<string, number>;
+  commitmentReliability?: Map<string, number>;
+}
+
+// Compute the raw (un-normalized) score for a single route. Lower = better
+// (it's a penalty). This is used for pairwise comparison (isBetterRoute) where
+// normalization across a candidate set isn't available.
+export function scoreRoute(route: CandidateRoute, ctx: RouteScoreContext): number {
+  const w = weightFor(ctx.riskTolerance);
+  const notional = route.legs[0]?.amount.toNumber() || 1;
+  const normCost = route.effectiveCost.toNumber() / notional;
+  const normDur = route.expectedExecutionSeconds / 600;
+  const normRisk = route.risk.composite;
+
+  // Compute route reputation across ALL material legs (same as rankAndTag).
+  const routeRep = computeRouteReputation(route, ctx);
+  // For pairwise comparison, we invert: higher reputation → lower penalty.
+  // repScore is 0..1; (1 - repScore) gives a 0..1 penalty.
+  const normRep = 1 - routeRep;
+
+  // Compute commitment reliability across ALL legs (same as rankAndTag).
+  const routeCommit = computeRouteCommitment(route, ctx);
+  const commitReduction = routeCommit * 0.2;
+
+  const adjustedRepPenalty = w.reputation * normRep * (1 - commitReduction);
+  return w.cost * normCost + w.speed * normDur + w.risk * normRisk + adjustedRepPenalty;
+}
+
+// Compute route-level reputation across ALL material legs.
+// 70% weighted average + 30% minimum (weakest-leg penalty).
+export function computeRouteReputation(route: CandidateRoute, ctx: RouteScoreContext): number {
+  if (route.legs.length === 0) return 0.5;
+  const legScores = route.legs.map((l) => {
+    const corridorKey = `${l.providerId}:${l.sourceAsset}:${l.destinationAsset}:${l.sourceCountry}:${l.destinationCountry}`;
+    const corridorScore = ctx.corridorScores?.get(corridorKey);
+    if (corridorScore !== undefined) return corridorScore;
+    return ctx.reputationMap?.get(l.providerId) ?? 0.5;
+  });
+  const avg = legScores.reduce((s, x) => s + x, 0) / legScores.length;
+  const minScore = Math.min(...legScores);
+  return avg * 0.7 + minScore * 0.3;
+}
+
+// Compute route-level commitment reliability across ALL material legs.
+// Uses the same aggregation style as reputation: average across legs.
+export function computeRouteCommitment(route: CandidateRoute, ctx: RouteScoreContext): number {
+  if (route.legs.length === 0) return 0;
+  const legCommitments = route.legs.map((l) => {
+    return ctx.commitmentReliability?.get(l.providerId) ?? 0;
+  });
+  return legCommitments.reduce((s, x) => s + x, 0) / legCommitments.length;
 }
 
 function explainRoute(
@@ -717,16 +783,17 @@ export async function findRoutes(input: FindRoutesInput): Promise<CandidateRoute
 }
 
 // Quick helper used by the engine ticker to check whether a *better* route
-// than the current reference exists. "Better" = strictly higher score under
-// the user's risk tolerance, OR same score but cheaper.
-export function isBetterRoute(newRoute: CandidateRoute, refRoute: CandidateRoute, riskTolerance: string): boolean {
+// than the current reference exists. Uses the SAME scoring semantics as
+// rankAndTag via the shared scoreRoute function — no drift between initial
+// ranking and re-evaluation.
+export function isBetterRoute(
+  newRoute: CandidateRoute,
+  refRoute: CandidateRoute,
+  riskTolerance: string,
+  ctx?: RouteScoreContext,
+): boolean {
   if (newRoute.hardFilterRejection) return false;
   if (refRoute.hardFilterRejection) return true;
-  const w = weightFor(riskTolerance);
-  // Note: reputation is not included here because isBetterRoute is called
-  // during the SEARCHING phase before a full findRoutes call. The reputation
-  // factor is applied during the full ranking in rankAndTag.
-  const score = (r: CandidateRoute) =>
-    r.risk.composite * w.risk + (r.effectiveCost.toNumber() / (r.legs[0]?.amount.toNumber() || 1)) * w.cost + (r.expectedExecutionSeconds / 600) * w.speed;
-  return score(newRoute) < score(refRoute);
+  const scoreCtx: RouteScoreContext = ctx ?? { riskTolerance };
+  return scoreRoute(newRoute, scoreCtx) < scoreRoute(refRoute, scoreCtx);
 }

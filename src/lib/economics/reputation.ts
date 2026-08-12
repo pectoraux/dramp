@@ -57,9 +57,22 @@ export async function getProviderReputation(providerId: string): Promise<Reputat
     orderBy: { execution: { startedAt: "asc" } },
   });
 
-  // Dispute + slash counts.
-  const disputes = await db.dispute.count({ where: { providerId, createdAt: { gte: cutoff90d } } });
-  const slashes = await db.dispute.count({ where: { providerId, status: "SLASHED", createdAt: { gte: cutoff90d } } });
+  // Dispute + slash counts — weighted by recency (same decay as executions)
+  // so recent disputes matter more than old ones. Disputes are NOT value-weighted
+  // (they are safety events, not transactions), but they ARE recency-weighted
+  // so a dispute from yesterday hurts more than one from 3 months ago.
+  const disputeRecords = await db.dispute.findMany({
+    where: { providerId, createdAt: { gte: cutoff90d } },
+    select: { createdAt: true, status: true },
+  });
+  let weightedDisputes = 0;
+  let weightedSlashes = 0;
+  for (const d of disputeRecords) {
+    const ageMs = now - d.createdAt.getTime();
+    const recency = decayWeight(ageMs);
+    weightedDisputes += recency;
+    if (d.status === "SLASHED") weightedSlashes += recency;
+  }
 
   // Compute weighted metrics — ANTI-GAMING: only transactions >= $50
   // (MEANINGFUL_THRESHOLD) contribute to reputation components. Each
@@ -137,8 +150,9 @@ export async function getProviderReputation(providerId: string): Promise<Reputat
     ? Math.max(0, Math.min(100, 100 - ((providerMedianFee - medianFee) / medianFee) * 50))
     : 50;
 
-  // Disputes: fewer = better.
-  const disputeRate = totalExecs > 0 ? disputes / totalExecs : 0;
+  // Disputes: fewer = better. Using weighted disputes (recency-weighted) vs
+  // weighted executions (value+recency-weighted) — consistent weighting.
+  const disputeRate = totalExecs > 0 ? weightedDisputes / totalExecs : 0;
   const disputesScore = Math.max(0, 100 - disputeRate * 200);
 
   // Operational: failures not due to disputes.
@@ -163,7 +177,7 @@ export async function getProviderReputation(providerId: string): Promise<Reputat
     history * 0.05
   );
 
-  const tier = deriveTier(overall, meaningfulExecutions, ageDays, slashes);
+  const tier = deriveTier(overall, meaningfulExecutions, ageDays, weightedSlashes);
   const tierReason = getTierReason(tier, overall, meaningfulExecutions, ageDays);
 
   return {
