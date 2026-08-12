@@ -475,8 +475,13 @@ function requireSettlementAssetRisk(input: ReturnType<typeof settlementAssetRisk
 }
 
 // ---- Ranking & tagging ---------------------------------------------------
+//
+// Reputation integration (Prompt 3): reputation is a MODEST factor in the
+// composite score. It nudges ranking among already-eligible routes but NEVER
+// overrides hard constraints. A highly reputable provider gets a small
+// ranking advantage; an expensive route does not magically become cheapest.
 
-function rankAndTag(routes: CandidateRoute[], riskTolerance: string): CandidateRoute[] {
+function rankAndTag(routes: CandidateRoute[], riskTolerance: string, reputationMap?: Map<string, number>): CandidateRoute[] {
   const valid = routes.filter((r) => !r.hardFilterRejection);
   if (valid.length === 0) return routes;
 
@@ -484,9 +489,19 @@ function rankAndTag(routes: CandidateRoute[], riskTolerance: string): CandidateR
   const fastest = [...valid].sort((a, b) => a.expectedExecutionSeconds - b.expectedExecutionSeconds)[0];
   const safest = [...valid].sort((a, b) => a.risk.composite - b.risk.composite)[0];
 
-  // Best: weighted by risk tolerance
+  // Best: weighted by risk tolerance + reputation
   const weights = weightFor(riskTolerance);
-  const scored = valid.map((r) => {
+
+  // Compute the min/max reputation across candidates for normalization.
+  // If no reputationMap is provided, all routes get neutral (0.5) reputation.
+  const repScores = valid.map((r) => {
+    const firstLegProvider = r.legs[0]?.providerId;
+    return firstLegProvider ? (reputationMap?.get(firstLegProvider) ?? 0.5) : 0.5;
+  });
+  const repMax = Math.max(...repScores, 0.5);
+  const repMin = Math.min(...repScores, 0.5);
+
+  const scored = valid.map((r, idx) => {
     // Normalize each axis to 0..1 across the candidate set.
     const costMax = valid.reduce((m, x) => moneyMax(m, x.effectiveCost), new Decimal(0)).toNumber() || 1;
     const costMin = valid.reduce((m, x) => moneyMin(m, x.effectiveCost), cheapest.effectiveCost).toNumber();
@@ -497,8 +512,10 @@ function rankAndTag(routes: CandidateRoute[], riskTolerance: string): CandidateR
     const normCost = costMax === costMin ? 0 : (r.effectiveCost.toNumber() - costMin) / (costMax - costMin);
     const normDur = durMax === durMin ? 0 : (r.expectedExecutionSeconds - durMin) / (durMax - durMin);
     const normRisk = riskMax === riskMin ? 0 : (r.risk.composite - riskMin) / (riskMax - riskMin);
+    // Reputation: higher = better, so we invert (1 - normalized) to get a penalty.
+    const normRep = repMax === repMin ? 0 : (repMax - repScores[idx]) / (repMax - repMin);
     // score = 1 - weighted penalty (higher is better)
-    const penalty = weights.cost * normCost + weights.speed * normDur + weights.risk * normRisk;
+    const penalty = weights.cost * normCost + weights.speed * normDur + weights.risk * normRisk + weights.reputation * normRep;
     return { route: r, score: 1 - penalty };
   });
   const best = scored.sort((a, b) => b.score - a.score)[0].route;
@@ -525,16 +542,18 @@ function rankAndTag(routes: CandidateRoute[], riskTolerance: string): CandidateR
   return [...valid, ...rejected];
 }
 
-function weightFor(riskTolerance: string): { cost: number; speed: number; risk: number } {
+function weightFor(riskTolerance: string): { cost: number; speed: number; risk: number; reputation: number } {
+  // Reputation is a MODEST factor — it nudges ranking but never overrides
+  // hard constraints or makes an expensive route appear cheapest.
   switch (riskTolerance) {
     case "MAX_RELIABILITY":
-      return { cost: 0.2, speed: 0.2, risk: 0.6 };
+      return { cost: 0.15, speed: 0.15, risk: 0.55, reputation: 0.15 };
     case "BALANCED":
-      return { cost: 0.4, speed: 0.25, risk: 0.35 };
+      return { cost: 0.35, speed: 0.20, risk: 0.30, reputation: 0.15 };
     case "LOWEST_COST":
-      return { cost: 0.65, speed: 0.2, risk: 0.15 };
+      return { cost: 0.60, speed: 0.15, risk: 0.10, reputation: 0.15 };
     default:
-      return { cost: 0.4, speed: 0.25, risk: 0.35 };
+      return { cost: 0.35, speed: 0.20, risk: 0.30, reputation: 0.15 };
   }
 }
 
@@ -577,6 +596,10 @@ function explainRoute(
   if (r.risk.liquidity < 0.3) parts.push("High liquidity");
   else if (r.risk.liquidity < 0.6) parts.push("Adequate liquidity");
   else parts.push("Lower liquidity");
+
+  // Provider reliability (from the first leg's provider risk)
+  if (r.risk.counterparty < 0.2) parts.push("High provider reliability");
+  else if (r.risk.counterparty < 0.4) parts.push("Good provider reliability");
 
   // Hops
   if (r.hopCount > 1) parts.push(`${r.hopCount} hops`);
@@ -645,8 +668,21 @@ export async function findRoutes(input: FindRoutesInput): Promise<CandidateRoute
   };
   const filtered = candidates.map((c) => applyHardFilters(c, ctx));
 
-  // Rank and tag
-  return rankAndTag(filtered, input.riskTolerance);
+  // Fetch provider reputation map for ranking integration.
+  // Reputation is a modest factor that nudges ranking but never overrides
+  // hard constraints. Uses a dynamic import to avoid a circular dependency
+  // (routing.ts → reputation.ts → routing.ts is not a cycle, but the import
+  // keeps the module graph clean).
+  let reputationMap: Map<string, number> | undefined;
+  try {
+    const { getReputationMap } = await import("@/lib/economics/reputation");
+    reputationMap = await getReputationMap();
+  } catch {
+    // If reputation service is unavailable, fall back to neutral scores.
+  }
+
+  // Rank and tag (with reputation as a factor)
+  return rankAndTag(filtered, input.riskTolerance, reputationMap);
 }
 
 // Quick helper used by the engine ticker to check whether a *better* route
@@ -656,6 +692,9 @@ export function isBetterRoute(newRoute: CandidateRoute, refRoute: CandidateRoute
   if (newRoute.hardFilterRejection) return false;
   if (refRoute.hardFilterRejection) return true;
   const w = weightFor(riskTolerance);
+  // Note: reputation is not included here because isBetterRoute is called
+  // during the SEARCHING phase before a full findRoutes call. The reputation
+  // factor is applied during the full ranking in rankAndTag.
   const score = (r: CandidateRoute) =>
     r.risk.composite * w.risk + (r.effectiveCost.toNumber() / (r.legs[0]?.amount.toNumber() || 1)) * w.cost + (r.expectedExecutionSeconds / 600) * w.speed;
   return score(newRoute) < score(refRoute);

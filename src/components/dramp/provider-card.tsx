@@ -13,7 +13,10 @@ import {
   formatTimestamp,
   toNum,
   prettyEnum,
+  tierBadgeClass,
+  tierDotClass,
 } from "./format";
+import { ReputationExplorer } from "./reputation-explorer";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { motion } from "framer-motion";
@@ -84,18 +87,28 @@ export function ProviderCard({ provider }: ProviderCardProps) {
                 </Badge>
               </div>
             </div>
-            <div className="flex flex-col items-end shrink-0">
+            <div className="flex flex-col items-end shrink-0 gap-1">
               <div className="flex items-center gap-1 text-xs">
                 <Star className="size-3 text-amber-500 fill-amber-500" />
                 <span className="font-mono tabular-nums font-medium">{reputation}</span>
                 <span className="text-muted-foreground text-[10px]">/100</span>
               </div>
               <span className="text-[10px] text-muted-foreground">reputation</span>
+              {provider.tier && (
+                <Badge variant="outline" className={cn("text-[9px] py-0 h-4 gap-1 mt-0.5", tierBadgeClass(provider.tier))}>
+                  <span className={cn("inline-block size-1 rounded-full", tierDotClass(provider.tier))} />
+                  {provider.tier}
+                </Badge>
+              )}
             </div>
           </div>
         </CardHeader>
 
         <CardContent className="space-y-3">
+          {/* Reputation explorer trigger */}
+          <div className="flex justify-end -mt-1">
+            <ReputationExplorer providerId={provider.id} />
+          </div>
           {/* capabilities + countries */}
           <div className="space-y-1.5">
             <div className="flex flex-wrap gap-1">

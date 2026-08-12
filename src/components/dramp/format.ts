@@ -240,3 +240,69 @@ export const ASSET_OPTIONS = ["USD", "EUR", "USDC", "SC", "WETH"] as const;
 export const COUNTRY_OPTIONS = ["US", "EU", "GLOBAL", "PH"] as const;
 export const RISK_OPTIONS = ["MAX_RELIABILITY", "BALANCED", "LOWEST_COST"] as const;
 export const POLICY_OPTIONS = ["NOW", "WAIT_FOR_BETTER"] as const;
+
+// ---------------------------------------------------------------------------
+// Reputation / Tier badges
+// ---------------------------------------------------------------------------
+export type Tier = "NEW" | "VERIFIED" | "TRUSTED" | "PREMIUM" | string;
+
+export function tierBadgeClass(tier: string | null | undefined): string {
+  switch (tier) {
+    case "PREMIUM":
+      // gold / amber
+      return "border-amber-500/50 bg-amber-500/15 text-amber-600 dark:text-amber-300 font-semibold";
+    case "TRUSTED":
+      // emerald
+      return "border-emerald-500/50 bg-emerald-500/15 text-emerald-600 dark:text-emerald-300 font-medium";
+    case "VERIFIED":
+      // sky
+      return "border-sky-500/50 bg-sky-500/15 text-sky-600 dark:text-sky-300 font-medium";
+    case "NEW":
+    default:
+      // zinc
+      return "border-zinc-500/40 bg-zinc-500/10 text-zinc-600 dark:text-zinc-300";
+  }
+}
+
+export function tierDotClass(tier: string | null | undefined): string {
+  switch (tier) {
+    case "PREMIUM":
+      return "bg-amber-500";
+    case "TRUSTED":
+      return "bg-emerald-500";
+    case "VERIFIED":
+      return "bg-sky-500";
+    case "NEW":
+    default:
+      return "bg-zinc-400";
+  }
+}
+
+/** 0..100 score → progress bar color (green/amber/rose). */
+export function scoreBarColor(value: number): string {
+  if (value >= 75) return "bg-emerald-500";
+  if (value >= 50) return "bg-amber-500";
+  return "bg-rose-500";
+}
+
+/** 0..100 → qualitative label. */
+export function scoreLabel(value: number): string {
+  if (value >= 80) return "Excellent";
+  if (value >= 65) return "Good";
+  if (value >= 45) return "Fair";
+  return "Weak";
+}
+
+/** Pretty-print a corridor with a -> b style: "USD:US→EUR:EU". */
+export function prettyCorridor(corridor: string | null | undefined): string {
+  if (!corridor) return "—";
+  return corridor.replace(/→/g, " → ").replace("->", " → ");
+}
+
+/** Format a 0..1 rate as a percentage with 4 decimals. */
+export function formatRatePercent(value: number | string | null | undefined): string {
+  if (value === null || value === undefined) return "—";
+  const n = typeof value === "string" ? Number(value) : value;
+  if (!isFinite(n)) return "—";
+  return `${(n * 100).toFixed(4)}%`;
+}

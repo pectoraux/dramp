@@ -123,6 +123,7 @@ export function serializeProvider(p: any) {
     capabilities: safeJson(p.capabilities),
     countries: safeJson(p.countries),
     reputationScore: p.reputationScore,
+    tier: p.tier ?? "NEW",
     status: p.status,
     vaultId: p.vaultId,
     vault: p.vault ? serializeVault(p.vault) : null,
@@ -151,6 +152,7 @@ export function serializeProviderPublic(p: any) {
     capabilities: safeJson(p.capabilities),
     countries: safeJson(p.countries),
     reputationScore: p.reputationScore,
+    tier: p.tier ?? "NEW",
     status: p.status,
     // Offers: public pricing/corridor info only (no reservedCapacity).
     offers: p.offers

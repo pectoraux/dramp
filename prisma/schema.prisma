@@ -215,6 +215,10 @@ model LiquidityProvider {
   reviewedById      String?
   reviewedAt        DateTime?
 
+  // Prompt 3: derived tier + reputation
+  tier              String   @default("NEW") // NEW | VERIFIED | TRUSTED | PREMIUM
+  tierUpdatedAt     DateTime @default(now())
+
   offers          LiquidityOffer[]
   obligations     Obligation[]
   legs            Leg[]
@@ -224,8 +228,13 @@ model LiquidityProvider {
   webhookEndpoints WebhookEndpoint[]
   incentiveCampaigns SettlementIncentiveCampaign[]
   disputes        Dispute[]
+  performanceSnapshots ProviderPerformanceSnapshot[]
+  commitments     LiquidityCommitment[]
+  corridorScores  ProviderCorridorScore[]
+  quoteWinLosses  QuoteWinLoss[]
 
   @@index([status])
+  @@index([tier])
 }
 
 // ---------------------------------------------------------------------------
@@ -626,3 +635,162 @@ model Notification {
   @@index([userId, read])
   @@index([createdAt])
 }
+
+// ===========================================================================
+// PROMPT 3 — Network Economics, Liquidity Competition & Reputation
+//
+// These models extend the existing domain to make dRamp economically
+// intelligent. All economic effects still flow through the existing ledger.
+// Reputation is derived from observable historical behavior — never opaque.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// P3-1. ProviderPerformanceSnapshot — periodic metrics for time-weighted decay
+// ---------------------------------------------------------------------------
+model ProviderPerformanceSnapshot {
+  id              String   @id @default(cuid())
+  providerId      String
+  provider        LiquidityProvider @relation(fields: [providerId], references: [id])
+  periodStart     DateTime
+  periodEnd       DateTime
+  // Raw counts for this period
+  requestsReceived Int    @default(0)
+  executionsAccepted Int @default(0)
+  executionsCompleted Int @default(0)
+  executionsFailed Int   @default(0)
+  executionsCancelled Int @default(0)
+  disputes        Int      @default(0)
+  slashes         Int      @default(0)
+  // Aggregated values
+  totalVolume     Decimal  @default(0)
+  totalEarnings   Decimal  @default(0)
+  totalIncentives Decimal  @default(0)
+  avgExecutionSeconds Int  @default(0)
+  // Liquidity metrics
+  avgAvailableCapacity Decimal @default(0)
+  avgReservedCapacity Decimal @default(0)
+  peakUtilization Float   @default(0)
+  // Computed reputation components (stored for history/decay)
+  reliabilityScore    Float @default(0.5)
+  speedScore          Float @default(0.5)
+  liquidityScore      Float @default(0.5)
+  pricingScore        Float @default(0.5)
+  disputeScore        Float @default(0.5)
+  operationalScore    Float @default(0.5)
+  overallReputation   Float @default(0.5)
+  createdAt       DateTime @default(now())
+
+  @@index([providerId, periodEnd])
+}
+
+// ---------------------------------------------------------------------------
+// P3-2. LiquidityCommitment — provider promises to maintain service levels
+// ---------------------------------------------------------------------------
+model LiquidityCommitment {
+  id              String   @id @default(cuid())
+  providerId      String
+  provider        LiquidityProvider @relation(fields: [providerId], references: [id])
+  sourceAsset     String
+  destinationAsset String
+  sourceCountry   String
+  destinationCountry String
+  minimumLiquidity Decimal
+  maximumLiquidity Decimal?
+  targetExecutionSeconds Int
+  operatingHoursStart Int?  // hour 0-23
+  operatingHoursEnd Int?
+  startDate       DateTime
+  endDate         DateTime
+  status          String   @default("ACTIVE") // ACTIVE | PAUSED | EXPIRED | BREACHED
+  // Reliability tracking
+  samples         Int      @default(0)
+  samplesMet      Int      @default(0)
+  avgAvailable    Decimal  @default(0)
+  reliabilityPct  Float    @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([providerId, status])
+  @@index([sourceAsset, destinationAsset])
+}
+
+// ---------------------------------------------------------------------------
+// P3-3. ProviderCorridorScore — per-provider-per-corridor performance
+// ---------------------------------------------------------------------------
+model ProviderCorridorScore {
+  id              String   @id @default(cuid())
+  providerId      String
+  provider        LiquidityProvider @relation(fields: [providerId], references: [id])
+  sourceAsset     String
+  destinationAsset String
+  sourceCountry   String
+  destinationCountry String
+  // Rolling metrics for this specific corridor
+  executions      Int      @default(0)
+  completed       Int      @default(0)
+  failed          Int      @default(0)
+  avgExecutionSeconds Int  @default(0)
+  totalVolume     Decimal  @default(0)
+  completionRate  Float    @default(0)
+  avgFeeBps       Float    @default(0)
+  lastExecutedAt  DateTime?
+  score           Float    @default(0.5) // 0..1, corridor-specific reputation
+  updatedAt       DateTime @updatedAt
+
+  @@unique([providerId, sourceAsset, destinationAsset, sourceCountry, destinationCountry])
+  @@index([sourceAsset, destinationAsset])
+}
+
+// ---------------------------------------------------------------------------
+// P3-4. QuoteWinLoss — tracks why offers won/lost for competitive feedback
+// ---------------------------------------------------------------------------
+model QuoteWinLoss {
+  id              String   @id @default(cuid())
+  providerId      String
+  provider        LiquidityProvider @relation(fields: [providerId], references: [id])
+  executionId     String
+  offerId         String?
+  corridor        String   // "SRC:DST"
+  result          String   // WON | LOST | EXPIRED
+  rank            Int?     // rank among candidates
+  winnerProviderId String?
+  winnerFeeBps    Int?
+  winnerExecutionSeconds Int?
+  ourFeeBps       Int?
+  ourExecutionSeconds Int?
+  reasonLost      String?  // "higher_cost" | "slower" | "higher_risk" | "manual_channel" | "lower_reputation"
+  createdAt       DateTime @default(now())
+
+  @@index([providerId, createdAt])
+  @@index([executionId])
+}
+
+// ---------------------------------------------------------------------------
+// P3-5. NetworkFeeConfig — configurable protocol fee framework
+// ---------------------------------------------------------------------------
+model NetworkFeeConfig {
+  id              String   @id @default(cuid())
+  name            String
+  // Fee in bps; can be scoped
+  feeBps          Int
+  // Scope: GLOBAL | CORRIDOR | PROVIDER_TYPE | SETTLEMENT_ASSET
+  scopeType       String   @default("GLOBAL")
+  scopeKey        String?  // e.g. "USD:EUR" for corridor, "BANK" for provider type
+  // Volume tiers (optional)
+  minVolume       Decimal?
+  maxVolume       Decimal?
+  // Rebate (negative fee) for valuable behavior
+  rebateBps       Int      @default(0)
+  rebateReason    String?  // "high_reliability" | "committed_liquidity" | "difficult_corridor"
+  status          String   @default("ACTIVE")
+  createdAt       DateTime @default(now())
+
+  @@index([scopeType, scopeKey, status])
+}
+
+// ---------------------------------------------------------------------------
+// P3-6. ProviderTier — derived tier stored on LiquidityProvider
+// Added as fields on the existing model (not a separate table) to avoid
+// a second entity. See LiquidityProvider.tier + tierUpdatedAt.
+// ---------------------------------------------------------------------------
+

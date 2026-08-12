@@ -21,7 +21,12 @@ import { assertCollateralEligible } from "./collateral";
 
 export async function seedDatabase(opts: { reset?: boolean } = {}) {
   if (opts.reset) {
-    // Wipe in dependency order.
+    // Wipe in dependency order (Prompt 3 models first, then P2, then P1).
+    await db.providerPerformanceSnapshot.deleteMany();
+    await db.liquidityCommitment.deleteMany();
+    await db.providerCorridorScore.deleteMany();
+    await db.quoteWinLoss.deleteMany();
+    await db.networkFeeConfig.deleteMany();
     await db.ledgerEntry.deleteMany();
     await db.auditEvent.deleteMany();
     await db.collateralLock.deleteMany();
@@ -29,10 +34,18 @@ export async function seedDatabase(opts: { reset?: boolean } = {}) {
     await db.obligation.deleteMany();
     await db.leg.deleteMany();
     await db.route.deleteMany();
+    await db.dispute.deleteMany();
+    await db.reconciliationItem.deleteMany();
     await db.execution.deleteMany();
     await db.executionIntent.deleteMany();
     await db.marketSignal.deleteMany();
     await db.idempotencyRecord.deleteMany();
+    await db.webhookDelivery.deleteMany();
+    await db.webhookEndpoint.deleteMany();
+    await db.apiKey.deleteMany();
+    await db.incentiveEarning.deleteMany();
+    await db.settlementIncentiveCampaign.deleteMany();
+    await db.notification.deleteMany();
     await db.vault.deleteMany();
     await db.liquidityOffer.deleteMany();
     await db.liquidityProvider.deleteMany();
@@ -498,6 +511,19 @@ export async function seedDatabase(opts: { reset?: boolean } = {}) {
   // API key for the demo operator's provider (Northbridge).
   const { createApiKey } = await import("@/lib/provider-api/auth");
   const apiKeyResult = await createApiKey(northbridge.id, "Northbridge API Key", ["offers", "executions", "obligations", "reconcile"]);
+
+  // ---- Prompt 3: set initial provider tiers based on reputation/age ----
+  // Continental Treasury (oldest, highest reputation) → PREMIUM.
+  await db.liquidityProvider.update({ where: { id: anchor.id }, data: { tier: "PREMIUM", tierUpdatedAt: new Date() } });
+  // Meridian LP (high reputation, stablecoin LP) → TRUSTED.
+  await db.liquidityProvider.update({ where: { id: apexBank.id }, data: { tier: "TRUSTED", tierUpdatedAt: new Date() } });
+  // Northbridge Bank, SwiftPay, Atlas Exchange → VERIFIED.
+  await db.liquidityProvider.update({ where: { id: northbridge.id }, data: { tier: "VERIFIED", tierUpdatedAt: new Date() } });
+  await db.liquidityProvider.update({ where: { id: sahel.id }, data: { tier: "VERIFIED", tierUpdatedAt: new Date() } });
+  await db.liquidityProvider.update({ where: { id: novapay.id }, data: { tier: "VERIFIED", tierUpdatedAt: new Date() } });
+  // OpenSwap, Sahara Cash → NEW (newer providers).
+  await db.liquidityProvider.update({ where: { id: centrex.id }, data: { tier: "NEW", tierUpdatedAt: new Date() } });
+  await db.liquidityProvider.update({ where: { id: fluidex.id }, data: { tier: "NEW", tierUpdatedAt: new Date() } });
 
   // Webhook endpoint for Northbridge (encrypted signing secret).
   const { encryptSecret } = await import("@/lib/crypto");

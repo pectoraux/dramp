@@ -248,6 +248,7 @@ export interface Provider {
   capabilities: string[];
   countries: string[];
   reputationScore: number;
+  tier?: string; // NEW | VERIFIED | TRUSTED | PREMIUM
   status: string;
   vaultId?: string | null;
   vault?: ProviderVault | null;
@@ -715,4 +716,235 @@ export interface OnboardingProvider {
 
 export interface OnboardingProvidersResponse {
   providers: OnboardingProvider[];
+}
+
+// ---------------------------------------------------------------------------
+// Economics — reputation
+// ---------------------------------------------------------------------------
+export interface ReputationComponents {
+  reliability: number;       // 0..100
+  speed: number;             // 0..100
+  liquidityQuality: number;  // 0..100
+  pricing: number;           // 0..100
+  disputes: number;          // 0..100
+  operational: number;       // 0..100
+  history: number;           // 0..100
+  overall: number;           // 0..100
+  sampleSize: number;
+  decayNote: string;
+}
+
+export interface ReputationResult {
+  providerId: string;
+  components: ReputationComponents;
+  tier: string;        // NEW | VERIFIED | TRUSTED | PREMIUM
+  tierReason: string;
+}
+
+// ---------------------------------------------------------------------------
+// Economics — provider economics, statements, win/loss
+// ---------------------------------------------------------------------------
+export interface ProviderEarnings {
+  executionFees: string;
+  incentives: string;
+  rebates: string;
+  penalties: string;
+  slashing: string;
+  compensation: string;
+  netEarnings: string;
+}
+
+export interface ProviderCapital {
+  committed: string;
+  deployed: string;
+  reserved: string;
+  idle: string;
+  vaultUsable: string;
+  vaultLocked: string;
+  maxExposure: string;
+}
+
+export interface ProviderPerformance {
+  totalExecutions: number;
+  completed: number;
+  completionRate: number;
+}
+
+export interface ProviderEfficiency {
+  earningsPerLiquidity: string;
+  capitalTurnover: number;
+  note: string;
+}
+
+export interface ProviderEconomicsResponse {
+  earnings: ProviderEarnings;
+  capital: ProviderCapital;
+  performance: ProviderPerformance;
+  efficiency: ProviderEfficiency;
+}
+
+export interface StatementEntry {
+  timestamp: string;
+  type: string;
+  asset: string;
+  amount: string;
+  signedAmount: string;
+  direction: "credit" | "debit";
+  executionId?: string | null;
+  description?: string | null;
+}
+
+export interface StatementSummary {
+  executionFees: string;
+  incentives: string;
+  slashing: string;
+  compensation: string;
+  refunds: string;
+  netChange: string;
+  entryCount: number;
+}
+
+export interface ProviderStatementResponse {
+  providerId: string;
+  period: { start: string; end: string };
+  entries: StatementEntry[];
+  summary: StatementSummary;
+}
+
+export interface QuoteWinLossResponse {
+  totalQuotes: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  lossReasons: Record<string, number>;
+  recentResults: Array<{
+    corridor: string;
+    result: string;
+    ourFeeBps: number | null;
+    winnerFeeBps: number | null;
+    reasonLost: string | null;
+    createdAt: string;
+  }>;
+}
+
+// ---------------------------------------------------------------------------
+// Economics — market intelligence (public)
+// ---------------------------------------------------------------------------
+export interface OpportunityItem {
+  corridor: string;
+  demandAmount: number | string;
+  supplyAmount: number | string;
+  gap: number | string;
+  gapPct: number;
+  estimatedSpreadBps: number;
+  opportunity: "HIGH" | "MEDIUM" | "LOW" | string;
+  note: string;
+}
+
+export interface OpportunitiesResponse {
+  opportunities: OpportunityItem[];
+}
+
+export interface PricingOffer {
+  provider: string;
+  providerType: string;
+  tier: string | null;
+  reputation: number;
+  feeBps: number;
+  rate: string;
+  availableCapacity: string;
+  channelType: string;
+  expectedExecutionSeconds: number;
+}
+
+export interface PricingFill {
+  amount: string;
+  feeBps: number | null;
+  completedAt: string | null;
+}
+
+export interface PricingIntelligenceResponse {
+  corridor: string;
+  offerCount: number;
+  cheapestFeeBps?: number;
+  medianFeeBps?: number;
+  mostExpensiveFeeBps?: number;
+  fastestExecutionSeconds?: number;
+  fastestProvider?: string;
+  offers?: PricingOffer[];
+  recentFills?: PricingFill[];
+  message?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Economics — network health / unit economics / funnel (admin)
+// ---------------------------------------------------------------------------
+export interface NetworkHealthResponse {
+  liquidityDepth: number;
+  routeCompetition: number;
+  providerReliability: number;
+  executionSuccess: number;
+  averageWait: number;
+  riskConcentration: number;
+  overall: number;
+  components: Record<string, number>;
+}
+
+export interface UnitEconomicsCorridor {
+  corridor: string;
+  volume: string;
+  count: number;
+  fees: string;
+  avgTakeRateBps: number;
+}
+
+export interface UnitEconomicsResponse {
+  totalVolume: number | string;
+  completedCount: number;
+  totalFees: string;
+  avgCostBps: number;
+  corridors: UnitEconomicsCorridor[];
+}
+
+export interface AcquisitionFunnelResponse {
+  applied: number;
+  approved: number;
+  connected: number;
+  publishedOffer: number;
+  receivedExecution: number;
+  completedExecution: number;
+  repeatProvider: number;
+  conversionRates: {
+    appliedToApproved: number;
+    approvedToConnected: number;
+    connectedToPublished: number;
+    publishedToFirstExecution: number;
+    firstToRepeat: number;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Commitments (operator + admin)
+// ---------------------------------------------------------------------------
+export interface CommitmentItem {
+  id: string;
+  providerId?: string;
+  providerName?: string;
+  corridor: string;
+  minimumLiquidity: string;
+  targetExecutionSeconds: number;
+  status: string;
+  reliability: number;
+  samples: number;
+  avgAvailable: string;
+  endDate: string;
+}
+
+export interface CommitmentsResponse {
+  commitments: CommitmentItem[];
+}
+
+export interface CommitmentSampleResponse {
+  met: boolean;
+  available: string | number;
 }

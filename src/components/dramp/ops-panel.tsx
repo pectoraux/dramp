@@ -59,6 +59,9 @@ import type {
   OnboardingProvider,
   OnboardingProvidersResponse,
 } from "./types";
+import { NetworkHealthView as EconNetworkHealthView } from "./network-health-view";
+import { UnitEconomicsView as EconUnitEconomicsView } from "./unit-economics-view";
+import { AcquisitionFunnel as EconAcquisitionFunnel } from "./acquisition-funnel";
 import {
   Activity,
   Gauge,
@@ -93,7 +96,10 @@ type OpsView =
   | "disputes"
   | "reconciliation"
   | "incentives"
-  | "onboarding";
+  | "onboarding"
+  | "network-health"
+  | "unit-economics"
+  | "funnel";
 
 const VIEWS: { key: OpsView; label: string; icon: React.ReactNode }[] = [
   { key: "overview", label: "Overview", icon: <Gauge className="size-3.5" /> },
@@ -106,6 +112,9 @@ const VIEWS: { key: OpsView; label: string; icon: React.ReactNode }[] = [
   { key: "reconciliation", label: "Reconciliation", icon: <FileCheck2 className="size-3.5" /> },
   { key: "incentives", label: "Incentives", icon: <Gift className="size-3.5" /> },
   { key: "onboarding", label: "Onboarding", icon: <UserCheck className="size-3.5" /> },
+  { key: "network-health", label: "Network health", icon: <Activity className="size-3.5" /> },
+  { key: "unit-economics", label: "Unit economics", icon: <TrendingUp className="size-3.5" /> },
+  { key: "funnel", label: "Funnel", icon: <Layers className="size-3.5" /> },
 ];
 
 export function OpsPanel() {
@@ -151,8 +160,26 @@ export function OpsPanel() {
       {view === "reconciliation" && <ReconciliationView />}
       {view === "incentives" && <IncentivesView />}
       {view === "onboarding" && <OnboardingView />}
+      {view === "network-health" && <NetworkHealthView />}
+      {view === "unit-economics" && <UnitEconomicsView />}
+      {view === "funnel" && <AcquisitionFunnel />}
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Network health / unit economics / funnel — delegate to economics components
+// ---------------------------------------------------------------------------
+function NetworkHealthView() {
+  return <EconNetworkHealthView />;
+}
+
+function UnitEconomicsView() {
+  return <EconUnitEconomicsView />;
+}
+
+function AcquisitionFunnel() {
+  return <EconAcquisitionFunnel />;
 }
 
 // ---------------------------------------------------------------------------

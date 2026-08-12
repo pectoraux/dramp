@@ -24,6 +24,7 @@ import { WaitlistPanel } from "./waitlist-panel";
 import { MarketplacePanel } from "./marketplace-panel";
 import { OpsPanel } from "./ops-panel";
 import { ApiPanel } from "./api-panel";
+import { EconomicsPanel } from "./economics-panel";
 import { AuthScreen } from "./auth-screen";
 import { usePolling } from "@/hooks/use-polling";
 import { toast } from "sonner";
@@ -46,6 +47,7 @@ import {
   Store,
   Gauge,
   Terminal,
+  BarChart3,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { cn } from "@/lib/utils";
@@ -59,6 +61,7 @@ type TabKey =
   | "monitor"
   | "audit"
   | "ops"
+  | "economics"
   | "api"
   | "waitlist";
 
@@ -77,6 +80,7 @@ const TABS: TabDef[] = [
   { key: "providers", label: "Providers", icon: <Building2 className="size-3.5" /> },
   { key: "monitor", label: "Monitor", icon: <Activity className="size-3.5" /> },
   { key: "audit", label: "Audit", icon: <ScrollText className="size-3.5" /> },
+  { key: "economics", label: "Economics", icon: <BarChart3 className="size-3.5" /> },
   { key: "ops", label: "Ops", icon: <Gauge className="size-3.5" />, adminOnly: true },
   { key: "api", label: "API", icon: <Terminal className="size-3.5" />, operatorOnly: true },
   { key: "waitlist", label: "Waitlist", icon: <UserCog className="size-3.5" />, adminOnly: true },
@@ -335,6 +339,9 @@ export function AppShell() {
                 </TabsContent>
                 <TabsContent value="audit" className="focus-visible:outline-none">
                   <AuditPanel />
+                </TabsContent>
+                <TabsContent value="economics" className="focus-visible:outline-none">
+                  <EconomicsPanel />
                 </TabsContent>
                 {isAdmin && (
                   <TabsContent value="ops" className="focus-visible:outline-none">

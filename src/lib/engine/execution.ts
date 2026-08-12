@@ -1015,6 +1015,28 @@ async function completeExecution(executionId: string) {
   } catch (err) {
     console.error(`[dRamp] incentive accrual error for ${executionId}:`, err);
   }
+
+  // Record provider performance outcomes for reputation/corridor scoring.
+  // This feeds the ReputationService and the routing engine's reputation factor.
+  try {
+    const { recordExecutionOutcome } = await import("@/lib/economics/performance");
+    const legs = await db.leg.findMany({
+      where: { executionId },
+      include: { offer: true },
+    });
+    for (const leg of legs) {
+      await recordExecutionOutcome(executionId, leg.providerId, "COMPLETED", {
+        sourceAsset: leg.sourceAsset,
+        destinationAsset: leg.destinationAsset,
+        sourceCountry: leg.offer?.sourceCountry ?? "GLOBAL",
+        destinationCountry: leg.offer?.destinationCountry ?? "GLOBAL",
+        amount: leg.amount,
+        offer: leg.offer ? { feeBps: leg.offer.feeBps } : null,
+      });
+    }
+  } catch (err) {
+    console.error(`[dRamp] performance recording error for ${executionId}:`, err);
+  }
 }
 
 // ---- Cancellation --------------------------------------------------------

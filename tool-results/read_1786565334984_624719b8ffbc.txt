@@ -1,0 +1,797 @@
+     1→// dRamp — Cross-Border Value Execution Marketplace
+     2→// Core economic engine schema.
+     3→//
+     4→// NOTE: This is a prototype. PostgreSQL is the datastore (Neon). All monetary
+     5→// values are stored as Decimal (native numeric type). Concurrency is enforced
+     6→// via Prisma interactive transactions with conditional re-checks inside the
+     7→// transaction. Blockchain / bank / PSP rails are simulated.
+     8→
+     9→generator client {
+    10→  provider = "prisma-client-js"
+    11→}
+    12→
+    13→datasource db {
+    14→  provider  = "postgresql"
+    15→  url       = env("DATABASE_URL")
+    16→  directUrl = env("DIRECT_URL")
+    17→}
+    18→
+    19→// ---------------------------------------------------------------------------
+    20→// Users — authenticated marketplace participants
+    21→// ---------------------------------------------------------------------------
+    22→model User {
+    23→  id         String   @id @default(cuid())
+    24→  email      String   @unique
+    25→  name       String?
+    26→  password   String? // null for waitlist-only / demo-as-pending; set when an account is created
+    27→  role       String   @default("USER") // USER | PROVIDER_OPERATOR | ADMIN
+    28→  status     String   @default("ACTIVE") // ACTIVE | SUSPENDED
+    29→  isDemo     Boolean  @default(false)
+    30→  providerId String?  // for PROVIDER_OPERATORs: the LiquidityProvider they operate
+    31→  createdAt  DateTime @default(now())
+    32→  updatedAt  DateTime @updatedAt
+    33→
+    34→  intents       ExecutionIntent[]
+    35→  waitlistApproved WaitlistEntry[] @relation("WaitlistReviewer")
+    36→  operatedProvider LiquidityProvider? @relation("OperatedBy", fields: [providerId], references: [id])
+    37→}
+    38→
+    39→// ---------------------------------------------------------------------------
+    40→// WaitlistEntry — sign-ups pending admin approval before an account is created
+    41→// ---------------------------------------------------------------------------
+    42→model WaitlistEntry {
+    43→  id            String   @id @default(cuid())
+    44→  email         String   @unique
+    45→  name          String?
+    46→  requestedRole String   @default("USER") // USER | PROVIDER_OPERATOR
+    47→  status        String   @default("PENDING") // PENDING | APPROVED | REJECTED
+    48→  note          String?
+    49→  createdAt     DateTime @default(now())
+    50→  reviewedAt    DateTime?
+    51→  reviewedById  String?
+    52→  reviewedBy    User?    @relation("WaitlistReviewer", fields: [reviewedById], references: [id])
+    53→  createdUserId String? // the User id created once approved
+    54→
+    55→  @@index([status])
+    56→}
+    57→
+    58→// ---------------------------------------------------------------------------
+    59→// 1. ExecutionIntent — what the user wants (stable, may outlive many attempts)
+    60→// ---------------------------------------------------------------------------
+    61→model ExecutionIntent {
+    62→  id                          String   @id @default(cuid())
+    63→  userId                      String
+    64→  user                        User     @relation(fields: [userId], references: [id])
+    65→
+    66→  sourceAmount                Decimal
+    67→  sourceAsset                 String
+    68→  sourceCountry               String
+    69→  destinationAsset            String
+    70→  destinationCountry          String
+    71→  minimumDestinationAmount    Decimal?
+    72→  maximumTotalCost            Decimal?
+    73→  targetRate                  Decimal?
+    74→
+    75→  riskTolerance               String // MAX_RELIABILITY | BALANCED | LOWEST_COST
+    76→  executionPolicy             String // NOW | WAIT_FOR_BETTER
+    77→  maxWaitSeconds              Int
+    78→  cancellationPolicy          String
+    79→  allowedSettlementAssets     String // JSON array of asset ids (empty = all eligible)
+    80→  prohibitedSettlementAssets  String // JSON array of asset ids
+    81→
+    82→  status                      String // ACTIVE | COMPLETED | CANCELLED | EXPIRED | FAILED
+    83→  createdAt                   DateTime @default(now())
+    84→  expiresAt                   DateTime
+    85→
+    86→  executions                  Execution[]
+    87→  auditEvents                 AuditEvent[]
+    88→
+    89→  @@index([status])
+    90→  @@index([userId])
+    91→}
+    92→
+    93→// ---------------------------------------------------------------------------
+    94→// 2. Execution — a concrete attempt to fulfill an intent
+    95→// ---------------------------------------------------------------------------
+    96→model Execution {
+    97→  id                String   @id @default(cuid())
+    98→  intentId          String
+    99→  intent            ExecutionIntent @relation(fields: [intentId], references: [id])
+   100→
+   101→  attemptNumber     Int
+   102→  status            String // canonical state machine
+   103→  commitmentStatus  String // REVERSIBLE | PARTIALLY_COMMITTED | IRREVERSIBLE
+   104→  selectedRouteId   String?
+   105→  referenceRouteId  String? // current best candidate while SEARCHING
+   106→  selectedRouteJson String? // snapshot of the selected route for the receipt
+   107→  startedAt         DateTime @default(now())
+   108→  completedAt       DateTime?
+   109→  failureReason     String?
+   110→  waitedSeconds     Int      @default(0)
+   111→  lastTickAt        DateTime @default(now())
+   112→
+   113→  routes            Route[]
+   114→  obligations       Obligation[]
+   115→  legs              Leg[]
+   116→  reservations      Reservation[]
+   117→  collateralLocks   CollateralLock[]
+   118→  ledgerEntries     LedgerEntry[]
+   119→  auditEvents       AuditEvent[]
+   120→  disputes          Dispute[]
+   121→
+   122→  @@index([intentId])
+   123→  @@index([status])
+   124→}
+   125→
+   126→// ---------------------------------------------------------------------------
+   127→// 3. Route — a candidate plan discovered by the routing engine
+   128→// ---------------------------------------------------------------------------
+   129→model Route {
+   130→  id              String   @id @default(cuid())
+   131→  executionId     String
+   132→  execution       Execution @relation(fields: [executionId], references: [id])
+   133→
+   134→  legCount        Int
+   135→  totalCost       Decimal
+   136→  effectiveCost   Decimal
+   137→  grossOutput     Decimal
+   138→  netOutput       Decimal
+   139→  incentiveBps    Int
+   140→
+   141→  // Separate risk dimensions (0..1)
+   142→  riskCounterparty     Float
+   143→  riskSettlementAsset  Float
+   144→  riskLiquidity        Float
+   145→  riskOperational      Float
+   146→  riskDuration         Float
+   147→  riskComposite        Float
+   148→
+   149→  expectedExecutionSeconds Int
+   150→  explanation             String
+   151→  tag                     String   // BEST | CHEAPEST | FASTEST | SAFEST | CANDIDATE
+   152→  status                  String   // CANDIDATE | SELECTED | RESERVED | SUPERSEDED | EXPIRED | FAILED
+   153→  splitRoute              Boolean  @default(false)
+   154→  expiresAt               DateTime?
+   155→  createdAt               DateTime @default(now())
+   156→
+   157→  legs            Leg[]
+   158→
+   159→  @@index([executionId])
+   160→}
+   161→
+   162→// ---------------------------------------------------------------------------
+   163→// 4. Leg — a single hop within a route (provider + offer + role)
+   164→// ---------------------------------------------------------------------------
+   165→model Leg {
+   166→  id                String   @id @default(cuid())
+   167→  routeId           String
+   168→  route             Route    @relation(fields: [routeId], references: [id])
+   169→  executionId       String?
+   170→  execution         Execution? @relation(fields: [executionId], references: [id])
+   171→
+   172→  providerId        String
+   173→  provider          LiquidityProvider @relation(fields: [providerId], references: [id])
+   174→  offerId           String
+   175→  offer             LiquidityOffer @relation(fields: [offerId], references: [id])
+   176→  sequence          Int
+   177→  role              String   // SOURCE | SETTLEMENT_HOP | DESTINATION
+   178→  amount            Decimal
+   179→  sourceAsset       String
+   180→  destinationAsset  String
+   181→  settlementAssetId String?
+   182→  channelType       String   // AUTOMATIC | MANUAL
+   183→  status            String   // PENDING | RESERVED | IN_PROGRESS | CONFIRMED | FAILED | CANCELLED
+   184→  commitmentStatus  String   // REVERSIBLE | PARTIALLY_COMMITTED | IRREVERSIBLE
+   185→  actorId           String?  // for manual confirmations
+   186→  actorNote         String?
+   187→  confirmedAt       DateTime?
+   188→
+   189→  @@index([routeId])
+   190→  @@index([executionId])
+   191→}
+   192→
+   193→// ---------------------------------------------------------------------------
+   194→// 5. LiquidityProvider — any source of liquidity (not just "agents")
+   195→// ---------------------------------------------------------------------------
+   196→model LiquidityProvider {
+   197→  id              String   @id @default(cuid())
+   198→  name            String
+   199→  providerType    String   // LOCAL_FIAT_AGENT | PSP | BANK | STABLECOIN_LP | CEX | DEX | TREASURY | MARKET_MAKER | SETTLEMENT_ASSET_SPONSOR | HYBRID
+   200→  trustModel      String   // COLLATERALIZED | INSTITUTIONALLY_TRUSTED | PRE_FUNDED | EXTERNAL_ESCROW | NON_CUSTODIAL
+   201→  capabilities    String   // JSON array
+   202→  countries       String   // JSON array
+   203→  reputationScore Float
+   204→  status          String   // APPLIED | REVIEW | APPROVED | ACTIVE | SUSPENDED | REJECTED
+   205→  vaultId         String?
+   206→  createdAt       DateTime @default(now())
+   207→
+   208→  // Onboarding profile (Prompt 2)
+   209→  jurisdiction      String?
+   210→  contactEmail      String?
+   211→  supportedAssets   String?  // JSON array of asset symbols
+   212→  settlementMethods String?  // JSON array
+   213→  apiIntegrationStatus String? // NONE | PENDING | CONNECTED | FAILED
+   214→  onboardingNote    String?
+   215→  reviewedById      String?
+   216→  reviewedAt        DateTime?
+   217→
+   218→  // Prompt 3: derived tier + reputation
+   219→  tier              String   @default("NEW") // NEW | VERIFIED | TRUSTED | PREMIUM
+   220→  tierUpdatedAt     DateTime @default(now())
+   221→
+   222→  offers          LiquidityOffer[]
+   223→  obligations     Obligation[]
+   224→  legs            Leg[]
+   225→  vault           Vault?
+   226→  operators       User[]    @relation("OperatedBy")
+   227→  apiKeys         ApiKey[]
+   228→  webhookEndpoints WebhookEndpoint[]
+   229→  incentiveCampaigns SettlementIncentiveCampaign[]
+   230→  disputes        Dispute[]
+   231→  performanceSnapshots ProviderPerformanceSnapshot[]
+   232→  commitments     LiquidityCommitment[]
+   233→  corridorScores  ProviderCorridorScore[]
+   234→  quoteWinLosses  QuoteWinLoss[]
+   235→
+   236→  @@index([status])
+   237→  @@index([tier])
+   238→}
+   239→
+   240→// ---------------------------------------------------------------------------
+   241→// 6. LiquidityOffer — a published capability with pricing & capacity
+   242→// ---------------------------------------------------------------------------
+   243→model LiquidityOffer {
+   244→  id                    String   @id @default(cuid())
+   245→  providerId            String
+   246→  provider              LiquidityProvider @relation(fields: [providerId], references: [id])
+   247→
+   248→  capability            String   // FIAT_IN | FIAT_OUT | SETTLEMENT_IN | SETTLEMENT_OUT | SWAP | FX | BANK_TRANSFER | MOBILE_MONEY | CASH | CARD | ONCHAIN_TRANSFER | ONCHAIN_SWAP | CEX_EXECUTION | DEX_EXECUTION
+   249→  sourceAsset           String
+   250→  destinationAsset      String
+   251→  sourceCountry         String
+   252→  destinationCountry    String
+   253→  rate                  Decimal  // amount of destination asset per 1 unit of source asset
+   254→  feeBps                Int
+   255→  minimumAmount         Decimal
+   256→  maximumAmount         Decimal
+   257→  availableCapacity     Decimal  // current reservable capacity in source asset
+   258→  reservedCapacity      Decimal  @default(0)
+   259→  settlementAssetId     String?
+   260→  channelType           String   // AUTOMATIC | MANUAL
+   261→  expectedExecutionSeconds Int
+   262→  incentiveBps          Int      @default(0)
+   263→  active                Boolean  @default(true)
+   264→  expiresAt             DateTime?
+   265→  createdAt             DateTime @default(now())
+   266→  updatedAt             DateTime @updatedAt
+   267→
+   268→  legs            Leg[]
+   269→  reservations    Reservation[]
+   270→
+   271→  @@index([providerId])
+   272→  @@index([active])
+   273→}
+   274→
+   275→// ---------------------------------------------------------------------------
+   276→// 7. SettlementAsset — stablecoins, volatile tokens, internal settlement units
+   277→// ---------------------------------------------------------------------------
+   278→model SettlementAsset {
+   279→  id                    String   @id @default(cuid())
+   280→  symbol                String   @unique
+   281→  issuer                String
+   282→  assetType             String   // STABLECOIN | VOLATILE_TOKEN | INTERNAL_SETTLEMENT_UNIT
+   283→  network               String
+   284→  volatilityScore       Float    // 0..1 (0 = stable)
+   285→  liquidityScore        Float    // 0..1 (1 = deep)
+   286→  pegQuality            Float?
+   287→  redemptionModel       String
+   288→  incentiveRate         Int      @default(0) // bps subsidy for usage
+   289→  incentiveSource       String?
+   290→  settlementHaircut     Float    @default(0) // haircut applied when used for settlement
+   291→  collateralHaircut     Float    @default(0) // haircut applied when used as collateral
+   292→  isEligibleCollateral  Boolean  @default(false) // HARD INVARIANT: false if assetType == VOLATILE_TOKEN
+   293→  maximumNetworkExposure Decimal?
+   294→  status                String   // ACTIVE | INELIGIBLE | DELISTED
+   295→  createdAt             DateTime @default(now())
+   296→
+   297→  incentiveCampaigns   SettlementIncentiveCampaign[]
+   298→}
+   299→
+   300→// ---------------------------------------------------------------------------
+   301→// 8. Vault — collateral store for COLLATERALIZED providers
+   302→// ---------------------------------------------------------------------------
+   303→model Vault {
+   304→  id                    String   @id @default(cuid())
+   305→  providerId            String   @unique
+   306→  provider              LiquidityProvider @relation(fields: [providerId], references: [id])
+   307→
+   308→  holdingsJson          String   // JSON: { assetId: amount }
+   309→  usableCollateral      Decimal  // Σ market_value × (1 - collateral_haircut)
+   310→  lockedCollateral      Decimal  @default(0)
+   311→  collateralizationRatio Float   @default(1.5) // 150%
+   312→  maxExposure           Decimal
+   313→
+   314→  collateralLocks       CollateralLock[]
+   315→  createdAt             DateTime @default(now())
+   316→}
+   317→
+   318→// ---------------------------------------------------------------------------
+   319→// 9. Obligation — the fundamental economic promise created by execution
+   320→// ---------------------------------------------------------------------------
+   321→model Obligation {
+   322→  id                    String   @id @default(cuid())
+   323→  executionId           String
+   324→  execution             Execution @relation(fields: [executionId], references: [id])
+   325→  legId                 String?
+   326→  providerId            String
+   327→  provider              LiquidityProvider @relation(fields: [providerId], references: [id])
+   328→  counterpartyProviderId String?
+   329→  amount                Decimal
+   330→  asset                 String
+   331→  collateralBackingId   String?
+   332→  dueAt                 DateTime
+   333→  status                String   // CREATED | ACTIVE | FULFILLED | EXPIRED | FAILED | DISPUTED | SLASHED
+   334→  createdAt             DateTime @default(now())
+   335→  fulfilledAt           DateTime?
+   336→
+   337→  @@index([executionId])
+   338→  @@index([providerId])
+   339→  @@index([status])
+   340→}
+   341→
+   342→// ---------------------------------------------------------------------------
+   343→// 10. Reservation — capacity hold on an offer (concurrency-safe)
+   344→// ---------------------------------------------------------------------------
+   345→model Reservation {
+   346→  id              String   @id @default(cuid())
+   347→  executionId     String
+   348→  execution       Execution @relation(fields: [executionId], references: [id])
+   349→  offerId         String
+   350→  offer           LiquidityOffer @relation(fields: [offerId], references: [id])
+   351→  amount          Decimal
+   352→  status          String   // ACTIVE | RELEASED | CONSUMED | EXPIRED
+   353→  expiresAt       DateTime
+   354→  createdAt       DateTime @default(now())
+   355→
+   356→  @@index([executionId])
+   357→  @@index([offerId])
+   358→}
+   359→
+   360→// ---------------------------------------------------------------------------
+   361→// 11. CollateralLock — locked collateral backing an obligation
+   362→// ---------------------------------------------------------------------------
+   363→model CollateralLock {
+   364→  id              String   @id @default(cuid())
+   365→  vaultId         String
+   366→  vault           Vault    @relation(fields: [vaultId], references: [id])
+   367→  providerId      String
+   368→  executionId     String
+   369→  execution       Execution @relation(fields: [executionId], references: [id])
+   370→  obligationId    String?
+   371→  amount          Decimal
+   372→  asset           String
+   373→  status          String   // LOCKED | RELEASED | SLASHED
+   374→  createdAt       DateTime @default(now())
+   375→
+   376→  @@index([executionId])
+   377→  @@index([vaultId])
+   378→}
+   379→
+   380→// ---------------------------------------------------------------------------
+   381→// 12. LedgerEntry — double-entry internal ledger (immutable)
+   382→// ---------------------------------------------------------------------------
+   383→model LedgerEntry {
+   384→  id              String   @id @default(cuid())
+   385→  timestamp       DateTime @default(now())
+   386→  debitAccount    String
+   387→  creditAccount   String
+   388→  amount          Decimal
+   389→  asset           String
+   390→  entryType       String   // MINT | BURN | TRANSFER | LOCK | RELEASE | SLASH | FEE | INCENTIVE | COMPENSATION | REFUND
+   391→  executionId     String?
+   392→  execution       Execution? @relation(fields: [executionId], references: [id])
+   393→  obligationId    String?
+   394→  idempotencyKey  String   @unique
+   395→  description     String?
+   396→
+   397→  @@index([executionId])
+   398→  @@index([debitAccount])
+   399→  @@index([creditAccount])
+   400→}
+   401→
+   402→// ---------------------------------------------------------------------------
+   403→// 13. AuditEvent — immutable, hash-chained event stream
+   404→// ---------------------------------------------------------------------------
+   405→model AuditEvent {
+   406→  id              String   @id @default(cuid())
+   407→  timestamp       DateTime @default(now())
+   408→  executionId     String?
+   409→  execution       Execution? @relation(fields: [executionId], references: [id])
+   410→  intentId        String?
+   411→  intent          ExecutionIntent? @relation(fields: [intentId], references: [id])
+   412→  eventType       String
+   413→  payloadJson     String
+   414→  actorType       String   // SYSTEM | USER | PROVIDER
+   415→  actorId         String?
+   416→  prevHash        String
+   417→  hash            String
+   418→
+   419→  @@index([executionId])
+   420→  @@index([intentId])
+   421→}
+   422→
+   423→// ---------------------------------------------------------------------------
+   424→// 14. IdempotencyRecord — guards all financial mutations
+   425→// ---------------------------------------------------------------------------
+   426→model IdempotencyRecord {
+   427→  id              String   @id @default(cuid())
+   428→  key             String   @unique
+   429→  operation       String
+   430→  requestPayload  String
+   431→  responseStatus  Int
+   432→  responseBody    String?
+   433→  createdAt       DateTime @default(now())
+   434→}
+   435→
+   436→// ---------------------------------------------------------------------------
+   437→// 15. MarketSignal — simulated market state (offers changing over time)
+   438→// ---------------------------------------------------------------------------
+   439→model MarketSignal {
+   440→  id              String   @id @default(cuid())
+   441→  kind            String   // NEW_LIQUIDITY | PRICE_CHANGE | CAPACITY_CHANGE | PROVIDER_JOIN | PROVIDER_LEAVE | ASSET_INELIGIBLE
+   442→  payloadJson     String
+   443→  triggerAt       DateTime
+   444→  fired           Boolean  @default(false)
+   445→  createdAt       DateTime @default(now())
+   446→
+   447→  @@index([fired, triggerAt])
+   448→}
+   449→
+   450→// ===========================================================================
+   451→// PROMPT 2 — Open Liquidity Marketplace extensions
+   452→//
+   453→// These models extend the existing domain (never replace it). All economic
+   454→// effects still flow through the existing LedgerEntry, ExecutionIntent,
+   455→// Execution, Route, Leg, Obligation, CollateralLock, and AuditEvent entities.
+   456→// ===========================================================================
+   457→
+   458→// ---------------------------------------------------------------------------
+   459→// P2-1. ApiKey — provider-scoped API credentials for the Open Liquidity API
+   460→// ---------------------------------------------------------------------------
+   461→model ApiKey {
+   462→  id            String   @id @default(cuid())
+   463→  providerId    String
+   464→  provider      LiquidityProvider @relation(fields: [providerId], references: [id])
+   465→  keyId         String   @unique // public identifier (e.g. "pk_live_xxxx")
+   466→  secretHash    String   // bcrypt hash of the secret; plaintext shown once on creation
+   467→  label         String   // human-readable name
+   468→  scopes        String   // JSON array: ["offers","executions","obligations","reconcile"]
+   469→  status        String   @default("ACTIVE") // ACTIVE | REVOKED
+   470→  lastUsedAt    DateTime?
+   471→  createdAt     DateTime @default(now())
+   472→  revokedAt     DateTime?
+   473→
+   474→  @@index([providerId])
+   475→}
+   476→
+   477→// ---------------------------------------------------------------------------
+   478→// P2-2. WebhookEndpoint — outbound webhook configuration per provider
+   479→// ---------------------------------------------------------------------------
+   480→model WebhookEndpoint {
+   481→  id            String   @id @default(cuid())
+   482→  providerId    String
+   483→  provider      LiquidityProvider @relation(fields: [providerId], references: [id])
+   484→  url           String
+   485→  encryptedSecret String // AES-256-GCM encrypted signing secret (never plaintext)
+   486→  encryptionKeyVersion Int @default(1) // key version for rotation
+   487→  events        String   // JSON array of event types to subscribe to
+   488→  status        String   @default("ACTIVE") // ACTIVE | PAUSED
+   489→  createdAt     DateTime @default(now())
+   490→
+   491→  deliveries    WebhookDelivery[]
+   492→
+   493→  @@index([providerId])
+   494→}
+   495→
+   496→// ---------------------------------------------------------------------------
+   497→// P2-3. WebhookDelivery — retryable, idempotent outbound webhook deliveries
+   498→// ---------------------------------------------------------------------------
+   499→model WebhookDelivery {
+   500→  id            String   @id @default(cuid())
+   501→  endpointId    String
+   502→  endpoint      WebhookEndpoint @relation(fields: [endpointId], references: [id])
+   503→  eventType     String
+   504→  payloadJson   String
+   505→  signature     String   // HMAC-SHA256 of payload
+   506→  status        String   @default("PENDING") // PENDING | DELIVERED | FAILED | RETRYING
+   507→  attempts      Int      @default(0)
+   508→  responseStatus Int?
+   509→  responseBody  String?
+   510→  nextRetryAt   DateTime?
+   511→  createdAt     DateTime @default(now())
+   512→  deliveredAt   DateTime?
+   513→
+   514→  @@index([endpointId, status])
+   515→  @@index([nextRetryAt])
+   516→}
+   517→
+   518→// ---------------------------------------------------------------------------
+   519→// P2-4. SettlementIncentiveCampaign — sponsor-funded incentive programs
+   520→// ---------------------------------------------------------------------------
+   521→model SettlementIncentiveCampaign {
+   522→  id              String   @id @default(cuid())
+   523→  settlementAssetId String
+   524→  settlementAsset SettlementAsset @relation(fields: [settlementAssetId], references: [id])
+   525→  sponsorProviderId String?
+   526→  sponsorProvider  LiquidityProvider? @relation(fields: [sponsorProviderId], references: [id])
+   527→  name            String
+   528→  incentiveBps    Int      // bps subsidy applied to qualifying settlement volume
+   529→  fundingSource   String   // issuer | sponsor | dramp
+   530→  startDate       DateTime
+   531→  endDate         DateTime
+   532→  totalBudget     Decimal  // max total incentive payout (in settlement asset)
+   533→  perTxnCap       Decimal? // max incentive per single execution
+   534→  volumeCap       Decimal? // max qualifying settlement volume
+   535→  qualifiedVolume Decimal  @default(0) // cumulative qualifying settlement volume actually earned
+   536→  accrued         Decimal  @default(0) // earned by completed executions (not yet paid)
+   537→  paid            Decimal  @default(0) // actually credited
+   538→  eligibleCorridors String? // JSON array of "SRC:DST" corridors; null = all
+   539→  eligibleRiskLevels String? // JSON array; null = all
+   540→  eligibleProviderTypes String? // JSON array; null = all
+   541→  status          String   @default("ACTIVE") // DRAFT | ACTIVE | PAUSED | EXHAUSTED | EXPIRED
+   542→  createdAt       DateTime @default(now())
+   543→
+   544→  earnings        IncentiveEarning[]
+   545→
+   546→  @@index([settlementAssetId, status])
+   547→  @@index([status])
+   548→}
+   549→
+   550→// ---------------------------------------------------------------------------
+   551→// P2-5. IncentiveEarning — tracks accrued incentive per completed execution
+   552→// ---------------------------------------------------------------------------
+   553→model IncentiveEarning {
+   554→  id              String   @id @default(cuid())
+   555→  campaignId      String
+   556→  campaign        SettlementIncentiveCampaign @relation(fields: [campaignId], references: [id])
+   557→  executionId     String
+   558→  providerId      String
+   559→  amount          Decimal
+   560→  qualifiedVolume Decimal  @default(0) // settlement volume that earned this incentive
+   561→  status          String   @default("ACCRUED") // ACCRUED | PAID | REVERSED
+   562→  createdAt       DateTime @default(now())
+   563→  paidAt          DateTime?
+   564→
+   565→  // Concurrency safety: one earning per (campaign, execution, provider).
+   566→  // Prevents duplicate accrual if two concurrent completion processes race.
+   567→  @@unique([campaignId, executionId, providerId])
+   568→  @@index([campaignId])
+   569→  @@index([executionId])
+   570→}
+   571→
+   572→// ---------------------------------------------------------------------------
+   573→// P2-6. Dispute — investigation workflow for execution/obligation failures
+   574→// ---------------------------------------------------------------------------
+   575→model Dispute {
+   576→  id              String   @id @default(cuid())
+   577→  executionId     String
+   578→  execution       Execution @relation(fields: [executionId], references: [id])
+   579→  obligationId    String?
+   580→  providerId      String
+   581→  provider        LiquidityProvider @relation(fields: [providerId], references: [id])
+   582→  reason          String
+   583→  description     String?
+   584→  status          String   @default("OPEN") // OPEN | INVESTIGATING | RESOLVED_PROVIDER | RESOLVED_USER | PARTIAL_COMPENSATION | SLASHED | CLOSED
+   585→  resolution      String?
+   586→  compensationAmount Decimal? @default(0)
+   587→  slashedAmount   Decimal? @default(0)
+   588→  openedById      String
+   589→  resolvedById    String?
+   590→  createdAt       DateTime @default(now())
+   591→  resolvedAt      DateTime?
+   592→
+   593→  @@index([executionId])
+   594→  @@index([providerId, status])
+   595→  @@index([status])
+   596→}
+   597→
+   598→// ---------------------------------------------------------------------------
+   599→// P2-7. ReconciliationItem — discrepancy detection + resolution workflow
+   600→// ---------------------------------------------------------------------------
+   601→model ReconciliationItem {
+   602→  id              String   @id @default(cuid())
+   603→  providerId      String
+   604→  type            String   // MISSING_SETTLEMENT | AMOUNT_MISMATCH | DUPLICATE_SETTLEMENT | STALE_OBLIGATION | BALANCE_DIFFERENCE
+   605→  severity        String   @default("MEDIUM") // LOW | MEDIUM | HIGH
+   606→  status          String   @default("DETECTED") // DETECTED | INVESTIGATING | MATCHED | ADJUSTED | RESOLVED
+   607→  executionId     String?
+   608→  obligationId    String?
+   609→  expectedAmount  Decimal?
+   610→  reportedAmount  Decimal?
+   611→  asset           String?
+   612→  description     String?
+   613→  resolution      String?
+   614→  resolvedById    String?
+   615→  createdAt       DateTime @default(now())
+   616→  resolvedAt      DateTime?
+   617→
+   618→  @@index([providerId, status])
+   619→  @@index([status])
+   620→}
+   621→
+   622→// ---------------------------------------------------------------------------
+   623→// P2-8. Notification — in-app notifications driven by domain events
+   624→// ---------------------------------------------------------------------------
+   625→model Notification {
+   626→  id              String   @id @default(cuid())
+   627→  userId          String
+   628→  type            String   // ROUTE_FOUND | BETTER_ROUTE | EXECUTION_STARTED | EXECUTION_COMPLETED | CANCELLED | DISPUTE | OBLIGATION | COLLATERAL_WARNING | OFFER_EXPIRING | PROVIDER_OBLIGATION
+   629→  title           String
+   630→  body            String?
+   631→  payloadJson     String?
+   632→  read            Boolean  @default(false)
+   633→  createdAt       DateTime @default(now())
+   634→
+   635→  @@index([userId, read])
+   636→  @@index([createdAt])
+   637→}
+   638→
+   639→// ===========================================================================
+   640→// PROMPT 3 — Network Economics, Liquidity Competition & Reputation
+   641→//
+   642→// These models extend the existing domain to make dRamp economically
+   643→// intelligent. All economic effects still flow through the existing ledger.
+   644→// Reputation is derived from observable historical behavior — never opaque.
+   645→// ===========================================================================
+   646→
+   647→// ---------------------------------------------------------------------------
+   648→// P3-1. ProviderPerformanceSnapshot — periodic metrics for time-weighted decay
+   649→// ---------------------------------------------------------------------------
+   650→model ProviderPerformanceSnapshot {
+   651→  id              String   @id @default(cuid())
+   652→  providerId      String
+   653→  provider        LiquidityProvider @relation(fields: [providerId], references: [id])
+   654→  periodStart     DateTime
+   655→  periodEnd       DateTime
+   656→  // Raw counts for this period
+   657→  requestsReceived Int    @default(0)
+   658→  executionsAccepted Int @default(0)
+   659→  executionsCompleted Int @default(0)
+   660→  executionsFailed Int   @default(0)
+   661→  executionsCancelled Int @default(0)
+   662→  disputes        Int      @default(0)
+   663→  slashes         Int      @default(0)
+   664→  // Aggregated values
+   665→  totalVolume     Decimal  @default(0)
+   666→  totalEarnings   Decimal  @default(0)
+   667→  totalIncentives Decimal  @default(0)
+   668→  avgExecutionSeconds Int  @default(0)
+   669→  // Liquidity metrics
+   670→  avgAvailableCapacity Decimal @default(0)
+   671→  avgReservedCapacity Decimal @default(0)
+   672→  peakUtilization Float   @default(0)
+   673→  // Computed reputation components (stored for history/decay)
+   674→  reliabilityScore    Float @default(0.5)
+   675→  speedScore          Float @default(0.5)
+   676→  liquidityScore      Float @default(0.5)
+   677→  pricingScore        Float @default(0.5)
+   678→  disputeScore        Float @default(0.5)
+   679→  operationalScore    Float @default(0.5)
+   680→  overallReputation   Float @default(0.5)
+   681→  createdAt       DateTime @default(now())
+   682→
+   683→  @@index([providerId, periodEnd])
+   684→}
+   685→
+   686→// ---------------------------------------------------------------------------
+   687→// P3-2. LiquidityCommitment — provider promises to maintain service levels
+   688→// ---------------------------------------------------------------------------
+   689→model LiquidityCommitment {
+   690→  id              String   @id @default(cuid())
+   691→  providerId      String
+   692→  provider        LiquidityProvider @relation(fields: [providerId], references: [id])
+   693→  sourceAsset     String
+   694→  destinationAsset String
+   695→  sourceCountry   String
+   696→  destinationCountry String
+   697→  minimumLiquidity Decimal
+   698→  maximumLiquidity Decimal?
+   699→  targetExecutionSeconds Int
+   700→  operatingHoursStart Int?  // hour 0-23
+   701→  operatingHoursEnd Int?
+   702→  startDate       DateTime
+   703→  endDate         DateTime
+   704→  status          String   @default("ACTIVE") // ACTIVE | PAUSED | EXPIRED | BREACHED
+   705→  // Reliability tracking
+   706→  samples         Int      @default(0)
+   707→  samplesMet      Int      @default(0)
+   708→  avgAvailable    Decimal  @default(0)
+   709→  reliabilityPct  Float    @default(0)
+   710→  createdAt       DateTime @default(now())
+   711→  updatedAt       DateTime @updatedAt
+   712→
+   713→  @@index([providerId, status])
+   714→  @@index([sourceAsset, destinationAsset])
+   715→}
+   716→
+   717→// ---------------------------------------------------------------------------
+   718→// P3-3. ProviderCorridorScore — per-provider-per-corridor performance
+   719→// ---------------------------------------------------------------------------
+   720→model ProviderCorridorScore {
+   721→  id              String   @id @default(cuid())
+   722→  providerId      String
+   723→  provider        LiquidityProvider @relation(fields: [providerId], references: [id])
+   724→  sourceAsset     String
+   725→  destinationAsset String
+   726→  sourceCountry   String
+   727→  destinationCountry String
+   728→  // Rolling metrics for this specific corridor
+   729→  executions      Int      @default(0)
+   730→  completed       Int      @default(0)
+   731→  failed          Int      @default(0)
+   732→  avgExecutionSeconds Int  @default(0)
+   733→  totalVolume     Decimal  @default(0)
+   734→  completionRate  Float    @default(0)
+   735→  avgFeeBps       Float    @default(0)
+   736→  lastExecutedAt  DateTime?
+   737→  score           Float    @default(0.5) // 0..1, corridor-specific reputation
+   738→  updatedAt       DateTime @updatedAt
+   739→
+   740→  @@unique([providerId, sourceAsset, destinationAsset, sourceCountry, destinationCountry])
+   741→  @@index([sourceAsset, destinationAsset])
+   742→}
+   743→
+   744→// ---------------------------------------------------------------------------
+   745→// P3-4. QuoteWinLoss — tracks why offers won/lost for competitive feedback
+   746→// ---------------------------------------------------------------------------
+   747→model QuoteWinLoss {
+   748→  id              String   @id @default(cuid())
+   749→  providerId      String
+   750→  provider        LiquidityProvider @relation(fields: [providerId], references: [id])
+   751→  executionId     String
+   752→  offerId         String?
+   753→  corridor        String   // "SRC:DST"
+   754→  result          String   // WON | LOST | EXPIRED
+   755→  rank            Int?     // rank among candidates
+   756→  winnerProviderId String?
+   757→  winnerFeeBps    Int?
+   758→  winnerExecutionSeconds Int?
+   759→  ourFeeBps       Int?
+   760→  ourExecutionSeconds Int?
+   761→  reasonLost      String?  // "higher_cost" | "slower" | "higher_risk" | "manual_channel" | "lower_reputation"
+   762→  createdAt       DateTime @default(now())
+   763→
+   764→  @@index([providerId, createdAt])
+   765→  @@index([executionId])
+   766→}
+   767→
+   768→// ---------------------------------------------------------------------------
+   769→// P3-5. NetworkFeeConfig — configurable protocol fee framework
+   770→// ---------------------------------------------------------------------------
+   771→model NetworkFeeConfig {
+   772→  id              String   @id @default(cuid())
+   773→  name            String
+   774→  // Fee in bps; can be scoped
+   775→  feeBps          Int
+   776→  // Scope: GLOBAL | CORRIDOR | PROVIDER_TYPE | SETTLEMENT_ASSET
+   777→  scopeType       String   @default("GLOBAL")
+   778→  scopeKey        String?  // e.g. "USD:EUR" for corridor, "BANK" for provider type
+   779→  // Volume tiers (optional)
+   780→  minVolume       Decimal?
+   781→  maxVolume       Decimal?
+   782→  // Rebate (negative fee) for valuable behavior
+   783→  rebateBps       Int      @default(0)
+   784→  rebateReason    String?  // "high_reliability" | "committed_liquidity" | "difficult_corridor"
+   785→  status          String   @default("ACTIVE")
+   786→  createdAt       DateTime @default(now())
+   787→
+   788→  @@index([scopeType, scopeKey, status])
+   789→}
+   790→
+   791→// ---------------------------------------------------------------------------
+   792→// P3-6. ProviderTier — derived tier stored on LiquidityProvider
+   793→// Added as fields on the existing model (not a separate table) to avoid
+   794→// a second entity. See LiquidityProvider.tier + tierUpdatedAt.
+   795→// ---------------------------------------------------------------------------
+   796→
+   797→
