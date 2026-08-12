@@ -366,5 +366,6 @@ export interface SeedResponse {
 
 export interface SeedStatusResponse {
   seeded: boolean;
+  needsBootstrap?: boolean;
   settlementAssets: number;
 }

@@ -3,17 +3,21 @@ import { createIntent } from "@/lib/engine/execution";
 import { scheduleBetterLiquidity } from "@/lib/engine/ticker";
 import { runIdempotent, makeKey } from "@/lib/engine/idempotency";
 import { EXECUTION_POLICY } from "@/lib/engine/types";
+import { requireUser, isAuthed } from "@/lib/auth-guard";
 
 export async function POST(req: NextRequest) {
+  const auth = await requireUser();
+  if (!isAuthed(auth)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+
   const body = await req.json();
-  const idempotencyKey = body.idempotencyKey ?? makeKey("create-intent", JSON.stringify(body));
+  const idempotencyKey = body.idempotencyKey ?? makeKey("create-intent", auth.id, JSON.stringify(body));
 
   try {
     const result = await runIdempotent(idempotencyKey, "create-intent", body, async () => {
       const { intent, execution, routes } = await createIntent({
-        userId: body.userId,
-        userEmail: body.userEmail,
-        userName: body.userName,
+        userId: auth.id,
+        userEmail: auth.email,
+        userName: auth.name ?? undefined,
         sourceAmount: body.sourceAmount,
         sourceAsset: body.sourceAsset,
         sourceCountry: body.sourceCountry,

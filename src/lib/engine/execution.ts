@@ -419,7 +419,7 @@ export async function reserveRoute(executionId: string) {
       where: { id: routeId },
       data: { status: ROUTE_STATUS.RESERVED },
     });
-  });
+  }, { timeout: 30000, maxWait: 15000 });
 
   await appendAuditEvent({
     executionId,
@@ -999,7 +999,7 @@ async function completeExecution(executionId: string) {
       where: { id: execution.intentId },
       data: { status: "COMPLETED" },
     });
-  });
+  }, { timeout: 30000, maxWait: 15000 });
 
   await appendAuditEvent({
     executionId,
@@ -1033,7 +1033,7 @@ export async function cancelExecution(executionId: string, actorId?: string): Pr
         where: { id: executionId },
         data: { status: EXECUTION_STATUS.CANCELLED, completedAt: new Date() },
       });
-    });
+    }, { timeout: 30000, maxWait: 15000 });
     await appendAuditEvent({
       executionId,
       eventType: "execution_cancelled",
@@ -1056,7 +1056,7 @@ export async function cancelExecution(executionId: string, actorId?: string): Pr
       where: { id: executionId },
       data: { status: EXECUTION_STATUS.CANCELLED, completedAt: new Date() },
     });
-  });
+  }, { timeout: 30000, maxWait: 15000 });
   await appendAuditEvent({
     executionId,
     eventType: "execution_cancelled",
@@ -1077,7 +1077,7 @@ async function expireExecution(executionId: string, reason: string) {
       where: { id: executionId },
       data: { status: EXECUTION_STATUS.EXPIRED, completedAt: new Date(), failureReason: reason },
     });
-  });
+  }, { timeout: 30000, maxWait: 15000 });
   await appendAuditEvent({
     executionId,
     eventType: "execution_expired",

@@ -3,9 +3,14 @@ import { db } from "@/lib/db";
 import { serializeIntent, serializeExecution, serializeRoute, serializeObligation, serializeLeg } from "@/lib/engine/serialize";
 import { getAuditTrailForExecution } from "@/lib/engine/audit";
 import { getLedgerForExecution } from "@/lib/engine/ledger";
+import { requireUser, isAuthed } from "@/lib/auth-guard";
+import { advanceOneOnDemand } from "@/lib/engine/ticker";
 
 export async function GET(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const auth = await requireUser();
+  if (!isAuthed(auth)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   const { id } = await params;
+
   const intent = await db.executionIntent.findUnique({
     where: { id },
     include: {
@@ -22,6 +27,13 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
   if (!intent) return NextResponse.json({ error: "not found" }, { status: 404 });
 
   const execution = intent.executions[0];
+
+  // On-demand advancement: progress the state machine on each poll so the demo
+  // works on serverless (Vercel) without a persistent background ticker.
+  if (execution) {
+    await advanceOneOnDemand(execution.id);
+  }
+
   let audit: any[] = [];
   let ledger: any[] = [];
   if (execution) {
@@ -29,12 +41,24 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
     ledger = await getLedgerForExecution(execution.id);
   }
 
+  // Re-fetch execution after advancement to return fresh state.
+  const freshExecution = execution
+    ? await db.execution.findUnique({
+        where: { id: execution.id },
+        include: {
+          routes: { include: { legs: { include: { provider: true, offer: true } } } },
+          obligations: { include: { provider: true } },
+          legs: { include: { provider: true, offer: true } },
+        },
+      })
+    : null;
+
   return NextResponse.json({
     intent: serializeIntent(intent),
-    execution: execution ? serializeExecution(execution) : null,
-    routes: execution?.routes?.map(serializeRoute) ?? [],
-    obligations: execution?.obligations?.map(serializeObligation) ?? [],
-    legs: execution?.legs?.map(serializeLeg) ?? [],
+    execution: freshExecution ? serializeExecution(freshExecution) : null,
+    routes: freshExecution?.routes?.map(serializeRoute) ?? [],
+    obligations: freshExecution?.obligations?.map(serializeObligation) ?? [],
+    legs: freshExecution?.legs?.map(serializeLeg) ?? [],
     audit,
     ledger,
   });

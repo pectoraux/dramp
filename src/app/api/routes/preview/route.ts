@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { findRoutes } from "@/lib/engine/routing";
 import { db } from "@/lib/db";
+import { requireUser, isAuthed } from "@/lib/auth-guard";
 
 // Preview available routes for a corridor WITHOUT creating an intent.
-// Used by the Send form to show the user what's available before they commit.
 export async function POST(req: NextRequest) {
+  const auth = await requireUser();
+  if (!isAuthed(auth)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   const body = await req.json();
   try {
     const candidates = await findRoutes({
@@ -18,7 +20,6 @@ export async function POST(req: NextRequest) {
       prohibitedSettlementAssets: body.prohibitedSettlementAssets ?? [],
     });
 
-    // Enrich with provider names for display.
     const providerIds = new Set<string>();
     for (const c of candidates) for (const l of c.legs) providerIds.add(l.providerId);
     const providers = await db.liquidityProvider.findMany({ where: { id: { in: [...providerIds] } } });

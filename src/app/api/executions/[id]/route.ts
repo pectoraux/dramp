@@ -3,9 +3,16 @@ import { db } from "@/lib/db";
 import { serializeExecution } from "@/lib/engine/serialize";
 import { getAuditTrailForExecution } from "@/lib/engine/audit";
 import { getLedgerForExecution } from "@/lib/engine/ledger";
+import { requireUser, isAuthed } from "@/lib/auth-guard";
+import { advanceOneOnDemand } from "@/lib/engine/ticker";
 
 export async function GET(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const auth = await requireUser();
+  if (!isAuthed(auth)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   const { id } = await params;
+
+  await advanceOneOnDemand(id);
+
   const execution = await db.execution.findUnique({
     where: { id },
     include: {

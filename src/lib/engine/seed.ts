@@ -37,6 +37,7 @@ export async function seedDatabase(opts: { reset?: boolean } = {}) {
     await db.liquidityProvider.deleteMany();
     await db.settlementAsset.deleteMany();
     await db.user.deleteMany();
+    await db.waitlistEntry.deleteMany();
   }
 
   // Bail if already seeded (idempotent).
@@ -362,9 +363,32 @@ export async function seedDatabase(opts: { reset?: boolean } = {}) {
     },
   });
 
-  // ---- Alice (demo user) -------------------------------------------------
+  // ---- Admin + demo users + waitlist -------------------------------------
+  // Real admin (non-demo): ekontetevi@gmail / Payswap123456
+  const { hashPassword } = await import("@/lib/auth");
+  const adminHash = await hashPassword("Payswap123456");
+  const admin = await db.user.create({
+    data: { email: "ekontetevi@gmail.com", name: "Admin", password: adminHash, role: "ADMIN", status: "ACTIVE", isDemo: false },
+  });
+
+  // Demo accounts (quick-login). Password: Demo1234!
+  const demoHash = await hashPassword("Demo1234!");
   const alice = await db.user.create({
-    data: { email: "alice@dramp.demo", name: "Alice" },
+    data: { email: "alice@dramp.demo", name: "Alice", password: demoHash, role: "USER", status: "ACTIVE", isDemo: true },
+  });
+  const operator = await db.user.create({
+    data: { email: "operator@dramp.demo", name: "Provider Operator", password: demoHash, role: "PROVIDER_OPERATOR", status: "ACTIVE", isDemo: true },
+  });
+  const demoAdmin = await db.user.create({
+    data: { email: "admin@dramp.demo", name: "Demo Admin", password: demoHash, role: "ADMIN", status: "ACTIVE", isDemo: true },
+  });
+
+  // A couple of pending waitlist entries so the admin has something to review.
+  await db.waitlistEntry.create({
+    data: { email: "samuel.okafor@example.com", name: "Samuel Okafor", requestedRole: "USER", status: "PENDING", note: "Wants to send USD→NGN." },
+  });
+  await db.waitlistEntry.create({
+    data: { email: "lucia.rivera@example.com", name: "Lucia Rivera", requestedRole: "PROVIDER_OPERATOR", status: "PENDING", note: "Fiat agent in Mexico." },
   });
 
   return {
@@ -373,6 +397,15 @@ export async function seedDatabase(opts: { reset?: boolean } = {}) {
     settlementAssets: 4,
     offers: 12,
     aliceId: alice.id,
+    adminId: admin.id,
+    operatorId: operator.id,
+    demoAdminId: demoAdmin.id,
+    demoCredentials: {
+      alice: { email: "alice@dramp.demo", password: "Demo1234!", role: "USER" },
+      operator: { email: "operator@dramp.demo", password: "Demo1234!", role: "PROVIDER_OPERATOR" },
+      demoAdmin: { email: "admin@dramp.demo", password: "Demo1234!", role: "ADMIN" },
+      realAdmin: { email: "ekontetevi@gmail.com", password: "Payswap123456", role: "ADMIN" },
+    },
     note: "Volatile asset WETH is NEVER eligible collateral (hard invariant enforced).",
   };
 }

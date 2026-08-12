@@ -1,8 +1,12 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { serializeProvider, serializeSettlementAsset, serializeOffer } from "@/lib/engine/serialize";
+import { serializeProvider, serializeSettlementAsset } from "@/lib/engine/serialize";
+import { requireUser, isAuthed } from "@/lib/auth-guard";
 
 export async function GET() {
+  const auth = await requireUser();
+  if (!isAuthed(auth)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+
   const providers = await db.liquidityProvider.findMany({
     include: {
       vault: true,

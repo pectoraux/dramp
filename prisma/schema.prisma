@@ -11,21 +11,46 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 // ---------------------------------------------------------------------------
-// Users (mocked identity for the prototype)
+// Users — authenticated marketplace participants
 // ---------------------------------------------------------------------------
 model User {
   id        String   @id @default(cuid())
   email     String   @unique
   name      String?
+  password  String? // null for waitlist-only / demo-as-pending; set when an account is created
+  role      String   @default("USER") // USER | PROVIDER_OPERATOR | ADMIN
+  status    String   @default("ACTIVE") // ACTIVE | SUSPENDED
+  isDemo    Boolean  @default(false)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  intents   ExecutionIntent[]
+  intents       ExecutionIntent[]
+  waitlistApproved WaitlistEntry[] @relation("WaitlistReviewer")
+}
+
+// ---------------------------------------------------------------------------
+// WaitlistEntry — sign-ups pending admin approval before an account is created
+// ---------------------------------------------------------------------------
+model WaitlistEntry {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String?
+  requestedRole String   @default("USER") // USER | PROVIDER_OPERATOR
+  status        String   @default("PENDING") // PENDING | APPROVED | REJECTED
+  note          String?
+  createdAt     DateTime @default(now())
+  reviewedAt    DateTime?
+  reviewedById  String?
+  reviewedBy    User?    @relation("WaitlistReviewer", fields: [reviewedById], references: [id])
+  createdUserId String? // the User id created once approved
+
+  @@index([status])
 }
 
 // ---------------------------------------------------------------------------

@@ -1,16 +1,27 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { useSession, signOut } from "next-auth/react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { SendPanel } from "./send-panel";
 import { ExecutionsPanel } from "./executions-panel";
 import { ProvidersPanel } from "./providers-panel";
 import { MonitorPanel } from "./monitor-panel";
 import { AuditPanel } from "./audit-panel";
+import { WaitlistPanel } from "./waitlist-panel";
+import { AuthScreen } from "./auth-screen";
 import { usePolling } from "@/hooks/use-polling";
 import { toast } from "sonner";
 import { motion, AnimatePresence } from "framer-motion";
@@ -22,23 +33,27 @@ import {
   ScrollText,
   Loader2,
   Database,
-  Github,
   Moon,
   Sun,
   AlertTriangle,
+  UserCog,
+  LogOut,
+  ChevronDown,
+  ShieldCheck,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { cn } from "@/lib/utils";
 import type { SeedStatusResponse, MonitorResponse } from "./types";
 
-type TabKey = "send" | "executions" | "providers" | "monitor" | "audit";
+type TabKey = "send" | "executions" | "providers" | "monitor" | "audit" | "waitlist";
 
-const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
+const TABS: { key: TabKey; label: string; icon: React.ReactNode; adminOnly?: boolean }[] = [
   { key: "send", label: "Send", icon: <Send className="size-3.5" /> },
   { key: "executions", label: "Executions", icon: <ListChecks className="size-3.5" /> },
   { key: "providers", label: "Providers", icon: <Building2 className="size-3.5" /> },
   { key: "monitor", label: "Monitor", icon: <Activity className="size-3.5" /> },
   { key: "audit", label: "Audit", icon: <ScrollText className="size-3.5" /> },
+  { key: "waitlist", label: "Waitlist", icon: <UserCog className="size-3.5" />, adminOnly: true },
 ];
 
 function readHashTab(): TabKey {
@@ -48,6 +63,7 @@ function readHashTab(): TabKey {
 }
 
 export function AppShell() {
+  const { data: session, status: sessionStatus } = useSession();
   const [tab, setTab] = useState<TabKey>("send");
   const [selectedExecutionId, setSelectedExecutionId] = useState<string | null>(null);
   const [autoSelectLatest, setAutoSelectLatest] = useState(false);
@@ -56,12 +72,15 @@ export function AppShell() {
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
 
+  const user = session?.user as any;
+  const isAdmin = user?.role === "ADMIN";
+
   // Seed status check — poll until seeded, then stop.
   const seedStatus = usePolling<SeedStatusResponse>("/api/seed", 3000);
   const seeded = !!seedStatus.data?.seeded;
 
   // Ticker status for header dot — share the monitor poll.
-  const monitor = usePolling<MonitorResponse>(seeded ? "/api/monitor" : null, 3000);
+  const monitor = usePolling<MonitorResponse>(seeded && user ? "/api/monitor" : null, 3000);
   const tickerRunning = !!monitor.data?.stats?.tickerRunning;
   const activeCount = monitor.data?.stats?.activeCount ?? 0;
 
@@ -120,6 +139,29 @@ export function AppShell() {
     }
   }
 
+  // Auth gate — after all hooks so hook order is stable.
+  if (sessionStatus !== "authenticated") {
+    if (sessionStatus === "loading") {
+      return (
+        <div className="min-h-screen flex flex-col items-center justify-center bg-background gap-3">
+          <div className="size-9 rounded-lg bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shadow-sm">
+            <span className="text-white font-bold text-base leading-none">d</span>
+          </div>
+          <Loader2 className="size-4 animate-spin text-muted-foreground" />
+        </div>
+      );
+    }
+    return (
+      <AuthScreen
+        seedStatus={seedStatus.data}
+        onSeed={handleSeed}
+        seeding={seeding}
+      />
+    );
+  }
+
+  const visibleTabs = TABS.filter((t) => !t.adminOnly || isAdmin);
+
   return (
     <div className="min-h-screen flex flex-col bg-background">
       {/* Sticky header */}
@@ -146,7 +188,7 @@ export function AppShell() {
             <nav className="flex-1 min-w-0 overflow-x-auto dramp-scroll">
               <Tabs value={tab} onValueChange={(v) => switchTab(v as TabKey)}>
                 <TabsList className="bg-transparent p-0 h-9 gap-0.5">
-                  {TABS.map((t) => (
+                  {visibleTabs.map((t) => (
                     <TabsTrigger
                       key={t.key}
                       value={t.key}
@@ -191,6 +233,31 @@ export function AppShell() {
               >
                 {mounted && theme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
               </Button>
+              {/* User menu */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="ghost" size="sm" className="gap-1.5 h-8 px-2">
+                    <span className={cn("flex size-5 items-center justify-center rounded-full text-[10px] font-semibold", isAdmin ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400" : "bg-muted text-muted-foreground")}>
+                      {isAdmin ? <ShieldCheck className="size-3" /> : (user?.name?.[0] ?? user?.email?.[0] ?? "U").toUpperCase()}
+                    </span>
+                    <span className="hidden sm:inline text-xs max-w-[120px] truncate">{user?.name ?? user?.email}</span>
+                    <ChevronDown className="size-3 text-muted-foreground" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-56">
+                  <DropdownMenuLabel className="text-xs">
+                    <div className="flex flex-col gap-0.5">
+                      <span className="font-medium truncate">{user?.name ?? user?.email}</span>
+                      <span className="text-muted-foreground font-normal">{user?.email}</span>
+                      <Badge variant="outline" className={cn("text-[9px] py-0 h-4 w-fit mt-0.5", isAdmin ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" : "border-border")}>{user?.role}{user?.isDemo ? " · DEMO" : ""}</Badge>
+                    </div>
+                  </DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={() => signOut({ callbackUrl: "/" })} className="text-rose-600 dark:text-rose-400 focus:text-rose-600">
+                    <LogOut className="size-3.5" /> Sign out
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
           </div>
         </div>
@@ -235,6 +302,11 @@ export function AppShell() {
                 <TabsContent value="audit" className="focus-visible:outline-none">
                   <AuditPanel />
                 </TabsContent>
+                {isAdmin && (
+                  <TabsContent value="waitlist" className="focus-visible:outline-none">
+                    <WaitlistPanel />
+                  </TabsContent>
+                )}
               </Tabs>
             </motion.div>
           </AnimatePresence>
@@ -249,7 +321,7 @@ export function AppShell() {
               <AlertTriangle className="size-2.5" /> Prototype
             </Badge>
             <span className="leading-relaxed">
-              <span className="font-medium text-foreground">dRamp</span> is a prototype execution marketplace. Blockchain, bank and PSP rails are <span className="font-medium">simulated</span>; KYC/AML is <span className="font-medium">mocked</span>; no real money, custody, or smart contracts are involved. State is in-memory SQLite and resets on reseed.
+              <span className="font-medium text-foreground">dRamp</span> is a prototype execution marketplace. Blockchain, bank and PSP rails are <span className="font-medium">simulated</span>; KYC/AML is <span className="font-medium">mocked</span>; no real money, custody, or smart contracts are involved.
             </span>
             <a
               href="#"
@@ -257,7 +329,7 @@ export function AppShell() {
               onClick={(e) => e.preventDefault()}
               title="Prototype — no external link"
             >
-              <Github className="size-3" /> v0.1
+              v0.2
             </a>
           </div>
         </div>

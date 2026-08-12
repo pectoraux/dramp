@@ -78,10 +78,10 @@ export function ProviderCard({ provider }: ProviderCardProps) {
               <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
                 <EnumBadge value={provider.providerType} className="text-[10px] py-0 h-4" />
                 <EnumBadge value={provider.trustModel} className="text-[10px] py-0 h-4" />
-                <StatusBadge status={provider.status === "ACTIVE" ? "COMPLETED" : "CANCELLED"} className="text-[10px] py-0 h-4">
+                <Badge variant="outline" className={cn("text-[10px] py-0 h-4", provider.status === "ACTIVE" ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300" : "border-zinc-500/40 bg-zinc-500/10 text-zinc-500")}>
                   <span className={cn("inline-block size-1.5 rounded-full", provider.status === "ACTIVE" ? "bg-emerald-500" : "bg-zinc-500")} />
                   {prettyEnum(provider.status)}
-                </StatusBadge>
+                </Badge>
               </div>
             </div>
             <div className="flex flex-col items-end shrink-0">

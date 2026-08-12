@@ -1,14 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { serializeLedgerEntry } from "@/lib/engine/serialize";
+import { requireUser, isAuthed } from "@/lib/auth-guard";
 
 export async function GET(_req: NextRequest, { params }: { params: Promise<{ executionId: string }> }) {
+  const auth = await requireUser();
+  if (!isAuthed(auth)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   const { executionId } = await params;
   const entries = await db.ledgerEntry.findMany({
     where: { executionId },
     orderBy: { timestamp: "asc" },
   });
-  // Compute running balances per account.
   const balances = new Map<string, { asset: string; balance: number }>();
   for (const e of entries) {
     const dKey = `${e.debitAccount}:${e.asset}`;

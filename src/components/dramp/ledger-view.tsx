@@ -12,7 +12,7 @@ import { ArrowLeftRight, BookOpen, ChevronDown, Scale } from "lucide-react";
 import { formatMoney, formatTimestamp, prettyEnum } from "./format";
 import { cn } from "@/lib/utils";
 import { useState } from "react";
-import type { LedgerResponse } from "./types";
+import type { LedgerResponse, LedgerEntry } from "./types";
 
 interface LedgerViewProps {
   /** Accepts either the wrapper {entries, balances} or a raw array of entries. */
