@@ -433,6 +433,30 @@ export async function reserveRoute(executionId: string) {
     eventType: "route_reserved",
     payload: { routeId },
   });
+  // Audit the frozen economic terms so the committed contract is reconstructable.
+  const frozenRoute = await db.route.findUnique({
+    where: { id: routeId },
+    include: { legs: { select: { id: true, providerId: true, snapshotFeeBps: true, snapshotRate: true, snapshotIncentiveBps: true, settlementAssetId: true, amount: true, sourceAsset: true, destinationAsset: true } } },
+  });
+  await appendAuditEvent({
+    executionId,
+    eventType: "route_terms_frozen",
+    payload: {
+      routeId,
+      legs: frozenRoute?.legs.map((l) => ({
+        legId: l.id,
+        providerId: l.providerId,
+        feeBps: l.snapshotFeeBps,
+        rate: l.snapshotRate?.toString(),
+        incentiveBps: l.snapshotIncentiveBps,
+        settlementAssetId: l.settlementAssetId,
+        amount: l.amount.toString(),
+        sourceAsset: l.sourceAsset,
+        destinationAsset: l.destinationAsset,
+      })) ?? [],
+      frozenAt: new Date().toISOString(),
+    },
+  });
   await appendAuditEvent({
     executionId,
     eventType: "obligations_created",
@@ -797,32 +821,36 @@ async function tokenize(executionId: string) {
       leg.sourceAsset,
       { executionId, idempotencyKey: `tokenize-in:${executionId}:${leg.id}`, description: `Source funds to ${leg.provider.name}` },
     );
-    // Charge the fee.
-    const feeAmt = feeForAmount(leg.amount, leg.offer.feeBps);
+    // Charge the fee — using the FROZEN SNAPSHOT (not the mutable offer).
+    const feeBps = leg.snapshotFeeBps ?? leg.offer?.feeBps ?? 0;
+    const feeAmt = feeForAmount(leg.amount, feeBps);
     if (feeAmt.gt(0)) {
       await feeEntry(
         `provider:${leg.providerId}:operational:${leg.sourceAsset}`,
         feeAmt,
         leg.sourceAsset,
-        { executionId, idempotencyKey: `fee:${executionId}:${leg.id}`, description: `Provider fee ${leg.offer.feeBps}bps` },
+        { executionId, idempotencyKey: `fee:${executionId}:${leg.id}`, description: `Provider fee ${feeBps}bps` },
       );
     }
     // Mint / credit the settlement asset (or destination asset) to escrow.
-    const outAmount = moneySub(moneyMul(moneySub(leg.amount, feeAmt), leg.offer.rate), new Decimal(0));
+    // Using the FROZEN SNAPSHOT rate.
+    const rate = leg.snapshotRate ?? leg.offer?.rate ?? new Decimal(1);
+    const outAmount = moneySub(moneyMul(moneySub(leg.amount, feeAmt), rate), new Decimal(0));
     await mint(
       `execution:${executionId}:escrow:${leg.destinationAsset}`,
       outAmount,
       leg.destinationAsset,
       { executionId, idempotencyKey: `mint:${executionId}:${leg.id}`, description: `Tokenized ${leg.destinationAsset} from ${leg.provider.name}` },
     );
-    // Apply incentive if any (rebate to execution escrow).
-    if (leg.offer.incentiveBps > 0) {
-      const inc = incentiveForAmount(outAmount, leg.offer.incentiveBps);
+    // Apply incentive if any (rebate to execution escrow) — using FROZEN SNAPSHOT.
+    const incentiveBps = leg.snapshotIncentiveBps ?? leg.offer?.incentiveBps ?? 0;
+    if (incentiveBps > 0) {
+      const inc = incentiveForAmount(outAmount, incentiveBps);
       await incentiveEntry(
         `execution:${executionId}:escrow:${leg.destinationAsset}`,
         inc,
         leg.destinationAsset,
-        { executionId, idempotencyKey: `incentive:${executionId}:${leg.id}`, description: `Settlement incentive ${leg.offer.incentiveBps}bps` },
+        { executionId, idempotencyKey: `incentive:${executionId}:${leg.id}`, description: `Settlement incentive ${incentiveBps}bps` },
       );
     }
     await db.leg.update({ where: { id: leg.id }, data: { status: LEG_STATUS.CONFIRMED, confirmedAt: new Date() } });
@@ -887,16 +915,19 @@ async function settle(executionId: string) {
       leg.sourceAsset,
       { executionId, idempotencyKey: `burn:${executionId}:${leg.id}`, description: `Settlement asset consumed by ${leg.provider.name}` },
     );
-    const feeAmt = feeForAmount(leg.amount, leg.offer.feeBps);
+    // Using FROZEN SNAPSHOT fee/rate (not the mutable offer).
+    const feeBps = leg.snapshotFeeBps ?? leg.offer?.feeBps ?? 0;
+    const rate = leg.snapshotRate ?? leg.offer?.rate ?? new Decimal(1);
+    const feeAmt = feeForAmount(leg.amount, feeBps);
     if (feeAmt.gt(0)) {
       await feeEntry(
         `provider:${leg.providerId}:operational:${leg.sourceAsset}`,
         feeAmt,
         leg.sourceAsset,
-        { executionId, idempotencyKey: `fee:${executionId}:${leg.id}`, description: `Provider fee` },
+        { executionId, idempotencyKey: `fee:${executionId}:${leg.id}`, description: `Provider fee ${feeBps}bps` },
       );
     }
-    const outAmount = moneyMul(moneySub(leg.amount, feeAmt), leg.offer.rate);
+    const outAmount = moneyMul(moneySub(leg.amount, feeAmt), rate);
     await mint(
       `execution:${executionId}:escrow:${leg.destinationAsset}`,
       outAmount,
@@ -978,16 +1009,19 @@ async function confirmDestination(executionId: string): Promise<{ advanced: bool
       leg.sourceAsset,
       { executionId, idempotencyKey: `dest-in:${executionId}:${leg.id}`, description: `Funds to payout provider ${leg.provider.name}` },
     );
-    const feeAmt = feeForAmount(leg.amount, leg.offer.feeBps);
+    // Using FROZEN SNAPSHOT fee/rate (not the mutable offer).
+    const feeBps = leg.snapshotFeeBps ?? leg.offer?.feeBps ?? 0;
+    const rate = leg.snapshotRate ?? leg.offer?.rate ?? new Decimal(1);
+    const feeAmt = feeForAmount(leg.amount, feeBps);
     if (feeAmt.gt(0)) {
       await feeEntry(
         `provider:${leg.providerId}:operational:${leg.sourceAsset}`,
         feeAmt,
         leg.sourceAsset,
-        { executionId, idempotencyKey: `fee:${executionId}:${leg.id}`, description: `Payout provider fee` },
+        { executionId, idempotencyKey: `fee:${executionId}:${leg.id}`, description: `Payout provider fee ${feeBps}bps` },
       );
     }
-    const payout = moneyMul(moneySub(leg.amount, feeAmt), leg.offer.rate);
+    const payout = moneyMul(moneySub(leg.amount, feeAmt), rate);
     await mint(
       `execution:${executionId}:escrow:${leg.destinationAsset}`,
       payout,
@@ -1094,10 +1128,11 @@ async function completeExecution(executionId: string) {
       await recordExecutionOutcome(executionId, leg.providerId, "COMPLETED", {
         sourceAsset: leg.sourceAsset,
         destinationAsset: leg.destinationAsset,
-        sourceCountry: leg.offer?.sourceCountry ?? "GLOBAL",
-        destinationCountry: leg.offer?.destinationCountry ?? "GLOBAL",
+        // Use snapshot fields for performance recording (historical accuracy).
+        sourceCountry: leg.snapshotSourceCountry ?? leg.offer?.sourceCountry ?? "GLOBAL",
+        destinationCountry: leg.snapshotDestinationCountry ?? leg.offer?.destinationCountry ?? "GLOBAL",
         amount: leg.amount,
-        offer: leg.offer ? { feeBps: leg.offer.feeBps } : null,
+        offer: { feeBps: leg.snapshotFeeBps ?? leg.offer?.feeBps ?? 0 },
       });
     }
   } catch (err) {
@@ -1211,7 +1246,7 @@ async function getDestinationLegs(executionId: string) {
 async function buildRouteSnapshot(routeId: string) {
   const route = await db.route.findUnique({
     where: { id: routeId },
-    include: { legs: { include: { provider: true, offer: true } } },
+    include: { legs: { include: { provider: true } } },
   });
   if (!route) throw new Error("route not found");
   return {
@@ -1236,8 +1271,9 @@ async function buildRouteSnapshot(routeId: string) {
         sourceAsset: l.sourceAsset,
         destinationAsset: l.destinationAsset,
         channelType: l.channelType,
-        feeBps: l.offer.feeBps,
-        incentiveBps: l.offer.incentiveBps,
+        // Use snapshot fields for the receipt (historical stability).
+        feeBps: l.snapshotFeeBps ?? 0,
+        incentiveBps: l.snapshotIncentiveBps ?? 0,
       })),
     risk: {
       counterparty: route.riskCounterparty,
