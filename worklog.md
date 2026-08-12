@@ -168,3 +168,40 @@ Stage Summary:
 - The app behaves the same on Vercel as locally: same UI, same engine, same DB. The only difference is the background ticker (local only) vs on-demand advancement (Vercel) — both drive the same state machine.
 - Env vars set on Vercel: DATABASE_URL, DIRECT_URL, NEXTAUTH_SECRET, NEXTAUTH_URL.
 - Note: user should rotate the GitHub PAT and Vercel token after this session.
+
+---
+Task ID: SecurityPass
+Agent: main (Z.ai Code)
+Task: Security/integrity pass — fix user ownership authorization on all intent/execution reads, ensure provider-private data is not exposed to ordinary users, reconcile stale SQLite docs, add authorization tests. No core engine or UI behavior change.
+
+Work Log:
+- Audited all API routes (Explore subagent) — found IDOR gaps on every per-resource read/mutation, provider-data exposure to ordinary users, and stale SQLite docs.
+- Added User.providerId + LiquidityProvider.operators back-relation to bind operators to a specific provider; pushed schema to Neon.
+- Updated NextAuth to carry providerId in JWT/session; demo operator now bound to Northbridge in seed.
+- Rewrote auth-guard.ts with ownership helpers: requireIntentOwnership, requireExecutionOwnership, requireLegOwnership, requireProviderOwnership (404 on mismatch to avoid leaking existence; admins bypass).
+- Fixed all IDOR gaps:
+  - GET /api/intents/[id] + POST cancel → ownership check
+  - GET /api/executions/[id] + POST cancel → ownership check
+  - GET /api/ledger/[executionId] → ownership check
+  - GET /api/audit/[executionId] → ownership check
+  - GET /api/executions → scoped to session user's own executions (admins see all)
+  - GET /api/monitor → scoped to session user's own intents/executions
+  - GET /api/audit (global trail) → admin-only
+  - GET /api/engine/tick → admin-only
+- Provider-data redaction: added serializeProviderPublic (omits vault, reservedCapacity, obligations); GET /api/providers returns public view to ordinary USERs, full view to operators/admins; GET /api/providers/[id] returns full view only to the owning operator or admin.
+- Leg ownership: POST /api/legs/[id]/confirm and /fail now verify the operator owns the leg's provider (requireLegOwnership); admins bypass.
+- Redacted generatedPassword from IdempotencyRecord after waitlist approval (returned to admin once, not persisted).
+- Fixed DELETE /api/admin/waitlist/[id]/approve to return 404 (not 500) on missing entry.
+- Reconciled stale SQLite docs: prisma/schema.prisma header now says PostgreSQL; deleted obsolete tests/database-runtime-build.sh.
+- Added tests/authz.test.ts (26 assertions): User A cannot read/mutate User B's intent/execution/ledger/audit; ordinary users can't access global audit or provider internals; operators scoped to their provider; admins retain global access; unauthenticated requests rejected.
+- All 26 authz tests PASS. Lint clean. Type-check clean. Golden demo verified still working end-to-end (SEARCHING → ORIGIN_PENDING → ... → COMPLETED).
+- Pushed to GitHub (commit 61b8318).
+
+Stage Summary:
+- Every per-user resource is now ownership-checked. User A cannot read or mutate User B's intent, execution, ledger, or audit trail (returns 404).
+- List/monitor endpoints are scoped to the session user (admins see all).
+- Global audit trail is admin-only.
+- Provider-private operational data (vault holdings, locked collateral, reserved capacity, obligations) is hidden from ordinary USERs; operators see full detail only for their own provider.
+- Operators can only confirm/fail legs on their bound provider.
+- Generated passwords are returned once to the approving admin and redacted from persisted idempotency records.
+- No core economic engine or UI behavior changed.
