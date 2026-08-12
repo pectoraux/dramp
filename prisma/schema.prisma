@@ -186,6 +186,17 @@ model Leg {
   actorNote         String?
   confirmedAt       DateTime?
 
+  // Prompt 3.4: Historical snapshot of the economically relevant offer
+  // fields at the time the route was persisted. These are IMMUTABLE once
+  // written — they do NOT change when the provider modifies the current
+  // LiquidityOffer. This ensures persisted routes remain historically stable.
+  snapshotSourceCountry        String?
+  snapshotDestinationCountry   String?
+  snapshotFeeBps               Int?
+  snapshotIncentiveBps         Int?
+  snapshotRate                 Decimal?
+  snapshotExpectedExecutionSeconds Int?
+
   @@index([routeId])
   @@index([executionId])
 }

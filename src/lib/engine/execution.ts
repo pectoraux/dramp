@@ -245,6 +245,13 @@ export async function discoverAndPersistRoutes(executionId: string, intent: { id
           channelType: leg.channelType,
           status: LEG_STATUS.PENDING,
           commitmentStatus: COMMITMENT_STATUS.REVERSIBLE,
+          // Historical snapshot — immutable once written.
+          snapshotSourceCountry: leg.sourceCountry,
+          snapshotDestinationCountry: leg.destinationCountry,
+          snapshotFeeBps: leg.feeBps,
+          snapshotIncentiveBps: leg.incentiveBps,
+          snapshotRate: leg.rate,
+          snapshotExpectedExecutionSeconds: leg.expectedExecutionSeconds,
         },
       });
     }
@@ -695,6 +702,15 @@ async function persistSingleRoute(executionId: string, c: CandidateRoute) {
         channelType: leg.channelType,
         status: LEG_STATUS.PENDING,
         commitmentStatus: COMMITMENT_STATUS.REVERSIBLE,
+        // Historical snapshot — immutable once written. These capture the
+        // offer's economic terms at persistence time so the route remains
+        // historically stable even if the provider later changes the offer.
+        snapshotSourceCountry: leg.sourceCountry,
+        snapshotDestinationCountry: leg.destinationCountry,
+        snapshotFeeBps: leg.feeBps,
+        snapshotIncentiveBps: leg.incentiveBps,
+        snapshotRate: leg.rate,
+        snapshotExpectedExecutionSeconds: leg.expectedExecutionSeconds,
       },
     });
   }

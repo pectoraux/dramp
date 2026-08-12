@@ -629,7 +629,14 @@ const ABS_DURATION_REF = 600; // 10 minutes = penalty 1.0
 
 export function calculateAbsoluteRouteQuality(route: CandidateRoute, ctx: RouteScoreContext): number {
   const w = weightFor(ctx.riskTolerance);
-  const notional = route.legs[0]?.amount.toNumber() || 1;
+  // Source notional = sum of all SOURCE legs. For a split route
+  // ($6,000 + $4,000), this is $10,000 — not just the first leg's $6,000.
+  // For a single-leg route, this equals legs[0].amount.
+  // For a multi-hop route, SOURCE legs still represent the initial notional.
+  const sourceNotional = route.legs
+    .filter((l) => l.role === "SOURCE")
+    .reduce((s, l) => s + l.amount.toNumber(), 0);
+  const notional = sourceNotional || route.legs[0]?.amount.toNumber() || 1;
 
   // Bounded absolute dimensions (each 0..1, higher = worse):
   const absCost = Math.min(1, route.effectiveCost.toNumber() / notional / ABS_COST_REF);
@@ -846,16 +853,21 @@ export function isBetterRoute(
   return shouldReplaceRoute(newRoute, refRoute, scoreCtx).replace;
 }
 
-// ---- Persisted route reconstruction (Prompt 3.3) -------------------------
+// ---- Persisted route reconstruction (Prompt 3.3 + 3.4) --------------------
 //
 // Rebuilds a real CandidateRoute from a persisted Route + Leg[] with all
 // material fields needed for scoring: provider IDs, corridors, amounts,
 // risk dimensions, etc. No fake provider IDs or empty fields.
+//
+// Prompt 3.4: Uses the LEG'S OWN SNAPSHOT FIELDS (snapshotFeeBps,
+// snapshotSourceCountry, etc.) rather than the current mutable LiquidityOffer.
+// This ensures the reconstructed route represents the route that existed when
+// it was selected — not whatever the provider currently advertises.
 
 export async function reconstructPersistedRoute(routeId: string): Promise<CandidateRoute | null> {
   const route = await db.route.findUnique({
     where: { id: routeId },
-    include: { legs: { include: { provider: true, offer: true } } },
+    include: { legs: { include: { provider: true } } },
   });
   if (!route) return null;
 
@@ -869,21 +881,22 @@ export async function reconstructPersistedRoute(routeId: string): Promise<Candid
       amount: l.amount,
       sourceAsset: l.sourceAsset,
       destinationAsset: l.destinationAsset,
-      sourceCountry: l.offer?.sourceCountry ?? "GLOBAL",
-      destinationCountry: l.offer?.destinationCountry ?? "GLOBAL",
+      // Use the leg's historical snapshot, not the mutable offer.
+      sourceCountry: l.snapshotSourceCountry ?? "GLOBAL",
+      destinationCountry: l.snapshotDestinationCountry ?? "GLOBAL",
       settlementAssetId: l.settlementAssetId,
       channelType: l.channelType,
-      feeBps: l.offer?.feeBps ?? 0,
-      incentiveBps: l.offer?.incentiveBps ?? 0,
-      rate: l.offer?.rate ?? new Decimal(1),
-      expectedExecutionSeconds: l.offer?.expectedExecutionSeconds ?? 60,
+      feeBps: l.snapshotFeeBps ?? 0,
+      incentiveBps: l.snapshotIncentiveBps ?? 0,
+      rate: l.snapshotRate ?? new Decimal(1),
+      expectedExecutionSeconds: l.snapshotExpectedExecutionSeconds ?? 60,
       providerRisk: providerRiskFromRecord(l.provider ? {
         trustModel: l.provider.trustModel,
         providerType: l.provider.providerType,
         reputationScore: l.provider.reputationScore,
         status: l.provider.status,
       } : { trustModel: "NON_CUSTODIAL", providerType: "HYBRID", reputationScore: 0.5, status: "ACTIVE" }),
-      offerCapacity: l.offer?.availableCapacity ?? new Decimal(0),
+      offerCapacity: new Decimal(0), // not needed for historical scoring
       settlementAssetRisk: null,
     }));
 
