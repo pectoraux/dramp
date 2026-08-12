@@ -558,3 +558,23 @@ Stage Summary:
 - The receipt is built entirely from the route's own persisted data (no offer join).
 - The audit trail records route_terms_frozen with all leg economics at reservation time, making the committed contract fully reconstructable.
 - The lifecycle is now: market quote → committed execution contract → immutable economic snapshot → settlement → ledger.
+
+---
+Task ID: P3.6-Commitment
+Agent: main (Z.ai Code)
+Task: Atomic quote validation and commitment. Stale routes rejected at reservation. Execution uses snapshot exclusively — no live-offer fallbacks. No new features.
+
+Work Log:
+- Stale route detection: reserveRoute() now revalidates every leg's live offer inside the reservation transaction. Checks: active, not expired, assets match, countries match, amount within min/max, settlement asset unchanged, channel type unchanged, feeBps/rate/incentiveBps unchanged from snapshot. If stale → StaleRouteError → transaction rolls back → execution returns to SEARCHING.
+- Committed economic terms: after validation, snapshot is refreshed from the live offer (authoritative freeze point). route_terms_frozen audit event only emitted after successful reservation.
+- No live-offer fallbacks: tokenize(), settle(), confirmDestination() use leg.snapshotFeeBps/snapshotRate/snapshotIncentiveBps exclusively. Missing snapshot → LEGACY_EXECUTION_SNAPSHOT_MISSING error (fails safely, no silent fallback).
+- Audit: route_stale_rejected event on stale routes; route_terms_frozen only on success with full committed terms.
+- Tests: tests/p3-commitment.test.ts (20 assertions) — stale fee/rate/incentive rejected with no side effects, unchanged offer succeeds with snapshot=live, post-reservation mutation uses frozen snapshot, legacy execution fails safely, audit trail correct.
+- All existing tests pass (collateral 23, P3.5 frozen 22). Lint + type-check clean.
+- Pushed to GitHub (commit b18684d).
+
+Stage Summary:
+- The lifecycle is now: LIVE OFFER → INDICATIVE ROUTE → ROUTE RESERVATION (atomic revalidation + freeze) → COMMITTED ECONOMIC TERMS → EXECUTION → LEDGER.
+- A provider changing their offer between discovery and reservation causes the stale route to be rejected — not silently committed.
+- After reservation, execution never reads mutable marketplace economics. Missing snapshots fail with an explicit error, not a silent fallback.
+- The audit trail records exactly what was committed and when, including stale rejections.
