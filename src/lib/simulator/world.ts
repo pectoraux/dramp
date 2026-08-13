@@ -212,6 +212,7 @@ export interface SimMetrics {
   medianNetMargin: number;           // % net margin (netEarnings / grossEarnings)
   medianProfitPerExecution: number;  // $ net earnings per execution
   medianAnnualizedReturnPct: number; // modeled extrapolation (labeled, not primary)
+  medianCapitalEfficiency: number;   // settledVolume / averageLockedCapital (turnover ratio)
   // Network outcomes
   totalLiquidity: number;
   avgRoutesPerCorridor: number;

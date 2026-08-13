@@ -66,15 +66,21 @@ export function simulateStep(world: SimWorld, rng: SeededRNG): void {
   world.step++;
   world.timeMs += world.config.stepDurationMs;
 
-  // 0. Release expired reservations FIRST — settlements that have completed
-  //    their duration free up capacity for new executions in this step.
+  // Step ordering (market microstructure):
+  //   1. Release expired reservations (settlements that completed free capacity)
+  //   2. Update utilization from active reservations (providers see current load)
+  //   3. Providers adjust prices based on observed utilization
+  //   4. Generate new demand
+  //   5. Match + execute (routes against updated prices, creates new reservations)
+  //   6. Provider entry/exit, campaign updates, shocks
+  //
+  // This ensures providers react to utilization BEFORE new demand routes,
+  // not after. Prices are set based on current deployment, then demand sees
+  // those prices.
   releaseExpiredReservations(world);
-
+  updateProviderOffers(world, rng);
   generateDemand(world, rng);
   matchAndExecute(world, rng);
-  // updateProviderOffers now sees reservations that are still active (not yet
-  // released) because they persist for settlementDurationSteps.
-  updateProviderOffers(world, rng);
   handleProviderEntryExit(world, rng);
   updateCampaigns(world);
   applyShocks(world, rng);
@@ -985,6 +991,21 @@ function collectMetrics(world: SimWorld): SimMetrics {
     ? annualizedReturns[Math.floor(annualizedReturns.length / 2)]
     : 0;
 
+  // Capital efficiency: settledVolume / averageLockedCapital (turnover ratio).
+  // Shows how much volume a provider processed per unit of capital deployed.
+  // High efficiency = capital is being recycled quickly.
+  const capitalEfficiencies = activeProviders
+    .filter(p => p.totalDeployedCapitalSteps > 0)
+    .map(p => {
+      const elapsedSteps = Math.max(1, world.step - p.entryStep);
+      const avgLockedCapital = p.totalDeployedCapitalSteps / elapsedSteps;
+      return avgLockedCapital > 0 ? p.totalVolume / avgLockedCapital : 0;
+    })
+    .sort((a, b) => a - b);
+  const medianCapitalEfficiency = capitalEfficiencies.length > 0
+    ? capitalEfficiencies[Math.floor(capitalEfficiencies.length / 2)]
+    : 0;
+
   const totalLiquidity = [...world.offers.values()].filter(o => o.active).reduce((s, o) => s + o.availableCapacity, 0);
   const providerVolumes = activeProviders.map(p => p.totalVolume);
   const totalVol = providerVolumes.reduce((s, v) => s + v, 0);
@@ -1045,6 +1066,8 @@ function collectMetrics(world: SimWorld): SimMetrics {
     medianProfitPerExecution: Math.round(medianProfitPerExecution * 100) / 100,
     // Annualized (modeled extrapolation — NOT primary).
     medianAnnualizedReturnPct: Math.round(medianAnnualizedReturnPct * 100) / 100,
+    // Capital efficiency: volume / average locked capital (turnover ratio).
+    medianCapitalEfficiency: Math.round(medianCapitalEfficiency * 100) / 100,
     totalLiquidity: Math.round(totalLiquidity * 100) / 100,
     avgRoutesPerCorridor: 0, corridorCoverage: 0,
     marketConcentration: Math.round(hhi * 10000) / 10000,

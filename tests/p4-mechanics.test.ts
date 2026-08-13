@@ -326,6 +326,38 @@ async function main() {
   assert(createStableNetworkConfig().stepDurationMs === 60000,
     `Stable network step duration is 60s (${createStableNetworkConfig().stepDurationMs}ms)`);
 
+  // =========================================================================
+  // 15. UPDATE ORDERING — pricing before demand routing (4.4 verification)
+  // =========================================================================
+  console.log("\n== 15. Update ordering ==");
+
+  // The simulateStep order must be:
+  //   release → updateProviderOffers → generateDemand → matchAndExecute
+  // so providers set prices based on current utilization BEFORE demand routes.
+  const fs3 = await import("fs");
+  const engineSrc3 = fs3.readFileSync("src/lib/simulator/engine-faithful.ts", "utf-8");
+  const stepFn = engineSrc3.match(/export function simulateStep[\s\S]*?^\}/m)?.[0] ?? "";
+  const releasePos = stepFn.indexOf("releaseExpiredReservations");
+  const updatePos = stepFn.indexOf("updateProviderOffers");
+  const demandPos = stepFn.indexOf("generateDemand");
+  const matchPos = stepFn.indexOf("matchAndExecute");
+  assert(releasePos < updatePos, "Release runs before updateProviderOffers");
+  assert(updatePos < demandPos, "updateProviderOffers runs before generateDemand (pricing before routing)");
+  assert(demandPos < matchPos, "generateDemand runs before matchAndExecute");
+
+  // =========================================================================
+  // 16. CAPITAL EFFICIENCY — volume / average locked capital (4.4)
+  // =========================================================================
+  console.log("\n== 16. Capital efficiency ==");
+
+  const effWorld = runSimulation({ ...createStableNetworkConfig(), seed: 88, totalSteps: 60 });
+  const effMetrics = effWorld.metricsHistory[effWorld.metricsHistory.length - 1];
+  assert(effMetrics.medianCapitalEfficiency !== undefined,
+    `Has medianCapitalEfficiency metric (${effMetrics.medianCapitalEfficiency})`);
+  console.log(`  Median capital efficiency: ${effMetrics.medianCapitalEfficiency}x turnover`);
+  console.log(`  Peak utilization: ${effMetrics.peakUtilization}%`);
+  console.log(`  Time-weighted utilization: ${effMetrics.avgTimeWeightedUtilization}%`);
+
   console.log(`\n========================================`);
   console.log(`  P4.4 Mechanics: Passed: ${passed}  |  Failed: ${failed}`);
   console.log(`========================================`);

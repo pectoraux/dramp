@@ -22,6 +22,7 @@ export async function POST(req: NextRequest) {
       totalProviderVolume: 0, totalProtocolRevenue: 0, totalIncentiveSpend: 0,
       medianNetProfit: 0, avgNetProfit: 0, medianNetMargin: 0,
       medianProfitPerExecution: 0, medianAnnualizedReturnPct: 0,
+      medianCapitalEfficiency: 0,
       totalLiquidity: 0, avgRoutesPerCorridor: 0, corridorCoverage: 0,
       marketConcentration: 0, equilibriumStatus: "FORMING",
     };
