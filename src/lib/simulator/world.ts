@@ -426,6 +426,35 @@ export interface SimWorld {
   // For multi-hop routes, the intermediate settlement asset is transferred
   // from the upstream provider to the downstream provider. Debit == credit.
   settlementTransfers: SimSettlementTransfer[];
+  // Calibration log: per-leg capital-time records for exact reconciliation.
+  // Each entry records the amount, start step, and completion step of a leg
+  // that was reserved, allowing the test to compute expected capital-time
+  // and compare with provider.totalDeployedCapitalSteps.
+  capitalTimeLog: Array<{
+    providerId: string;
+    offerId: string;
+    amount: number;
+    startStep: number;
+    completionStep: number;
+    durationSteps: number;
+  }>;
+  // Capacity mutation log: tracks every explicit change to availableCapacity
+  // (from provider strategies or shocks), allowing exact capacity reconciliation.
+  capacityMutations: Array<{
+    offerId: string;
+    step: number;
+    delta: number; // positive = added, negative = removed
+    reason: string;
+  }>;
+  // External flow log: tracks boundary flows (user input, recipient output).
+  // First-leg settlement = external source inflow. Last-leg settlement = external
+  // destination outflow. Used for exact boundary-flow reconciliation.
+  externalFlowLog: Array<{
+    asset: string;
+    amount: number;
+    step: number;
+    type: "INFLOW" | "OUTFLOW";
+  }>;
   metricsHistory: SimMetrics[];
   // Running tallies
   totalVolume: number;
@@ -549,6 +578,9 @@ export function createWorld(config: SimConfig): SimWorld {
     activeReservations: [],
     inFlightExecutions: [],
     settlementTransfers: [],
+    capitalTimeLog: [],
+    capacityMutations: [],
+    externalFlowLog: [],
     metricsHistory: [],
     totalVolume: 0,
     totalFees: 0,

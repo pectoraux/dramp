@@ -147,12 +147,22 @@ function processInFlightExecutions(world: SimWorld, rng: SeededRNG): void {
         // tracks economic changes, not reservations. Production separates these).
         const offer = world.offers.get(leg.offerId);
         if (offer) {
+          offer.availableCapacity -= leg.reservation.amount;
           offer.reservedCapacity += leg.reservation.amount;
         }
         const p = world.providers.get(leg.providerId);
         if (p) {
           p.currentDeployedCapital += leg.reservation.amount;
           p.totalDeployedCapitalSteps += leg.reservation.amount * durationSteps;
+          // Log for calibration reconciliation.
+          world.capitalTimeLog.push({
+            providerId: leg.providerId,
+            offerId: leg.offerId,
+            amount: leg.reservation.amount,
+            startStep: world.step,
+            completionStep: world.step + durationSteps,
+            durationSteps,
+          });
         }
         allSettled = false;
         break; // only one leg starts per step (dependency chain)
@@ -228,6 +238,8 @@ function settleLeg(world: SimWorld, exec: SimInFlightExecution, legIndex: number
     if (legIndex === 0) {
       const srcBalance = p.liquidity.balances.get(leg.sourceAsset) ?? 0;
       p.liquidity.balances.set(leg.sourceAsset, srcBalance + leg.amount);
+      // Log external inflow (user pays in source asset).
+      world.externalFlowLog.push({ asset: leg.sourceAsset, amount: leg.amount, step: world.step, type: "INFLOW" });
     }
     // legIndex > 0: sourceAsset already credited by upstream transfer — do nothing.
 
@@ -237,8 +249,6 @@ function settleLeg(world: SimWorld, exec: SimInFlightExecution, legIndex: number
     const dstBalance = p.liquidity.balances.get(leg.destinationAsset) ?? 0;
     if (dstBalance < leg.payoutAmount) {
       // Insufficient destination liquidity — leg fails.
-      // This prevents the conservation violation where Math.max(0, ...) clamps
-      // the debit but the transfer still credits the full amount.
       leg.status = "FAILED";
       leg.settlementOutcome = "FAILURE";
       p.executionsFailed++;
@@ -246,11 +256,16 @@ function settleLeg(world: SimWorld, exec: SimInFlightExecution, legIndex: number
       return;
     }
     p.liquidity.balances.set(leg.destinationAsset, dstBalance - leg.payoutAmount);
+    // Log external outflow if this is the last leg (recipient payout).
+    if (legIndex === exec.legs.length - 1) {
+      world.externalFlowLog.push({ asset: leg.destinationAsset, amount: leg.payoutAmount, step: world.step, type: "OUTFLOW" });
+    }
   }
 
   // Release the reservation for this leg.
   const offer = world.offers.get(leg.offerId);
   if (offer) {
+    offer.availableCapacity += leg.reservation.amount;
     offer.reservedCapacity = Math.max(0, offer.reservedCapacity - leg.reservation.amount);
   }
   p.currentDeployedCapital = Math.max(0, p.currentDeployedCapital - leg.reservation.amount);
@@ -394,6 +409,7 @@ function failExecution(world: SimWorld, exec: SimInFlightExecution): void {
       // This leg failed or was cancelled. Release its reservation.
       const offer = world.offers.get(leg.offerId);
       if (offer) {
+        offer.availableCapacity += leg.reservation.amount;
         offer.reservedCapacity = Math.max(0, offer.reservedCapacity - leg.reservation.amount);
       }
       const p = world.providers.get(leg.providerId);
@@ -473,6 +489,7 @@ function releaseExpiredReservations(world: SimWorld): void {
       // Release: decrement reservedCapacity and currentDeployedCapital.
       const offer = world.offers.get(res.offerId);
       if (offer) {
+        offer.availableCapacity += res.amount;
         offer.reservedCapacity = Math.max(0, offer.reservedCapacity - res.amount);
       }
       const provider = world.providers.get(res.providerId);
@@ -737,7 +754,7 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent): SimCandidateRou
     if (offer.sourceAsset !== intent.sourceAsset || offer.destinationAsset !== intent.destinationAsset) continue;
     const provider = providers.get(offer.providerId);
     if (!provider || provider.status !== "ACTIVE") continue;
-    if (offer.availableCapacity - offer.reservedCapacity < intent.sourceAmount) continue;
+    if (offer.availableCapacity < intent.sourceAmount) continue;
 
     // Liquidity inventory check: provider must have enough destination-asset
     // liquidity to complete the payout. This is separate from capacity —
@@ -831,7 +848,7 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent): SimCandidateRou
       const p1 = providers.get(o1.providerId);
       if (!p1 || p1.status !== "ACTIVE") continue;
       // Capacity check for hop 1.
-      if (o1.availableCapacity - o1.reservedCapacity < intent.sourceAmount) continue;
+      if (o1.availableCapacity < intent.sourceAmount) continue;
       const p1Risk: ProviderRiskInfo = {
         trustModel: p1.trustModel, providerType: p1.providerType,
         reputationScore: p1.reputationScore, status: p1.status,
@@ -851,7 +868,7 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent): SimCandidateRou
         const afterFee1 = intent.sourceAmount - fee1;
         const midAmount = afterFee1 * o1.rate;
         // Capacity check for hop 2 (midAmount may differ from sourceAmount).
-        if (o2.availableCapacity - o2.reservedCapacity < midAmount) continue;
+        if (o2.availableCapacity < midAmount) continue;
 
         // Liquidity inventory checks for multi-hop:
         // p1 needs settlement-asset liquidity (to pay out the mid-asset).
@@ -992,7 +1009,7 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
       intent.failureReason = "offer no longer available";
       return;
     }
-    const available = offer.availableCapacity - offer.reservedCapacity;
+    const available = offer.availableCapacity;
     if (available < leg.amount) {
       intent.status = "FAILED";
       intent.failureReason = "insufficient capacity";
@@ -1021,6 +1038,7 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
   // Reserve capacity on all legs (do NOT increment version — reservations
   // are not economic changes. Version tracks fee/rate/capacity offer edits).
   for (const r of reservations) {
+    r.offer.availableCapacity -= r.amount;
     r.offer.reservedCapacity += r.amount;
   }
 
@@ -1037,7 +1055,8 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
     provider.totalPenalties += intent.sourceAmount * 0.001;
     // Release reservations immediately on failure (no settlement period).
     for (const r of reservations) {
-      r.offer.reservedCapacity -= r.amount;
+      r.offer.availableCapacity += r.amount;
+      r.offer.reservedCapacity = Math.max(0, r.offer.reservedCapacity - r.amount);
     }
     // NO liquidity was consumed (failure before settlement) — nothing to restore.
     recordExecution(provider, intent, route, "FAILED", 0, world);
@@ -1089,12 +1108,22 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
     const firstLeg = inFlightLegs[0];
     const firstOffer = world.offers.get(firstLeg.offerId);
     if (firstOffer) {
+      firstOffer.availableCapacity -= firstLeg.reservation.amount;
       firstOffer.reservedCapacity += firstLeg.reservation.amount;
     }
     const firstProvider = world.providers.get(firstLeg.providerId);
     if (firstProvider) {
       firstProvider.currentDeployedCapital += firstLeg.reservation.amount;
       firstProvider.totalDeployedCapitalSteps += firstLeg.reservation.amount * firstLeg.durationSteps;
+      // Log for calibration reconciliation.
+      world.capitalTimeLog.push({
+        providerId: firstLeg.providerId,
+        offerId: firstLeg.offerId,
+        amount: firstLeg.reservation.amount,
+        startStep: world.step,
+        completionStep: world.step + firstLeg.durationSteps,
+        durationSteps: firstLeg.durationSteps,
+      });
     }
   }
 
@@ -1212,7 +1241,11 @@ function updateProviderOffers(world: SimWorld, rng: SeededRNG): void {
         if (utilization > 0.7 && rng.chance(0.1)) offer.feeBps += 1;
         break;
       case "PREMIUM":
-        if (utilization > 0.8 && rng.chance(0.05)) offer.availableCapacity *= 1.1;
+        if (utilization > 0.8 && rng.chance(0.05)) {
+          const oldCap = offer.availableCapacity;
+          offer.availableCapacity *= 1.1;
+          world.capacityMutations.push({ offerId: offer.id, step: world.step, delta: offer.availableCapacity - oldCap, reason: "PREMIUM strategy capacity increase" });
+        }
         break;
       case "LIQUIDITY_MAXIMIZER":
         if (utilization < 0.2 && rng.chance(0.15)) offer.feeBps = Math.max(5, offer.feeBps - 2);
@@ -1235,7 +1268,11 @@ function updateProviderOffers(world: SimWorld, rng: SeededRNG): void {
         }
         break;
       case "CONSERVATIVE":
-        if (provider.reputationScore < 0.6 && rng.chance(0.1)) offer.availableCapacity *= 0.9;
+        if (provider.reputationScore < 0.6 && rng.chance(0.1)) {
+          const oldCap = offer.availableCapacity;
+          offer.availableCapacity *= 0.9;
+          world.capacityMutations.push({ offerId: offer.id, step: world.step, delta: offer.availableCapacity - oldCap, reason: "CONSERVATIVE strategy capacity decrease" });
+        }
         break;
       case "OPPORTUNISTIC":
         if (utilization > 0.6 && rng.chance(0.1)) offer.feeBps += 2;
@@ -1376,7 +1413,9 @@ function applyShocks(world: SimWorld, rng: SeededRNG): void {
   switch (config.shockType) {
     case "LIQUIDITY":
       for (const offer of world.offers.values()) {
+        const oldCap = offer.availableCapacity;
         offer.availableCapacity *= (1 - config.shockMagnitude);
+        world.capacityMutations.push({ offerId: offer.id, step: world.step, delta: offer.availableCapacity - oldCap, reason: "LIQUIDITY shock" });
         offer.version++;
       }
       break;

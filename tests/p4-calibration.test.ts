@@ -139,12 +139,16 @@ async function main() {
   assert(cap1.reserved >= 0, `Reserved capacity >= 0 (${cap1.reserved})`);
   assert(cap1.available >= 0, `Available capacity >= 0 (${cap1.available})`);
 
-  // Check per-offer: availableCapacity >= reservedCapacity (no negative available).
+  // Check per-offer: availableCapacity >= 0 and reservedCapacity >= 0.
+  // (With the P4.7.4 capacity model, availableCapacity is reduced when reserved,
+  // so availableCapacity can be less than reservedCapacity. The invariant is
+  // that both are non-negative and their sum equals the initial total.)
   let negativeAvail = 0;
   for (const o of w1.offers.values()) {
-    if (o.active && o.availableCapacity < o.reservedCapacity) negativeAvail++;
+    if (o.active && o.availableCapacity < 0) negativeAvail++;
+    if (o.active && o.reservedCapacity < 0) negativeAvail++;
   }
-  assert(negativeAvail === 0, `No offer has reservedCapacity > availableCapacity (${negativeAvail} violations)`);
+  assert(negativeAvail === 0, `No negative capacity values (${negativeAvail} violations)`);
 
   // =========================================================================
   // 3. CAPITAL-TIME ACCOUNTING RECONCILIATION
