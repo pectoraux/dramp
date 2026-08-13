@@ -175,7 +175,7 @@ async function main() {
         .reduce((s, m) => s + m.delta, 0);
       const expected = initialCapacity[o.id] + mutations;
       const actual = o.availableCapacity + o.reservedCapacity;
-      if (!approxEq(actual, expected, 0.1)) {
+      if (!approxEq(actual, expected)) {
         stepFailures++;
         console.error(`  Step ${step}: Offer ${o.id} capacity FAILED: expected ${expected.toFixed(2)}, actual ${actual.toFixed(2)}, delta ${(actual - expected).toFixed(2)}`);
       }
@@ -242,8 +242,8 @@ async function main() {
     const expected = expectedCapitalTimeByProvider[p.id] ?? 0;
     const actual = p.totalDeployedCapitalSteps;
     console.log(`  ${p.name}: expected=${expected.toFixed(2)} (from ${world.capitalTimeLog.filter(e => e.providerId === p.id).length} legs), actual=${actual.toFixed(2)}`);
-    assert(approxEq(actual, expected, 0.1),
-      `${p.name}: expected capital-time(${expected.toFixed(2)}) ≈ actual(${actual.toFixed(2)})`);
+    assert(approxEq(actual, expected),
+      `${p.name}: expected capital-time(${expected.toFixed(2)}) ≈ actual(${actual.toFixed(2)}) [eps=${MONETARY_EPSILON}]`);
   }
 
   // 4. BOUNDARY-FLOW (already covered by #1, but print summary).
