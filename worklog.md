@@ -781,3 +781,29 @@ Stage Summary:
 - Simulator market mechanics are now correct: capacity is reserved and released, utilization is real, exit reasons are separated, economics are time-consistent, reference routes use real data.
 - The simulator is READY for controlled experiments but NOT yet ready for strategic business conclusions until the stable-network fixture is used to run the controlled experiment methodology (A: routing efficiency, B: provider economics, C: cold start, D: stablecoin bootstrapping, E: volatile assets, F: patient execution).
 - No production routing/economic logic was changed — all fixes are in the simulator only.
+
+---
+Task ID: P4.4-Utilization
+Agent: main (Z.ai Code)
+Task: Fix simulator utilization and execution-duration semantics. Reservations must persist across steps so provider strategies observe real utilization. Multi-step settlement duration. Leg/campaign-aware incentives. 1-minute step calibration.
+
+Work Log:
+- Added SimActiveReservation type (id, offerId, providerId, amount, startStep, releaseStep) to world.ts. Added settlementDurationSteps to SimOffer. Added peakUtilization + utilizationTimeSteps to SimProvider. Added activeReservations array to SimWorld.
+- Added releaseExpiredReservations() as step 0 of simulateStep — releases reservations whose releaseStep has elapsed, freeing capacity for new executions. Called BEFORE generateDemand/matchAndExecute so freed capacity is available.
+- Rewrote executeIntent: creates SimActiveReservation entries that persist for settlementDurationSteps (not released synchronously). Failed executions release immediately. Capital-time product (totalDeployedCapitalSteps) uses the multi-step duration.
+- Added computeSettlementDurations() to generator.ts — derives settlementDurationSteps from expectedExecutionSeconds / stepDurationMs for each offer. Called after generateWorld and generateNewProvider.
+- Rewrote updateProviderOffers: computes utilization from world.activeReservations (not offer.reservedCapacity which may be 0 after release). Tracks peakUtilization and utilizationTimeSteps. Provider strategies now react to utilization observed DURING the step.
+- Fixed incentive accounting: only legs whose offer.settlementAssetId matches campaign.settlementAssetId qualify. Incentive = leg.amount × campaign.incentiveBps (not route.netOutput). Paid only to the qualifying provider(s), not split across all legs.
+- Changed stepDurationMs from 5000 (5s) to 60000 (1 minute) in both createDefaultConfig and createStableNetworkConfig.
+- Added peakUtilization + avgTimeWeightedUtilization to SimMetrics.
+- Updated API route fallback metrics + provider analysis to include exitReason.
+- Tests: tests/p4-mechanics.test.ts expanded to 48 assertions — persistent reservations (peak util > 0), time-weighted utilization, multi-step capital duration, incentive eligibility (leg/campaign-aware), step duration calibration (60s).
+- All tests pass: P4 canonical 91, P4 simulator 21, P4 faithful 19, P4 mechanics 48. Lint clean.
+- Pushed to GitHub (commit 5cb8230).
+
+Stage Summary:
+- Utilization is now REAL: reservations persist across steps, provider strategies observe actual deployment, peak/time-weighted utilization tracked.
+- Multi-step settlement duration: capital is reserved for settlementDurationSteps (1-3 steps for typical 10-120s executions on 1-minute sim steps). Different provider types with different execution speeds now have different capital costs.
+- Incentive accounting is leg/campaign-aware: only qualifying legs receive incentives, calculated on leg amount not route netOutput.
+- Step duration calibrated to 1 minute — economically meaningful unit.
+- Simulator is READY for controlled strategic experiments.
