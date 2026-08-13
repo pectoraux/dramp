@@ -229,11 +229,20 @@ function settleLeg(world: SimWorld, exec: SimInFlightExecution, legIndex: number
     // legIndex > 0: sourceAsset already credited by upstream transfer — do nothing.
 
     // Destination balance: ALWAYS decreases (provider pays out).
-    // For the last leg, this is the external payout (boundary flow).
-    // For intermediate legs, this is the settlement asset paid to the next
-    // provider — debited here, credited to the next provider in createSettlementTransfer.
+    // CONSERVATION CHECK: if the provider doesn't have enough destination liquidity,
+    // the leg FAILS rather than clamping to 0 (which would create money).
     const dstBalance = p.liquidity.balances.get(leg.destinationAsset) ?? 0;
-    p.liquidity.balances.set(leg.destinationAsset, Math.max(0, dstBalance - leg.payoutAmount));
+    if (dstBalance < leg.payoutAmount) {
+      // Insufficient destination liquidity — leg fails.
+      // This prevents the conservation violation where Math.max(0, ...) clamps
+      // the debit but the transfer still credits the full amount.
+      leg.status = "FAILED";
+      leg.settlementOutcome = "FAILURE";
+      p.executionsFailed++;
+      p.settlementsFailed++;
+      return;
+    }
+    p.liquidity.balances.set(leg.destinationAsset, dstBalance - leg.payoutAmount);
   }
 
   // Release the reservation for this leg.
