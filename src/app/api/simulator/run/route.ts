@@ -18,6 +18,7 @@ export async function POST(req: NextRequest) {
       p95ExecutionSteps: 0, completionRate: 0, activeProviders: 0, exitedProviders: 0,
       suspendedProviders: 0, economicExits: 0,
       avgProviderEarnings: 0, medianProviderEarnings: 0, avgUtilization: 0,
+      peakUtilization: 0, avgTimeWeightedUtilization: 0,
       totalProviderVolume: 0, totalProtocolRevenue: 0, totalIncentiveSpend: 0,
       medianNetProfit: 0, avgNetProfit: 0, medianNetMargin: 0,
       medianProfitPerExecution: 0, medianAnnualizedReturnPct: 0,

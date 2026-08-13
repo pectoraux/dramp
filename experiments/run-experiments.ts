@@ -359,6 +359,7 @@ function experiment4_volatileAssets() {
         availableCapacity: 100000, reservedCapacity: 0,
         settlementAssetId: weth.id, channelType: "AUTOMATIC",
         expectedExecutionSeconds: 15, incentiveBps: 100, active: true, version: 1,
+        settlementDurationSteps: 1,
       });
       // WETH → EUR (low fee, high incentive)
       w.offers.set("weth_hop2", {
@@ -369,6 +370,7 @@ function experiment4_volatileAssets() {
         availableCapacity: 100000 * 2500, reservedCapacity: 0,
         settlementAssetId: weth.id, channelType: "AUTOMATIC",
         expectedExecutionSeconds: 20, incentiveBps: 100, active: true, version: 1,
+        settlementDurationSteps: 1,
       });
     });
     results.push(computeMetrics(world));

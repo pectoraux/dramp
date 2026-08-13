@@ -73,10 +73,24 @@ export function generateWorld(world: SimWorld, rng: SeededRNG): void {
     generateProvider(world, rng, assetList, stableAssets, i);
   }
 
+  // Compute settlementDurationSteps for all offers based on the config.
+  computeSettlementDurations(world);
+
   // ---- Users ----
   const numUsers = 50;
   for (let i = 0; i < numUsers; i++) {
     generateUser(world, rng, config);
+  }
+}
+
+// Compute settlementDurationSteps for each offer: how many simulation steps
+// the capital is reserved during settlement. Derived from the offer's
+// expectedExecutionSeconds and the simulation's stepDurationMs.
+// Minimum 1 step (synchronous), typical 1-3 steps for 1-minute sim steps.
+export function computeSettlementDurations(world: SimWorld): void {
+  const stepSeconds = world.config.stepDurationMs / 1000;
+  for (const offer of world.offers.values()) {
+    offer.settlementDurationSteps = Math.max(1, Math.ceil(offer.expectedExecutionSeconds / stepSeconds));
   }
 }
 
@@ -103,7 +117,8 @@ function generateProvider(
     strategy, collateral, usableCollateral, lockedCollateral: 0, maxExposure,
     corridors: [], totalVolume: 0, totalEarnings: 0, totalIncentives: 0,
     totalPenalties: 0, totalSlashing: 0, executionsCompleted: 0, executionsFailed: 0,
-    utilization: 0, entryStep: 0, exitStep: null,
+    utilization: 0, peakUtilization: 0, utilizationTimeSteps: 0,
+    entryStep: 0, exitStep: null,
     totalDeployedCapitalSteps: 0, currentDeployedCapital: 0,
     executionHistory: [],
   };
@@ -154,6 +169,7 @@ function generateProvider(
       channelType: rng.chance(0.8) ? "AUTOMATIC" : "MANUAL",
       expectedExecutionSeconds: rng.int(10, 120),
       incentiveBps, active: true, version: 1,
+      settlementDurationSteps: 0, // computed in generateWorld after config is available
     };
     world.offers.set(offer.id, offer);
   }
@@ -220,7 +236,8 @@ export function generateNewProvider(
     strategy, collateral, usableCollateral, lockedCollateral: 0, maxExposure,
     corridors: [], totalVolume: 0, totalEarnings: 0, totalIncentives: 0,
     totalPenalties: 0, totalSlashing: 0, executionsCompleted: 0, executionsFailed: 0,
-    utilization: 0, entryStep: step, exitStep: null,
+    utilization: 0, peakUtilization: 0, utilizationTimeSteps: 0,
+    entryStep: step, exitStep: null,
     totalDeployedCapitalSteps: 0, currentDeployedCapital: 0,
     executionHistory: [],
   };
@@ -253,9 +270,13 @@ export function generateNewProvider(
       expectedExecutionSeconds: rng.int(10, 120),
       incentiveBps: settlementAsset.incentiveRate > 0 ? settlementAsset.incentiveRate : 0,
       active: true, version: 1,
+      settlementDurationSteps: 0, // computed in generateNewProvider
     };
     world.offers.set(offer.id, offer);
   }
+
+  // Compute settlement durations for the new provider's offers.
+  computeSettlementDurations(world);
 
   return provider;
 }

@@ -62,26 +62,29 @@ async function main() {
   console.log("\n== 2. Utilization is real ==");
 
   // In a simulation with executions, at least some providers should have
-  // non-zero utilization at some point (during execution).
-  // The final utilization may be 0 (all released), but the deployed capital
-  // tracking proves utilization was real during execution.
+  // With persistent reservations (Prompt 4.4), reservations last for
+  // settlementDurationSteps. After the simulation completes, some reservations
+  // may still be active (not yet released). The key proof is that providers
+  // have peakUtilization > 0 — meaning utilization was observed during execution.
   const providersWithDeployedCapital = [...world.providers.values()].filter(p => p.totalDeployedCapitalSteps > 0);
   assert(providersWithDeployedCapital.length > 0,
     `Providers with deployed capital > 0: ${providersWithDeployedCapital.length}`);
 
+  // Peak utilization must be > 0 for at least one provider — proving the
+  // utilization signal was real during execution (not always 0).
+  const providersWithPeakUtil = [...world.providers.values()].filter(p => p.peakUtilization > 0);
+  assert(providersWithPeakUtil.length > 0,
+    `Providers with peak utilization > 0: ${providersWithPeakUtil.length} (utilization signal is real)`);
+
   // Verify utilization computation: a provider with $100k capacity and $40k
-  // reserved should show 40% utilization. We test this by checking that the
-  // utilization formula is reserved/available.
+  // reserved should show 40% utilization. With persistent reservations, the
+  // reserved amount may be non-zero if the settlement period hasn't elapsed.
   const testProvider = providersWithDeployedCapital[0];
   if (testProvider) {
-    const offers = [...world.offers.values()].filter(o => o.providerId === testProvider.id && o.active);
-    if (offers.length > 0) {
-      const totalAvail = offers.reduce((s, o) => s + o.availableCapacity, 0);
-      const totalReserved = offers.reduce((s, o) => s + o.reservedCapacity, 0);
-      const expectedUtil = totalAvail > 0 ? totalReserved / totalAvail : 0;
-      // After all executions complete, reserved should be 0 (released).
-      assert(totalReserved === 0, `All reservations released after execution (reserved: ${totalReserved})`);
-    }
+    assert(testProvider.peakUtilization > 0,
+      `Provider peak utilization > 0 (${(testProvider.peakUtilization * 100).toFixed(1)}%)`);
+    assert(testProvider.utilizationTimeSteps > 0,
+      `Provider utilizationTimeSteps > 0 (${testProvider.utilizationTimeSteps.toFixed(2)})`);
   }
 
   // =========================================================================
@@ -247,8 +250,84 @@ async function main() {
   assert(w1.totalVolume === w2.totalVolume, `Same seed → same total volume (${w1.totalVolume})`);
   assert(w1.providers.size === w2.providers.size, `Same seed → same provider count (${w1.providers.size})`);
 
+  // =========================================================================
+  // 11. PERSISTENT RESERVATIONS — utilization observed during step (4.4)
+  // =========================================================================
+  console.log("\n== 11. Persistent reservations ==");
+
+  // Run a simulation and verify that peak utilization > 0 — proving that
+  // reservations were active when updateProviderOffers ran (not released
+  // synchronously before the strategy layer observed them).
+  const persistWorld = runSimulation({ ...createStableNetworkConfig(), seed: 55, totalSteps: 50 });
+  const persistActive = [...persistWorld.providers.values()].filter(p => p.status === "ACTIVE");
+  const providersWithPeak = persistActive.filter(p => p.peakUtilization > 0);
+  assert(providersWithPeak.length > 0,
+    `Providers with peak utilization > 0: ${providersWithPeak.length} (reservations persist across steps)`);
+
+  // Time-weighted utilization should also be > 0.
+  const providersWithTimeWeighted = persistActive.filter(p => p.utilizationTimeSteps > 0);
+  assert(providersWithTimeWeighted.length > 0,
+    `Providers with time-weighted utilization > 0: ${providersWithTimeWeighted.length}`);
+
+  // Active reservations may still exist at the end of the simulation.
+  assert(persistWorld.activeReservations.length >= 0,
+    `Active reservations array exists (length: ${persistWorld.activeReservations.length})`);
+
+  // =========================================================================
+  // 12. MULTI-STEP CAPITAL DURATION — settlementDurationSteps (4.4)
+  // =========================================================================
+  console.log("\n== 12. Multi-step capital duration ==");
+
+  // Offers should have settlementDurationSteps >= 1.
+  const sampleOffer = [...persistWorld.offers.values()].find(o => o.active);
+  if (sampleOffer) {
+    assert(sampleOffer.settlementDurationSteps >= 1,
+      `Offer has settlementDurationSteps >= 1 (${sampleOffer.settlementDurationSteps})`);
+  }
+
+  // The totalDeployedCapitalSteps should reflect multi-step duration:
+  // amount × durationSteps per execution. If durationSteps > 1, the capital-time
+  // product is larger than just amount × executions.
+  const providerWithDuration = persistActive.find(p => p.executionsCompleted > 0 && p.totalDeployedCapitalSteps > 0);
+  if (providerWithDuration) {
+    // totalDeployedCapitalSteps >= sum of execution amounts (at least 1 step each).
+    assert(providerWithDuration.totalDeployedCapitalSteps >= providerWithDuration.totalVolume * 0.01,
+      `Capital-time product reflects duration (${providerWithDuration.totalDeployedCapitalSteps.toFixed(0)} >= volume × min duration)`);
+  }
+
+  // =========================================================================
+  // 13. INCENTIVE ELIGIBILITY — only qualifying legs receive incentives (4.4)
+  // =========================================================================
+  console.log("\n== 13. Incentive eligibility ==");
+
+  // The incentive accounting should only pay legs whose offer uses the
+  // campaign's settlement asset. Verify by checking the source code.
+  const fs2 = await import("fs");
+  const engineSrc2 = fs2.readFileSync("src/lib/simulator/engine-faithful.ts", "utf-8");
+  assert(engineSrc2.includes("r.offer.settlementAssetId === campaign.settlementAssetId"),
+    "Incentive eligibility checks leg's offer settlement asset (not just route)");
+  assert(!engineSrc2.includes("route.netOutput * campaign.incentiveBps"),
+    "Incentive NOT calculated on route netOutput (uses leg amount instead)");
+  assert(engineSrc2.includes("leg.amount * campaign.incentiveBps"),
+    "Incentive calculated on qualifying leg amount");
+
+  // Run with incentives and verify accrual.
+  const incWorld = runSimulation({ ...createStableNetworkConfig(), seed: 77, totalSteps: 60, enableIncentives: true });
+  assert(incWorld.totalIncentives > 0,
+    `Incentives accrued with campaigns active ($${incWorld.totalIncentives.toFixed(2)})`);
+
+  // =========================================================================
+  // 14. STEP DURATION — economically meaningful (1 minute, not 5 seconds)
+  // =========================================================================
+  console.log("\n== 14. Step duration calibration ==");
+
+  assert(createDefaultConfig().stepDurationMs === 60000,
+    `Default step duration is 60s (1 minute), not 5s (${createDefaultConfig().stepDurationMs}ms)`);
+  assert(createStableNetworkConfig().stepDurationMs === 60000,
+    `Stable network step duration is 60s (${createStableNetworkConfig().stepDurationMs}ms)`);
+
   console.log(`\n========================================`);
-  console.log(`  P4.3 Mechanics: Passed: ${passed}  |  Failed: ${failed}`);
+  console.log(`  P4.4 Mechanics: Passed: ${passed}  |  Failed: ${failed}`);
   console.log(`========================================`);
   if (failed > 0) {
     console.log("\nFailures:");

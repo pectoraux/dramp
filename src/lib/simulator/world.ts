@@ -41,17 +41,31 @@ export interface SimProvider {
   totalSlashing: number;
   executionsCompleted: number;
   executionsFailed: number;
-  utilization: number; // reserved / available (computed from actual reservations)
+  utilization: number; // instantaneous reserved / available (observed during step)
+  peakUtilization: number; // highest utilization seen over the simulation
+  utilizationTimeSteps: number; // Σ (utilization per step) — for time-weighted average
   entryStep: number;
   exitStep: number | null;
   // Deployed capital tracking: sum of (amount × duration) across all executions.
   // Used for time-consistent capital cost calculation.
   totalDeployedCapitalSteps: number; // Σ (amount × steps_deployed) — capital-time product
-  currentDeployedCapital: number; // currently reserved/deployed capital
+  currentDeployedCapital: number; // currently reserved/deployed capital (across active reservations)
   // Per-execution history for faithful reputation recalculation.
   // Each record captures the amount, outcome, duration, and sim-time so the
   // shared calculateReputation function can apply recency + value weighting.
   executionHistory: SimExecutionRecord[];
+}
+
+// Active reservation: capacity held for a multi-step settlement period.
+// Created when an execution starts, released when the settlement duration
+// elapses. This makes utilization real across steps.
+export interface SimActiveReservation {
+  id: string;
+  offerId: string;
+  providerId: string;
+  amount: number;
+  startStep: number;
+  releaseStep: number; // startStep + settlementDurationSteps
 }
 
 export interface SimOffer {
@@ -74,6 +88,10 @@ export interface SimOffer {
   incentiveBps: number;
   active: boolean;
   version: number;
+  // Settlement duration in simulation steps. Capital is reserved for this
+  // many steps before being released. Derived from expectedExecutionSeconds
+  // and the simulation stepDurationMs.
+  settlementDurationSteps: number;
 }
 
 export interface SimUser {
@@ -183,6 +201,8 @@ export interface SimMetrics {
   avgProviderEarnings: number;       // simulation-period net earnings ($)
   medianProviderEarnings: number;    // simulation-period net earnings ($)
   avgUtilization: number;
+  peakUtilization: number;       // highest instantaneous utilization across all providers
+  avgTimeWeightedUtilization: number; // time-weighted average (utilizationTimeSteps / elapsedSteps)
   totalProviderVolume: number;
   totalProtocolRevenue: number;
   totalIncentiveSpend: number;
@@ -212,6 +232,9 @@ export interface SimWorld {
   intents: SimIntent[];
   routes: Map<string, SimRoute>;
   campaigns: Map<string, SimCampaign>;
+  // Active reservations: capacity held for multi-step settlement periods.
+  // These persist across steps until releaseStep, making utilization real.
+  activeReservations: SimActiveReservation[];
   metricsHistory: SimMetrics[];
   // Running tallies
   totalVolume: number;
@@ -245,7 +268,7 @@ export function createDefaultConfig(): SimConfig {
   return {
     seed: 42,
     totalSteps: 100,
-    stepDurationMs: 5000,
+    stepDurationMs: 60000, // 1 minute per step — economically meaningful unit
     initialProviders: 10,
     providerGrowthRate: 0.05,
     providerExitThreshold: 0.01,
@@ -277,7 +300,7 @@ export function createStableNetworkConfig(): SimConfig {
   return {
     seed: 42,
     totalSteps: 100,
-    stepDurationMs: 5000,
+    stepDurationMs: 60000, // 1 minute per step
     initialProviders: 20,
     providerGrowthRate: 0.0,
     providerExitThreshold: 0.001,
@@ -307,6 +330,7 @@ export function createWorld(config: SimConfig): SimWorld {
     intents: [],
     routes: new Map(),
     campaigns: new Map(),
+    activeReservations: [],
     metricsHistory: [],
     totalVolume: 0,
     totalFees: 0,

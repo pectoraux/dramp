@@ -23,7 +23,7 @@
 import { SeededRNG } from "./rng";
 import {
   SimWorld, SimIntent, SimMetrics, SimProvider, SimOffer,
-  SimCampaign, SimRoute, SimExecutionRecord,
+  SimCampaign, SimRoute, SimExecutionRecord, SimActiveReservation,
 } from "./world";
 import { generateNewProvider } from "./generator";
 import {
@@ -66,8 +66,14 @@ export function simulateStep(world: SimWorld, rng: SeededRNG): void {
   world.step++;
   world.timeMs += world.config.stepDurationMs;
 
+  // 0. Release expired reservations FIRST — settlements that have completed
+  //    their duration free up capacity for new executions in this step.
+  releaseExpiredReservations(world);
+
   generateDemand(world, rng);
   matchAndExecute(world, rng);
+  // updateProviderOffers now sees reservations that are still active (not yet
+  // released) because they persist for settlementDurationSteps.
   updateProviderOffers(world, rng);
   handleProviderEntryExit(world, rng);
   updateCampaigns(world);
@@ -75,6 +81,29 @@ export function simulateStep(world: SimWorld, rng: SeededRNG): void {
   if (world.step % 5 === 0 || world.step === world.config.totalSteps) {
     world.metricsHistory.push(collectMetrics(world));
   }
+}
+
+// Release reservations whose settlement duration has elapsed.
+// This is called at the START of each step, so reservations persist across
+// steps and are visible to updateProviderOffers.
+function releaseExpiredReservations(world: SimWorld): void {
+  const remaining: SimActiveReservation[] = [];
+  for (const res of world.activeReservations) {
+    if (world.step >= res.releaseStep) {
+      // Release: decrement reservedCapacity and currentDeployedCapital.
+      const offer = world.offers.get(res.offerId);
+      if (offer) {
+        offer.reservedCapacity = Math.max(0, offer.reservedCapacity - res.amount);
+      }
+      const provider = world.providers.get(res.providerId);
+      if (provider) {
+        provider.currentDeployedCapital = Math.max(0, provider.currentDeployedCapital - res.amount);
+      }
+    } else {
+      remaining.push(res);
+    }
+  }
+  world.activeReservations = remaining;
 }
 
 function generateDemand(world: SimWorld, rng: SeededRNG): void {
@@ -457,50 +486,52 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent): SimCandidateRou
   return routes;
 }
 
-// ---- Execute intent (with capacity reservation + release) -----------------
+// ---- Execute intent (with PERSISTENT capacity reservation) ----------------
 //
-// CRITICAL: executeIntent now RESERVES capacity before execution and RELEASES
-// it after completion/failure. This makes utilization real and prevents
-// unlimited reuse of the same liquidity.
+// CRITICAL: executeIntent now creates PERSISTENT reservations that last for
+// the settlement duration (settlementDurationSteps). Reservations are NOT
+// released synchronously — they persist across steps until
+// releaseExpiredReservations() frees them. This makes utilization REAL:
+// updateProviderOffers sees active reservations and provider strategies
+// can react to actual deployment.
 //
 // The reservation model:
 //   1. Before execution: verify each leg's offer has capacity, then reserve.
-//   2. During execution: the capital is "deployed" (tracked for economics).
-//   3. After completion/failure: release the reservation.
-//   4. The deployed-capital-time product is accumulated for capital cost.
+//   2. Create SimActiveReservation entries with releaseStep = step + durationSteps.
+//   3. Capital is tracked as deployed (currentDeployedCapital) for the duration.
+//   4. releaseExpiredReservations (at the start of each step) frees elapsed ones.
+//   5. Failed executions release immediately (no settlement period).
+
+let reservationCounter = 0;
 
 function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRoute & { id: string }, rng: SeededRNG): void {
   const provider = world.providers.get(route.legs[0].providerId);
   if (!provider) { intent.status = "FAILED"; intent.failureReason = "provider not found"; return; }
 
   // ---- Step 1: Verify capacity and reserve ----
-  const reservations: Array<{ offerId: string; amount: number }> = [];
+  const reservations: Array<{ offer: SimOffer; amount: number; durationSteps: number }> = [];
   for (const leg of route.legs) {
-    // Find the offer for this leg. We match by provider + corridor + capacity.
-    // In the simulator, each leg corresponds to one offer.
     const offer = findOfferForLeg(world, leg);
     if (!offer) {
-      // Offer not found — can't execute.
       intent.status = "FAILED";
       intent.failureReason = "offer no longer available";
       return;
     }
     const available = offer.availableCapacity - offer.reservedCapacity;
     if (available < leg.amount) {
-      // Insufficient capacity — can't execute.
       intent.status = "FAILED";
       intent.failureReason = "insufficient capacity";
       return;
     }
-    reservations.push({ offerId: offer.id, amount: leg.amount });
+    // Settlement duration for this leg (from the offer's expectedExecutionSeconds).
+    const durationSteps = offer.settlementDurationSteps;
+    reservations.push({ offer, amount: leg.amount, durationSteps });
   }
-  // Reserve capacity on all legs.
+
+  // Reserve capacity on all legs (increment reservedCapacity immediately).
   for (const r of reservations) {
-    const offer = world.offers.get(r.offerId);
-    if (offer) {
-      offer.reservedCapacity += r.amount;
-      offer.version++;
-    }
+    r.offer.reservedCapacity += r.amount;
+    r.offer.version++;
   }
 
   // ---- Step 2: Failure model ----
@@ -514,16 +545,15 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
     intent.failureReason = "provider execution failure";
     provider.executionsFailed++;
     provider.totalPenalties += intent.sourceAmount * 0.001;
-    // Release reservations on failure.
+    // Release reservations immediately on failure (no settlement period).
     for (const r of reservations) {
-      const offer = world.offers.get(r.offerId);
-      if (offer) offer.reservedCapacity -= r.amount;
+      r.offer.reservedCapacity -= r.amount;
     }
     recordExecution(provider, intent, route, "FAILED", 0, world);
     return;
   }
 
-  // ---- Step 3: Success ----
+  // ---- Step 3: Success — create PERSISTENT reservations ----
   intent.status = "COMPLETED";
   intent.completedAtStep = world.step;
   intent.effectiveCost = route.effectiveCost;
@@ -533,55 +563,55 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
   intent.routeTag = route.tag;
 
   const durationSec = route.expectedExecutionSeconds;
-  // Execution duration in simulation steps (for capital cost accrual).
-  const durationSteps = Math.max(1, Math.ceil(durationSec / (world.config.stepDurationMs / 1000)));
 
-  // Update provider economics (aggregate totals).
-  for (const leg of route.legs) {
+  // Update provider economics + create persistent reservations.
+  for (let i = 0; i < route.legs.length; i++) {
+    const leg = route.legs[i];
+    const r = reservations[i];
     const p = world.providers.get(leg.providerId);
     if (!p) continue;
+
     const fee = leg.amount * leg.feeBps / 10000;
     p.totalVolume += leg.amount;
     p.totalEarnings += fee;
     p.executionsCompleted++;
     // Track deployed capital: amount × duration (capital-time product).
-    p.totalDeployedCapitalSteps += leg.amount * durationSteps;
+    p.totalDeployedCapitalSteps += leg.amount * r.durationSteps;
     p.currentDeployedCapital += leg.amount;
+
+    // Create a persistent reservation that will be released after durationSteps.
+    const reservation: SimActiveReservation = {
+      id: `res_${++reservationCounter}`,
+      offerId: r.offer.id,
+      providerId: p.id,
+      amount: leg.amount,
+      startStep: world.step,
+      releaseStep: world.step + r.durationSteps,
+    };
+    world.activeReservations.push(reservation);
 
     recordExecution(p, intent, route, "COMPLETED", durationSec, world, leg);
   }
 
-  // ---- Step 4: Release reservations after execution ----
-  // In a real marketplace, the capital is deployed during execution and
-  // released after settlement. We release immediately since the sim doesn't
-  // model a separate settlement window.
-  for (const r of reservations) {
-    const offer = world.offers.get(r.offerId);
-    if (offer) {
-      offer.reservedCapacity -= r.amount;
-    }
-  }
-  // Reset current deployed capital (all executions in this step are complete).
-  for (const leg of route.legs) {
-    const p = world.providers.get(leg.providerId);
-    if (p) p.currentDeployedCapital = Math.max(0, p.currentDeployedCapital - leg.amount);
-  }
-
-  // ---- Step 5: Accrue incentives ----
-  for (const saId of route.settlementAssetIds) {
-    for (const campaign of world.campaigns.values()) {
-      if (campaign.status !== "ACTIVE") continue;
-      if (campaign.settlementAssetId === saId) {
-        const inc = route.netOutput * campaign.incentiveBps / 10000;
+  // ---- Step 4: Accrue incentives (leg/campaign-aware) ----
+  // Only legs whose offer uses the campaign's settlement asset qualify for
+  // the incentive. The incentive is paid on the qualifying leg's volume,
+  // not the full route netOutput, and only to the qualifying provider(s).
+  for (const campaign of world.campaigns.values()) {
+    if (campaign.status !== "ACTIVE") continue;
+    for (let i = 0; i < route.legs.length; i++) {
+      const leg = route.legs[i];
+      const r = reservations[i];
+      if (r.offer.settlementAssetId === campaign.settlementAssetId) {
+        // This leg qualifies. Incentive = leg amount × campaign bps.
+        const inc = leg.amount * campaign.incentiveBps / 10000;
         const remaining = campaign.totalBudget - campaign.accrued;
         if (remaining > 0) {
           const actualInc = Math.min(inc, remaining);
           campaign.accrued += actualInc;
           world.totalIncentives += actualInc;
-          for (const leg of route.legs) {
-            const p = world.providers.get(leg.providerId);
-            if (p) p.totalIncentives += actualInc / route.legs.length;
-          }
+          const p = world.providers.get(leg.providerId);
+          if (p) p.totalIncentives += actualInc;
         }
       }
     }
@@ -635,30 +665,44 @@ function recordExecution(
 
 // ---- Provider offer updates (strategy-based pricing) ----------------------
 //
-// Utilization is now REAL: it's computed from actual reserved capacity
-// across all of a provider's offers. During execution, reservedCapacity is
-// incremented, so utilization reflects actual deployment.
+// Utilization is computed from ACTIVE reservations that persist across steps.
+// Because reservations last for settlementDurationSteps, updateProviderOffers
+// sees them and provider strategies can react to actual deployment.
+//
+// We track three utilization signals:
+//   - utilization: instantaneous (current reserved / available) — observed NOW
+//   - peakUtilization: the highest instantaneous utilization seen
+//   - utilizationTimeSteps: Σ utilization per step — for time-weighted average
 
 function updateProviderOffers(world: SimWorld, rng: SeededRNG): void {
-  // First, compute per-provider utilization from actual reservations.
-  const providerUtilization = new Map<string, number>();
+  // Compute per-provider instantaneous utilization from active reservations.
+  // Active reservations are still in world.activeReservations (not yet released).
+  const providerReserved = new Map<string, number>();
+  for (const res of world.activeReservations) {
+    providerReserved.set(res.providerId, (providerReserved.get(res.providerId) ?? 0) + res.amount);
+  }
+
   for (const provider of world.providers.values()) {
     if (provider.status !== "ACTIVE") continue;
     const offers = [...world.offers.values()].filter(o => o.providerId === provider.id && o.active);
-    if (offers.length === 0) {
-      providerUtilization.set(provider.id, 0);
-      continue;
-    }
     const totalAvail = offers.reduce((s, o) => s + o.availableCapacity, 0);
-    const totalReserved = offers.reduce((s, o) => s + o.reservedCapacity, 0);
-    providerUtilization.set(provider.id, totalAvail > 0 ? totalReserved / totalAvail : 0);
+    const totalReserved = providerReserved.get(provider.id) ?? 0;
+    const utilization = totalAvail > 0 ? totalReserved / totalAvail : 0;
+
+    // Update utilization signals.
+    provider.utilization = utilization;
+    if (utilization > provider.peakUtilization) {
+      provider.peakUtilization = utilization;
+    }
+    provider.utilizationTimeSteps += utilization;
   }
 
   for (const offer of world.offers.values()) {
     const provider = world.providers.get(offer.providerId);
     if (!provider || provider.status !== "ACTIVE" || !offer.active) continue;
-    const utilization = providerUtilization.get(provider.id) ?? 0;
-    provider.utilization = utilization;
+    // Provider strategies react to the utilization observed DURING this step
+    // (from active reservations that haven't been released yet).
+    const utilization = provider.utilization;
 
     switch (provider.strategy) {
       case "AGGRESSIVE":
@@ -989,6 +1033,8 @@ function collectMetrics(world: SimWorld): SimMetrics {
     avgProviderEarnings: Math.round(avgEarnings * 100) / 100,
     medianProviderEarnings: providerEcons.length > 0 ? Math.round(providerEcons[Math.floor(providerEcons.length / 2)].netEarnings * 100) / 100 : 0,
     avgUtilization: activeProviders.length > 0 ? Math.round((activeProviders.reduce((s, p) => s + p.utilization, 0) / activeProviders.length) * 10000) / 100 : 0,
+    peakUtilization: activeProviders.length > 0 ? Math.round(Math.max(...activeProviders.map(p => p.peakUtilization)) * 10000) / 100 : 0,
+    avgTimeWeightedUtilization: activeProviders.length > 0 ? Math.round((activeProviders.reduce((s, p) => s + (p.utilizationTimeSteps / Math.max(1, world.step - p.entryStep)), 0) / activeProviders.length) * 10000) / 100 : 0,
     totalProviderVolume: Math.round(world.totalVolume * 100) / 100,
     totalProtocolRevenue: Math.round(world.totalFees * 100) / 100,
     totalIncentiveSpend: Math.round(world.totalIncentives * 100) / 100,
