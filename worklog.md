@@ -707,3 +707,26 @@ Stage Summary:
 - The dRamp Network Simulator is live. It can answer: How much liquidity is required before dRamp becomes competitive? How much can a provider earn per unit of deployed liquidity? Does reputation create a useful flywheel? Is patient execution economically valuable? Can incentives bootstrap adoption? How resilient is the network to provider exit? Does the network converge toward a positive equilibrium?
 - 9 preset experiments available: Provider Growth (5→50), Largest Provider Exit, Stablecoin Incentive Bootstrap, Volatile Settlement Asset, Patient Execution Comparison, Liquidity Shock (50%), Demand Surge (5×), No Incentives (Baseline), Reputation Disabled.
 - The simulator reuses the production routing/risk/scoring logic patterns (same weight functions, same risk dimensions) without duplicating the domain services — it's an analytical layer, not a parallel engine.
+
+---
+Task ID: P4.1-Faithful
+Agent: main (Z.ai Code)
+Task: Make the network simulator economically faithful by sharing production logic. No second routing engine. Volatile assets can participate. Patient execution genuinely simulated. Provider economics include real costs. Equilibrium uses economic thresholds.
+
+Work Log:
+- Extracted shared pure economics (src/lib/economics/shared.ts): 12 dependency-free functions used by BOTH production and simulation. Includes weightFor, settlementAssetRisk, risk ceilings, isCollateralEligible, calculateAbsoluteRouteQuality, computeRouteReputation, computeRouteCommitment, shouldReplaceRoute, calculateReputation (7 components), deriveTier, calculateProviderEconomics (gross - costs - capital - expected loss = net; risk-adjusted return), detectEquilibrium (economic thresholds).
+- Built faithful simulator (engine-faithful.ts): route discovery includes ALL settlement assets (volatile tokens CAN participate, risk ceiling determines eligibility). Route scoring uses shared calculateAbsoluteRouteQuality. Hard risk constraints applied per user tolerance. Patient execution uses shouldReplaceRoute with ROUTE_REPLACEMENT_THRESHOLD. Reputation uses shared calculateReputation. Provider exit based on negative risk-adjusted return. Equilibrium uses shared detectEquilibrium.
+- Removed volatile-token exclusion from multi-hop routing.
+- Patient execution: WAIT_FOR_BETTER sets reference route, re-evaluates each step, replaces only when shouldReplaceRoute returns true, times out to execute reference.
+- Provider economics: calculateProviderEconomics computes gross earnings minus settlement costs (1bps), operating costs (2bps), capital cost (5% annual), expected loss (10bps), penalties, slashing = net earnings. Risk-adjusted return = net / deployed capital (annualized).
+- Equilibrium: detectEquilibrium checks median risk-adjusted return > 0, route coverage >= 70%, user cost < 80% of baseline, HHI < 0.5, not incentive-dependent, stable returns. POSITIVE/FRAGILE/NEGATIVE/FORMING with explicit reasons.
+- Tests: tests/p4-faithful.test.ts (19 assertions) — seed reproducibility, provider growth lowers cost, volatile assets can participate, volatile never collateral, risk tolerance affects routing, patient execution different outcomes, incentives increase volume, provider exit on negative returns, equilibrium economic thresholds, liquidity shock.
+- All existing tests pass (collateral 23, P4 simulator 21). Lint + type-check clean.
+- Pushed to GitHub (commit 784b7cd).
+
+Stage Summary:
+- The simulator is now economically faithful: it uses the SAME pure economic functions as production (shared.ts). Route eligibility, scoring, risk, reputation, provider economics, and equilibrium detection are all shared — no second economic engine.
+- Volatile settlement assets (WETH) can participate in multi-hop routes. The risk ceiling (0.25 for MAX_RELIABILITY, 0.50 for BALANCED, 0.80 for LOWEST_COST) determines eligibility. WETH at ~0.65 risk passes LOWEST_COST but fails MAX_RELIABILITY.
+- Patient execution is genuinely simulated: WAIT_FOR_BETTER intents set a reference route, re-evaluate each step using shouldReplaceRoute with the same ROUTE_REPLACEMENT_THRESHOLD as production, and only execute when improvement exceeds the threshold or max wait is reached.
+- Provider economics include real modeled costs: settlement costs, operating costs, capital opportunity cost (5% annual), expected loss (10bps), penalties, slashing. Net earnings and risk-adjusted return are calculated using the same function as production.
+- Equilibrium detection uses explicit economic thresholds: positive risk-adjusted returns, sufficient route coverage, competitive user cost vs baseline, low market concentration, incentive independence, and stability over a rolling window.
