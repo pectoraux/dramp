@@ -148,18 +148,33 @@ export function deriveDemandCorridors(users: SimUser[]): Array<[string, string, 
     .map(c => [c.srcAsset, c.srcCountry, c.dstAsset, c.dstCountry] as [string, string, string, string]);
 }
 
-// ---- Generate immutable canonical provider specs (per-seed) ----
-export function generateCanonicalSpecs(
-  seed: number, count: number, topology: TopologyMode,
-  settlementAssets: Map<string, SimSettlementAsset>,
-  demandDerivedCorridors: Array<[string, string, string, string]>,
-): ProviderSpec[] {
+// ---- Generate immutable provider ECONOMICS (shared across topologies) ----
+// Provider type, strategy, collateral, reliability, etc. are generated ONCE
+// per seed and are IDENTICAL across all topology treatments.
+// Only the corridor/offer assignment differs by topology.
+interface ProviderEconomics {
+  id: string;
+  name: string;
+  providerType: string;
+  trustModel: string;
+  strategy: string;
+  collateral: number;
+  usableCollateral: number;
+  maxExposure: number;
+  reliabilityProfile: SettlementReliabilityProfile;
+  // Pricing parameters shared across topology treatments.
+  feeBps: number;
+  rate: number;
+  capacity: number;
+  expectedExecutionSeconds: number;
+}
+
+function generateProviderEconomics(seed: number, count: number, settlementAssets: Map<string, SimSettlementAsset>): ProviderEconomics[] {
   const rng = new SeededRNG(seed);
-  const specs: ProviderSpec[] = [];
+  const economics: ProviderEconomics[] = [];
   const stableAssetList = [...settlementAssets.values()].filter(a => a.isEligibleCollateral);
 
   for (let i = 0; i < count; i++) {
-    const providerId = `prov_${i}`;
     const providerType = rng.pick(PROVIDER_TYPES);
     const strategy = rng.pick(STRATEGIES);
     const trustModel = rng.pick(TRUST_MODELS);
@@ -178,6 +193,31 @@ export function generateCanonicalSpecs(
       failureRate: Math.max(0, baseProfile.failureRate - variation * 0.2),
     };
 
+    economics.push({
+      id: `prov_${i}`, name, providerType, trustModel, strategy,
+      collateral, usableCollateral, maxExposure, reliabilityProfile,
+      feeBps: rng.int(5, 35), rate: rng.float(0.8, 1.2),
+      capacity: rng.float(5000, 50000), expectedExecutionSeconds: rng.int(10, 120),
+    });
+  }
+  return economics;
+}
+
+// ---- Assign topology-specific corridors to shared provider economics ----
+export function generateCanonicalSpecs(
+  seed: number, count: number, topology: TopologyMode,
+  settlementAssets: Map<string, SimSettlementAsset>,
+  demandDerivedCorridors: Array<[string, string, string, string]>,
+): ProviderSpec[] {
+  // Generate shared economics ONCE (identical across topologies for same seed).
+  const economics = generateProviderEconomics(seed, count, settlementAssets);
+  // Use a SEPARATE RNG for topology-specific corridor assignment.
+  const rng = new SeededRNG(seed + 77777);
+  const specs: ProviderSpec[] = [];
+  const stableAssetList = [...settlementAssets.values()].filter(a => a.isEligibleCollateral);
+
+  for (let i = 0; i < count; i++) {
+    const econ = economics[i];
     const corridors: string[] = [];
     const offerSpecs: ProviderSpec["offerSpecs"] = [];
 
@@ -194,10 +234,8 @@ export function generateCanonicalSpecs(
         offerSpecs.push({
           sourceAsset: ASSETS[srcIdx], destinationAsset: ASSETS[dstIdx],
           sourceCountry: COUNTRIES[srcIdx], destinationCountry: COUNTRIES[dstIdx],
-          rate: rng.float(0.8, 1.2), feeBps: rng.int(5, 35),
-          settlementAssetId: settlementAsset.id,
-          availableCapacity: rng.float(5000, 50000),
-          expectedExecutionSeconds: rng.int(10, 120),
+          rate: econ.rate, feeBps: econ.feeBps, settlementAssetId: settlementAsset.id,
+          availableCapacity: econ.capacity, expectedExecutionSeconds: econ.expectedExecutionSeconds,
         });
       }
     } else if (topology === "CORRIDOR_FOCUSED") {
@@ -209,10 +247,8 @@ export function generateCanonicalSpecs(
         offerSpecs.push({
           sourceAsset: corridor[0], destinationAsset: corridor[2],
           sourceCountry: corridor[1], destinationCountry: corridor[3],
-          rate: rng.float(0.8, 1.2), feeBps: rng.int(5, 35),
-          settlementAssetId: settlementAsset.id,
-          availableCapacity: rng.float(5000, 50000),
-          expectedExecutionSeconds: rng.int(10, 120),
+          rate: econ.rate, feeBps: econ.feeBps, settlementAssetId: settlementAsset.id,
+          availableCapacity: econ.capacity, expectedExecutionSeconds: econ.expectedExecutionSeconds,
         });
       }
     } else if (topology === "BRIDGED") {
@@ -224,10 +260,8 @@ export function generateCanonicalSpecs(
         offerSpecs.push({
           sourceAsset: corridor[0], destinationAsset: corridor[2],
           sourceCountry: corridor[1], destinationCountry: corridor[3],
-          rate: rng.float(0.8, 1.2), feeBps: rng.int(5, 35),
-          settlementAssetId: settlementAsset.id,
-          availableCapacity: rng.float(5000, 50000),
-          expectedExecutionSeconds: rng.int(10, 120),
+          rate: econ.rate, feeBps: econ.feeBps, settlementAssetId: settlementAsset.id,
+          availableCapacity: econ.capacity, expectedExecutionSeconds: econ.expectedExecutionSeconds,
         });
       } else {
         const sa = rng.pick(stableAssetList);
@@ -236,31 +270,32 @@ export function generateCanonicalSpecs(
         const fiatCountry = COUNTRIES[fiatIdx];
         if (rng.chance(0.5)) {
           corridors.push(`${fiatAsset}:${fiatCountry}:${sa.symbol}:GLOBAL`);
-          offerSpecs.push({ sourceAsset: fiatAsset, destinationAsset: sa.symbol, sourceCountry: fiatCountry, destinationCountry: "GLOBAL", rate: 1.0, feeBps: rng.int(3, 10), settlementAssetId: sa.id, availableCapacity: rng.float(5000, 50000), expectedExecutionSeconds: rng.int(10, 120) });
+          offerSpecs.push({ sourceAsset: fiatAsset, destinationAsset: sa.symbol, sourceCountry: fiatCountry, destinationCountry: "GLOBAL", rate: 1.0, feeBps: rng.int(3, 10), settlementAssetId: sa.id, availableCapacity: econ.capacity, expectedExecutionSeconds: econ.expectedExecutionSeconds });
         } else {
           corridors.push(`${sa.symbol}:GLOBAL:${fiatAsset}:${fiatCountry}`);
-          offerSpecs.push({ sourceAsset: sa.symbol, destinationAsset: fiatAsset, sourceCountry: "GLOBAL", destinationCountry: fiatCountry, rate: 1.0, feeBps: rng.int(3, 10), settlementAssetId: sa.id, availableCapacity: rng.float(5000, 50000), expectedExecutionSeconds: rng.int(10, 120) });
+          offerSpecs.push({ sourceAsset: sa.symbol, destinationAsset: fiatAsset, sourceCountry: "GLOBAL", destinationCountry: fiatCountry, rate: 1.0, feeBps: rng.int(3, 10), settlementAssetId: sa.id, availableCapacity: econ.capacity, expectedExecutionSeconds: econ.expectedExecutionSeconds });
         }
       }
     }
 
-    // Build liquidity from corridors (immutable template).
+    // Build liquidity from corridors (same formula across topologies).
     const liquidityBalances = new Map<string, number>();
     const treasuryBalances = new Map<string, number>();
     for (const corridor of corridors) {
       const parts = corridor.split(":");
       if (parts.length < 4) continue;
       const srcAsset = parts[0], dstAsset = parts[2];
-      liquidityBalances.set(srcAsset, (liquidityBalances.get(srcAsset) ?? 0) + collateral * rng.float(0.2, 0.6));
-      liquidityBalances.set(dstAsset, (liquidityBalances.get(dstAsset) ?? 0) + collateral * rng.float(0.05, 0.25));
-      treasuryBalances.set(srcAsset, (treasuryBalances.get(srcAsset) ?? 0) + collateral * rng.float(0.4, 1.2));
-      treasuryBalances.set(dstAsset, (treasuryBalances.get(dstAsset) ?? 0) + collateral * rng.float(0.1, 0.5));
+      liquidityBalances.set(srcAsset, (liquidityBalances.get(srcAsset) ?? 0) + econ.collateral * 0.4);
+      liquidityBalances.set(dstAsset, (liquidityBalances.get(dstAsset) ?? 0) + econ.collateral * 0.15);
+      treasuryBalances.set(srcAsset, (treasuryBalances.get(srcAsset) ?? 0) + econ.collateral * 0.8);
+      treasuryBalances.set(dstAsset, (treasuryBalances.get(dstAsset) ?? 0) + econ.collateral * 0.3);
     }
 
     specs.push({
-      id: providerId, name, providerType, trustModel, strategy,
-      collateral, usableCollateral, maxExposure, corridors,
-      reliabilityProfile, liquidityBalances, treasuryBalances, offerSpecs,
+      id: econ.id, name: econ.name, providerType: econ.providerType, trustModel: econ.trustModel,
+      strategy: econ.strategy, collateral: econ.collateral, usableCollateral: econ.usableCollateral,
+      maxExposure: econ.maxExposure, corridors, reliabilityProfile: econ.reliabilityProfile,
+      liquidityBalances, treasuryBalances, offerSpecs,
     });
   }
   return specs;
@@ -306,9 +341,13 @@ function buildWorld(
 
 // ---- Metrics ----
 interface RunMetrics {
-  executionAttemptRate: number;   // % reaching COMPLETED/EXECUTING/FAILED
-  reachableDemandPct: number;     // amount-weighted demand with ≥1 topological path
-  reachablePairs: number;
+  executionAttemptRate: number;
+  // Three reachability levels.
+  assetReachablePct: number;      // Does an abstract asset path exist? (ignores countries)
+  corridorReachablePct: number;   // Does a path exist matching asset AND country?
+  executableReachablePct: number; // Does a path exist with capacity, liquidity, risk?
+  assetReachablePairs: number;
+  corridorReachablePairs: number;
   totalDemandPairs: number;
   completionRate: number;
   abandonmentRate: number;
@@ -376,48 +415,111 @@ function extractMetrics(world: any): RunMetrics {
   const multiHopCount = world.settlementTransfers.filter((t: any) => t.status === "COMPLETED").length;
   const multiHopPercentage = completed.length > 0 ? (multiHopCount / completed.length) * 100 : 0;
 
-  // Graph reachability: topological path existence (ignoring liquidity/capacity).
+  // ---- Three-level reachability ----
+  // 1. ASSET reachability: does an abstract asset path exist? (ignores countries)
+  // 2. CORRIDOR reachability: does a path exist matching asset AND country?
+  // 3. EXECUTABLE reachability: does a path exist with capacity, liquidity, risk?
   const settlementAssetSymbols = new Set([...world.assets.values()].map((a: any) => a.symbol));
-  const demandedPairs = new Set<string>();
-  const demandByPair = new Map<string, number>(); // pair → total demand volume
+  const activeOffers = [...world.offers.values()].filter((o: any) => o.active);
+
+  // Demanded corridors: (srcAsset, srcCountry) → (dstAsset, dstCountry)
+  const demandedCorridors = new Map<string, number>(); // key → demand weight
   for (const u of world.users.values()) {
-    const pair = `${u.sourceAsset}→${u.destinationAsset}`;
-    demandedPairs.add(pair);
-    demandByPair.set(pair, (demandByPair.get(pair) ?? 0) + u.typicalAmount * u.frequency);
+    const key = `${u.sourceAsset}:${u.sourceCountry}→${u.destinationAsset}:${u.destinationCountry}`;
+    demandedCorridors.set(key, (demandedCorridors.get(key) ?? 0) + u.typicalAmount * u.frequency);
   }
+  const totalDemandPairs = demandedCorridors.size;
+  const totalDemandWeight = [...demandedCorridors.values()].reduce((s, v) => s + v, 0);
 
-  let reachablePairs = 0;
-  let reachableDemandVolume = 0;
+  let assetReachablePairs = 0;
+  let corridorReachablePairs = 0;
+  let executableReachablePairs = 0;
+  let assetReachableVolume = 0;
+  let corridorReachableVolume = 0;
+  let executableReachableVolume = 0;
   let corridorsWithMultipleRoutes = 0;
-  const totalDemandPairs = demandedPairs.size;
 
-  for (const pair of demandedPairs) {
-    const [src, dst] = pair.split("→");
-    const directOffers = [...world.offers.values()].filter((o: any) => o.active && o.sourceAsset === src && o.destinationAsset === dst);
-    let reachable = false;
+  for (const [corridorKey, weight] of demandedCorridors) {
+    const [srcPart, dstPart] = corridorKey.split("→");
+    const [srcAsset, srcCountry] = srcPart.split(":");
+    const [dstAsset, dstCountry] = dstPart.split(":");
+
+    // 1. ASSET reachability (ignores countries).
+    let assetReachable = false;
     let routeCount = 0;
-
-    if (directOffers.length > 0) { reachable = true; routeCount += directOffers.length; }
-
-    // Multi-hop via settlement assets.
+    const directAsset = activeOffers.filter(o => o.sourceAsset === srcAsset && o.destinationAsset === dstAsset);
+    if (directAsset.length > 0) { assetReachable = true; routeCount += directAsset.length; }
     for (const sa of settlementAssetSymbols) {
-      const hop1 = [...world.offers.values()].filter((o: any) => o.active && o.sourceAsset === src && o.destinationAsset === sa);
-      const hop2 = [...world.offers.values()].filter((o: any) => o.active && o.sourceAsset === sa && o.destinationAsset === dst);
+      const hop1 = activeOffers.filter(o => o.sourceAsset === srcAsset && o.destinationAsset === sa);
+      const hop2 = activeOffers.filter(o => o.sourceAsset === sa && o.destinationAsset === dstAsset);
+      if (hop1.length > 0 && hop2.length > 0) { assetReachable = true; routeCount += Math.min(hop1.length, hop2.length); }
+    }
+    if (assetReachable) { assetReachablePairs++; assetReachableVolume += weight; }
+
+    // 2. CORRIDOR reachability (matches asset AND country).
+    let corridorReachable = false;
+    let corridorRouteCount = 0;
+    const directCorridor = activeOffers.filter(o =>
+      o.sourceAsset === srcAsset && o.sourceCountry === srcCountry &&
+      o.destinationAsset === dstAsset && o.destinationCountry === dstCountry);
+    if (directCorridor.length > 0) { corridorReachable = true; corridorRouteCount += directCorridor.length; }
+    // Multi-hop: src/fiat → settlement/GLOBAL → dst/fiat
+    for (const sa of settlementAssetSymbols) {
+      const hop1 = activeOffers.filter(o =>
+        o.sourceAsset === srcAsset && o.sourceCountry === srcCountry &&
+        o.destinationAsset === sa && o.destinationCountry === "GLOBAL");
+      const hop2 = activeOffers.filter(o =>
+        o.sourceAsset === sa && o.sourceCountry === "GLOBAL" &&
+        o.destinationAsset === dstAsset && o.destinationCountry === dstCountry);
       if (hop1.length > 0 && hop2.length > 0) {
-        reachable = true;
-        routeCount += Math.min(hop1.length, hop2.length);
+        corridorReachable = true;
+        corridorRouteCount += Math.min(hop1.length, hop2.length);
       }
     }
+    if (corridorReachable) { corridorReachablePairs++; corridorReachableVolume += weight; }
+    if (corridorRouteCount >= 2) corridorsWithMultipleRoutes++;
 
-    if (reachable) {
-      reachablePairs++;
-      reachableDemandVolume += demandByPair.get(pair) ?? 0;
-      if (routeCount >= 2) corridorsWithMultipleRoutes++;
+    // 3. EXECUTABLE reachability (has capacity, liquidity, risk constraints).
+    // Check if at least one offer in a reachable route has:
+    // - sufficient capacity (availableCapacity >= some threshold, say 100)
+    // - provider has destination liquidity
+    let executableReachable = false;
+    // Direct executable.
+    for (const o of directCorridor) {
+      if (o.availableCapacity >= 100) {
+        const provider = world.providers.get(o.providerId);
+        if (provider && (provider.liquidity.balances.get(dstAsset) ?? 0) >= 100) {
+          executableReachable = true; break;
+        }
+      }
     }
+    // Multi-hop executable.
+    if (!executableReachable) {
+      for (const sa of settlementAssetSymbols) {
+        const hop1 = activeOffers.filter(o =>
+          o.sourceAsset === srcAsset && o.sourceCountry === srcCountry &&
+          o.destinationAsset === sa && o.destinationCountry === "GLOBAL" && o.availableCapacity >= 100);
+        const hop2 = activeOffers.filter(o =>
+          o.sourceAsset === sa && o.sourceCountry === "GLOBAL" &&
+          o.destinationAsset === dstAsset && o.destinationCountry === dstCountry && o.availableCapacity >= 100);
+        if (hop1.length > 0 && hop2.length > 0) {
+          // Check liquidity for hop2's provider.
+          for (const o2 of hop2) {
+            const provider = world.providers.get(o2.providerId);
+            if (provider && (provider.liquidity.balances.get(dstAsset) ?? 0) >= 100) {
+              executableReachable = true; break;
+            }
+          }
+          if (executableReachable) break;
+        }
+      }
+    }
+    if (executableReachable) { executableReachablePairs++; executableReachableVolume += weight; }
   }
 
-  const totalDemandWeight = [...demandByPair.values()].reduce((s, v) => s + v, 0);
-  const reachableDemandPct = totalDemandWeight > 0 ? (reachableDemandVolume / totalDemandWeight) * 100 : 0;
+  const assetReachablePct = totalDemandWeight > 0 ? (assetReachableVolume / totalDemandWeight) * 100 : 0;
+  const corridorReachablePct = totalDemandWeight > 0 ? (corridorReachableVolume / totalDemandWeight) * 100 : 0;
+  const executableReachablePct = totalDemandWeight > 0 ? (executableReachableVolume / totalDemandWeight) * 100 : 0;
 
   const corridorOfferCounts = new Map<string, number>();
   for (const o of world.offers.values()) {
@@ -432,8 +534,11 @@ function extractMetrics(world: any): RunMetrics {
 
   return {
     executionAttemptRate: intents.length > 0 ? (intents.filter((i: any) => i.status === "COMPLETED" || i.status === "EXECUTING" || i.status === "FAILED").length / intents.length) * 100 : 0,
-    reachableDemandPct: Math.round(reachableDemandPct * 100) / 100,
-    reachablePairs,
+    assetReachablePct: Math.round(assetReachablePct * 100) / 100,
+    corridorReachablePct: Math.round(corridorReachablePct * 100) / 100,
+    executableReachablePct: Math.round(executableReachablePct * 100) / 100,
+    assetReachablePairs,
+    corridorReachablePairs,
     totalDemandPairs,
     completionRate: intents.length > 0 ? (completed.length / intents.length) * 100 : 0,
     abandonmentRate: intents.length > 0 ? (abandoned.length / intents.length) * 100 : 0,
@@ -537,17 +642,15 @@ function printResults(results: Result[]) {
   console.log("║  Controls: no entry/exit, no incentives, no shocks              ║");
   console.log("╚══════════════════════════════════════════════════════════════════╝");
 
-  // Table A: Reachable demand % (topological graph coverage)
-  console.log("\n### Table A — Reachable Demand % (Topological Graph Coverage)\n");
-  console.log("| Providers | RANDOM | CORRIDOR_FOCUSED | BRIDGED |");
-  console.log("| --- | --- | --- | --- |");
-  for (const density of PROVIDER_COUNTS) {
-    const row = [`| ${density} |`];
-    for (const topo of TOPOLOGIES) {
-      const r = results.find(r => r.density === density && r.topology === topo);
-      row.push(` ${statsLabel(r ? r.metrics.map(m => m.reachableDemandPct) : [])} |`);
-    }
-    console.log(row.join(""));
+  // Table A: Three-level reachability
+  console.log("\n### Table A — Reachable Demand % (Asset / Corridor / Executable)\n");
+  console.log("| Providers | Topology | Asset reach % | Corridor reach % | Executable reach % |");
+  console.log("| --- | --- | --- | --- | --- |");
+  for (const r of results) {
+    const ar = r.metrics.map(m => m.assetReachablePct);
+    const cr = r.metrics.map(m => m.corridorReachablePct);
+    const er = r.metrics.map(m => m.executableReachablePct);
+    console.log(`| ${r.density} | ${r.topology} | ${statsLabel(ar)} | ${statsLabel(cr)} | ${statsLabel(er)} |`);
   }
 
   // Table B: Completion / Effective cost sensitivity
@@ -573,12 +676,12 @@ function printResults(results: Result[]) {
     console.log(`| ${r.density} | ${r.topology} | ${statsLabel(au)} | ${statsLabel(mp)} | ${statsLabel(mh)} |`);
   }
 
-  // Table D: Graph connectivity
-  console.log("\n### Table D — Graph Connectivity\n");
-  console.log("| Providers | Topology | Reachable pairs | Total demand pairs | Multiple routes |");
+  // Table D: Graph connectivity (corridor-level)
+  console.log("\n### Table D — Graph Connectivity (Corridor-Level)\n");
+  console.log("| Providers | Topology | Corridor reachable pairs | Total demand pairs | Multiple routes |");
   console.log("| --- | --- | --- | --- | --- |");
   for (const r of results) {
-    const rp = r.metrics.map(m => m.reachablePairs);
+    const rp = r.metrics.map(m => m.corridorReachablePairs);
     const tp = r.metrics.map(m => m.totalDemandPairs);
     const mr = r.metrics.map(m => m.corridorsWithMultipleRoutes);
     console.log(`| ${r.density} | ${r.topology} | ${statsLabel(rp)} | ${statsLabel(tp)} | ${statsLabel(mr)} |`);
@@ -589,11 +692,13 @@ function printResults(results: Result[]) {
   for (const topo of TOPOLOGIES) {
     const r100 = results.find(r => r.density === 100 && r.topology === topo);
     if (r100) {
-      const medReach = percentile(r100.metrics.map(m => m.reachableDemandPct), 0.5);
+      const medAsset = percentile(r100.metrics.map(m => m.assetReachablePct), 0.5);
+      const medCorridor = percentile(r100.metrics.map(m => m.corridorReachablePct), 0.5);
+      const medExec = percentile(r100.metrics.map(m => m.executableReachablePct), 0.5);
       const medComp = percentile(r100.metrics.map(m => m.completionRate), 0.5);
       const medEff300 = percentile(r100.metrics.map(m => m.effectiveCost300Bps), 0.5);
       const medMultiHop = percentile(r100.metrics.map(m => m.multiHopPercentage), 0.5);
-      console.log(`  ${topo} @ 100 providers: reachable=${medReach.toFixed(1)}%, completion=${medComp.toFixed(1)}%, eff cost(300bps)=${medEff300.toFixed(1)} bps, multi-hop=${medMultiHop.toFixed(1)}%`);
+      console.log(`  ${topo} @ 100: asset_reach=${medAsset.toFixed(1)}%, corridor_reach=${medCorridor.toFixed(1)}%, exec_reach=${medExec.toFixed(1)}%, completion=${medComp.toFixed(1)}%, eff(300)=${medEff300.toFixed(1)}bps, multi-hop=${medMultiHop.toFixed(1)}%`);
     }
   }
 }
