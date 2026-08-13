@@ -140,11 +140,11 @@ function processInFlightExecutions(world: SimWorld, rng: SeededRNG): void {
         leg.status = "EXECUTING";
         leg.startStep = world.step;
         leg.completionStep = world.step + durationSteps;
-        // Reserve capacity for this leg.
+        // Reserve capacity for this leg (do NOT increment version — version
+        // tracks economic changes, not reservations. Production separates these).
         const offer = world.offers.get(leg.offerId);
         if (offer) {
           offer.reservedCapacity += leg.reservation.amount;
-          offer.version++;
         }
         const p = world.providers.get(leg.providerId);
         if (p) {
@@ -184,10 +184,17 @@ function processInFlightExecutions(world: SimWorld, rng: SeededRNG): void {
 }
 
 // Settle a single leg: consume liquidity, credit provider, release reservation.
-// For the FIRST leg (external input): source balance increases (user pays in).
-// For the LAST leg (external output): destination balance decreases (payout).
-// For intermediate legs: the settlement asset is debited from this provider
-// and credited to the next provider via createSettlementTransfer.
+//
+// CONSERVATION RULES (Prompt 4.7.1 — fixes double-credit bug):
+//   - First leg (legIndex === 0): EXTERNAL source inflow. Credit sourceAsset
+//     (user pays in from outside the network). Debit destinationAsset.
+//   - Intermediate/last leg (legIndex > 0): sourceAsset was ALREADY credited
+//     by createSettlementTransfer() when the upstream leg settled. Do NOT
+//     credit it again. Only debit destinationAsset (payout to next provider
+//     or external recipient).
+//
+// This ensures: for USD→USDC→EUR, Provider A's USDC debit == Provider B's USDC
+// credit (via the transfer), with no double-counting.
 function settleLeg(world: SimWorld, exec: SimInFlightExecution, legIndex: number): void {
   const leg = exec.legs[legIndex];
   const p = world.providers.get(leg.providerId);
@@ -212,15 +219,16 @@ function settleLeg(world: SimWorld, exec: SimInFlightExecution, legIndex: number
 
   // Consume liquidity CONSERVINGLY:
   if (world.config.enableLiquidityInventory) {
-    // Source balance increases (provider receives the source asset).
-    // For the first leg, this is external user input (boundary flow).
-    // For intermediate legs, this is the settlement asset received from the
-    // upstream provider via the transfer (credited in createSettlementTransfer).
-    // For the last leg, the source asset IS the settlement asset from upstream.
-    const srcBalance = p.liquidity.balances.get(leg.sourceAsset) ?? 0;
-    p.liquidity.balances.set(leg.sourceAsset, srcBalance + leg.amount);
+    // Source balance: ONLY credit for the first leg (external boundary inflow).
+    // For intermediate/last legs, the source asset was already credited by
+    // createSettlementTransfer() — crediting again would double-count.
+    if (legIndex === 0) {
+      const srcBalance = p.liquidity.balances.get(leg.sourceAsset) ?? 0;
+      p.liquidity.balances.set(leg.sourceAsset, srcBalance + leg.amount);
+    }
+    // legIndex > 0: sourceAsset already credited by upstream transfer — do nothing.
 
-    // Destination balance decreases (provider pays out the destination asset).
+    // Destination balance: ALWAYS decreases (provider pays out).
     // For the last leg, this is the external payout (boundary flow).
     // For intermediate legs, this is the settlement asset paid to the next
     // provider — debited here, credited to the next provider in createSettlementTransfer.
@@ -311,16 +319,24 @@ function createSettlementTransfer(world: SimWorld, exec: SimInFlightExecution, f
   world.settlementTransfers.push(transfer);
 }
 
-// Fail an execution: an upstream leg failed, so downstream legs can't settle.
-// Release all remaining reservations and mark intent FAILED.
+// Fail an execution: a leg failed. Release all remaining reservations, mark
+// intent FAILED, and REVERSE any outstanding internal transfers from upstream
+// legs that already settled (so settlement assets aren't stranded).
+//
+// Recovery rule (Prompt 4.7.1): if leg N failed but leg N-1 already settled
+// and transferred a settlement asset to leg N's provider, that transfer must
+// be reversed — the settlement asset returns to the upstream provider.
 function failExecution(world: SimWorld, exec: SimInFlightExecution): void {
   const intent = world.intents.find(i => i.id === exec.intentId);
   if (!intent) return;
   intent.status = "FAILED";
   intent.failureReason = "upstream settlement failure (dependency chain)";
-  // Release all reservations for legs that were EXECUTING or PENDING.
-  for (const leg of exec.legs) {
+
+  // Find the failed leg and reverse any transfers from upstream settled legs.
+  for (let i = 0; i < exec.legs.length; i++) {
+    const leg = exec.legs[i];
     if (leg.status === "EXECUTING" || leg.status === "PENDING") {
+      // This leg failed or was cancelled. Release its reservation.
       const offer = world.offers.get(leg.offerId);
       if (offer) {
         offer.reservedCapacity = Math.max(0, offer.reservedCapacity - leg.reservation.amount);
@@ -331,6 +347,39 @@ function failExecution(world: SimWorld, exec: SimInFlightExecution): void {
         p.executionsFailed++;
       }
       leg.status = "FAILED";
+
+      // If this leg had an upstream leg that already settled and transferred
+      // a settlement asset to this provider, REVERSE that transfer: return
+      // the settlement asset to the upstream provider.
+      if (i > 0 && exec.legs[i - 1].status === "SETTLED" && world.config.enableLiquidityInventory) {
+        const upstreamLeg = exec.legs[i - 1];
+        const settlementAsset = upstreamLeg.destinationAsset; // == leg.sourceAsset
+        const transferAmount = upstreamLeg.payoutAmount;
+        // Reverse: debit this provider (who received it), credit upstream (who paid it).
+        const thisProvider = world.providers.get(leg.providerId);
+        const upstreamProvider = world.providers.get(upstreamLeg.providerId);
+        if (thisProvider && upstreamProvider) {
+          const thisBalance = thisProvider.liquidity.balances.get(settlementAsset) ?? 0;
+          const upstreamBalance = upstreamProvider.liquidity.balances.get(settlementAsset) ?? 0;
+          // Only reverse what's available (don't go negative).
+          const reversal = Math.min(transferAmount, thisBalance);
+          thisProvider.liquidity.balances.set(settlementAsset, thisBalance - reversal);
+          upstreamProvider.liquidity.balances.set(settlementAsset, upstreamBalance + reversal);
+          // Record the reversal as a FAILED transfer.
+          world.settlementTransfers.push({
+            id: `transfer_reversal_${++reservationCounter}`,
+            executionId: exec.id,
+            fromProviderId: leg.providerId,       // reversed: this provider returns it
+            toProviderId: upstreamLeg.providerId,  // to the upstream provider
+            asset: settlementAsset,
+            amount: reversal,
+            fromLegIndex: i,
+            toLegIndex: i - 1,
+            settlementStep: world.step,
+            status: "FAILED",
+          });
+        }
+      }
     }
   }
 }
@@ -903,10 +952,10 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
     reservations.push({ offer, amount: leg.amount, durationSteps });
   }
 
-  // Reserve capacity on all legs (increment reservedCapacity immediately).
+  // Reserve capacity on all legs (do NOT increment version — reservations
+  // are not economic changes. Version tracks fee/rate/capacity offer edits).
   for (const r of reservations) {
     r.offer.reservedCapacity += r.amount;
-    r.offer.version++;
   }
 
   // ---- Step 2: Execution failure model (counterparty risk-based) ----
