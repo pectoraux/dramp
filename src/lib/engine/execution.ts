@@ -398,9 +398,37 @@ export async function reserveRoute(executionId: string) {
         }
       }
 
-      // ---- STEP 2: All legs validated — freeze committed terms from live offer ----
-      // The snapshot is now refreshed to the live offer's current values.
-      // This is redundant if nothing changed, but it's the authoritative freeze point.
+      // ---- STEP 2: Atomic compare-and-swap on every offer version ----
+      // This is the REAL concurrency guard. Even if another transaction
+      // updates the offer after our validation read in STEP 1, this
+      // conditional update will fail (0 rows affected) and the entire
+      // transaction rolls back. The version increment serves as the
+      // compare-and-swap boundary — it proves no other transaction modified
+      // the offer between our read and this write.
+      //
+      // NOTE: We increment the version here as a concurrency lock, not as an
+      // economic change. The committed snapshot keeps the OBSERVED version
+      // (snapshotOfferVersion), not the incremented one. Future provider
+      // updates will see version N+1 and can increment to N+2, etc.
+      for (const leg of route.legs) {
+        const observedVersion = leg.snapshotOfferVersion!;
+        const casResult = await tx.liquidityOffer.updateMany({
+          where: { id: leg.offerId, version: observedVersion },
+          data: { version: { increment: 1 } },
+        });
+        if (casResult.count !== 1) {
+          // Another transaction modified the offer between our read and this CAS.
+          const currentOffer = await tx.liquidityOffer.findUnique({ where: { id: leg.offerId }, select: { version: true } });
+          throw new StaleRouteError(
+            `Leg ${leg.id}: offer version compare-and-swap failed — expected ${observedVersion}, got ${currentOffer?.version ?? "unknown"}`,
+          );
+        }
+      }
+
+      // ---- STEP 3: All legs validated + CAS passed — freeze committed terms ----
+      // The snapshot is now refreshed from the live offer's values (which we
+      // just proved are the same as what we validated, since the CAS succeeded).
+      // snapshotOfferVersion remains the OBSERVED version (not the incremented one).
       for (const leg of route.legs) {
         const offer = leg.offer!;
         await tx.leg.update({
@@ -412,11 +440,12 @@ export async function reserveRoute(executionId: string) {
             snapshotSourceCountry: offer.sourceCountry,
             snapshotDestinationCountry: offer.destinationCountry,
             snapshotExpectedExecutionSeconds: offer.expectedExecutionSeconds,
+            // snapshotOfferVersion is NOT updated — it stays as the observed version.
           },
         });
       }
 
-      // ---- STEP 3: Reserve capacity, lock collateral, create obligations ----
+      // ---- STEP 4: Reserve capacity, lock collateral, create obligations ----
       const bySequence = new Map<number, typeof route.legs>();
       for (const leg of route.legs) {
         if (!bySequence.has(leg.sequence)) bySequence.set(leg.sequence, []);
@@ -494,7 +523,7 @@ export async function reserveRoute(executionId: string) {
         }
       }
 
-      // ---- STEP 4: Transition to ROUTE_RESERVED ----
+      // ---- STEP 5: Transition to ROUTE_RESERVED ----
       await tx.execution.update({
         where: { id: executionId },
         data: {
@@ -519,7 +548,7 @@ export async function reserveRoute(executionId: string) {
       await appendAuditEvent({
         executionId,
         eventType: "route_stale_rejected",
-        payload: { routeId, reason: err.message },
+        payload: { routeId, reason: err.message, timestamp: new Date().toISOString() },
       });
       return;
     }

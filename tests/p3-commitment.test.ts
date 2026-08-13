@@ -113,7 +113,7 @@ async function main() {
   console.log("\n== A. Stale fee ==");
 
   const execA = await db.execution.create({
-    data: { intentId: testIntent.id, attemptNumber: 1, status: "ROUTE_FOUND", commitmentStatus: "REVERSIBLE", startedAt: new Date(), lastTickAt: new Date() },
+    data: { intentId: testIntent.id, attemptNumber: 1, status: "ROUTE_FOUND", commitmentStatus: "REVERSIBLE", startedAt: new Date(), lastTickAt: new Date(Date.now() + 120000) },
   });
   const routeAId = await createRouteWithSnapshot(execA.id, { feeBps: 30, rate: "0.92", incentiveBps: 10 });
 
@@ -145,7 +145,7 @@ async function main() {
   console.log("\n== B. Stale rate ==");
 
   const execB = await db.execution.create({
-    data: { intentId: testIntent.id, attemptNumber: 2, status: "ROUTE_FOUND", commitmentStatus: "REVERSIBLE", startedAt: new Date(), lastTickAt: new Date() },
+    data: { intentId: testIntent.id, attemptNumber: 2, status: "ROUTE_FOUND", commitmentStatus: "REVERSIBLE", startedAt: new Date(), lastTickAt: new Date(Date.now() + 120000) },
   });
   const routeBId = await createRouteWithSnapshot(execB.id, { feeBps: 30, rate: "0.92", incentiveBps: 10 });
 
@@ -163,7 +163,7 @@ async function main() {
   console.log("\n== C. Stale incentive ==");
 
   const execC = await db.execution.create({
-    data: { intentId: testIntent.id, attemptNumber: 3, status: "ROUTE_FOUND", commitmentStatus: "REVERSIBLE", startedAt: new Date(), lastTickAt: new Date() },
+    data: { intentId: testIntent.id, attemptNumber: 3, status: "ROUTE_FOUND", commitmentStatus: "REVERSIBLE", startedAt: new Date(), lastTickAt: new Date(Date.now() + 120000) },
   });
   await createRouteWithSnapshot(execC.id, { feeBps: 30, rate: "0.92", incentiveBps: 10 });
 
@@ -181,7 +181,7 @@ async function main() {
   console.log("\n== D. Unchanged offer — reservation succeeds ==");
 
   const execD = await db.execution.create({
-    data: { intentId: testIntent.id, attemptNumber: 4, status: "ROUTE_FOUND", commitmentStatus: "REVERSIBLE", startedAt: new Date(), lastTickAt: new Date() },
+    data: { intentId: testIntent.id, attemptNumber: 4, status: "ROUTE_FOUND", commitmentStatus: "REVERSIBLE", startedAt: new Date(), lastTickAt: new Date(Date.now() + 120000) },
   });
   await createRouteWithSnapshot(execD.id, { feeBps: 30, rate: "0.92", incentiveBps: 10 });
 
@@ -223,7 +223,7 @@ async function main() {
 
   // Create a leg WITHOUT snapshot fields (simulating a pre-3.4 route).
   const execF = await db.execution.create({
-    data: { intentId: testIntent.id, attemptNumber: 5, status: "ROUTE_RESERVED", commitmentStatus: "REVERSIBLE", startedAt: new Date(), lastTickAt: new Date() },
+    data: { intentId: testIntent.id, attemptNumber: 5, status: "ROUTE_RESERVED", commitmentStatus: "REVERSIBLE", startedAt: new Date(), lastTickAt: new Date(Date.now() + 120000) },
   });
   const routeF = await db.route.create({
     data: {
