@@ -27,19 +27,13 @@ import {
 } from "./world";
 import { generateNewProvider } from "./generator";
 import {
-  weightFor,
   settlementAssetRisk,
   providerCounterpartyRisk,
   computeRouteRisk,
   assetRiskCeiling,
   counterpartyRiskCeiling,
-  isCollateralEligible,
-  calculateAbsoluteRouteQuality,
-  computeRouteReputation,
-  computeRouteCommitment,
   shouldReplaceRoute,
   rankRoutes,
-  applyHardFilters,
   calculateReputation,
   deriveTier,
   calculateProviderEconomics,
@@ -47,7 +41,6 @@ import {
   decayWeight,
   valueWeight,
   MEANINGFUL_THRESHOLD,
-  ROUTE_REPLACEMENT_THRESHOLD,
   type RouteInfo,
   type RouteLegInfo,
   type RouteScoreContext,
@@ -55,7 +48,6 @@ import {
   type ProviderEconomicsInput,
   type ProviderRiskInfo,
   type SettlementAssetRiskInput,
-  type HardFilterContext,
   type RankedRoute,
 } from "../economics/shared";
 
