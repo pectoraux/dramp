@@ -99,10 +99,12 @@ function generateProvider(
   const provider: SimProvider = {
     id: nextId("prov"), name, providerType, trustModel,
     reputationScore: rng.float(0.5, 0.9), tier: "VERIFIED", status: "ACTIVE",
+    exitReason: null,
     strategy, collateral, usableCollateral, lockedCollateral: 0, maxExposure,
     corridors: [], totalVolume: 0, totalEarnings: 0, totalIncentives: 0,
     totalPenalties: 0, totalSlashing: 0, executionsCompleted: 0, executionsFailed: 0,
     utilization: 0, entryStep: 0, exitStep: null,
+    totalDeployedCapitalSteps: 0, currentDeployedCapital: 0,
     executionHistory: [],
   };
   world.providers.set(provider.id, provider);
@@ -214,10 +216,12 @@ export function generateNewProvider(
   const provider: SimProvider = {
     id: nextId("prov"), name, providerType, trustModel,
     reputationScore: 0.5, tier: "NEW", status: "ACTIVE",
+    exitReason: null,
     strategy, collateral, usableCollateral, lockedCollateral: 0, maxExposure,
     corridors: [], totalVolume: 0, totalEarnings: 0, totalIncentives: 0,
     totalPenalties: 0, totalSlashing: 0, executionsCompleted: 0, executionsFailed: 0,
     utilization: 0, entryStep: step, exitStep: null,
+    totalDeployedCapitalSteps: 0, currentDeployedCapital: 0,
     executionHistory: [],
   };
   world.providers.set(provider.id, provider);

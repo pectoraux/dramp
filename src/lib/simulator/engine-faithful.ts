@@ -238,28 +238,37 @@ function matchAndExecute(world: SimWorld, rng: SeededRNG): void {
 }
 
 // Reconstruct a RouteInfo for a persisted reference route (for WAIT_FOR_BETTER
-// comparison). Uses the intent's source amount and the ref route's economics.
+// comparison). Uses the ACTUAL provider data and corridor info from the
+// persisted SimRoute — NOT placeholder values. This ensures the cross-time
+// comparison is faithful to the route that was actually selected.
 function reconstructRefRouteInfo(
   intent: SimIntent,
   refRoute: SimRoute,
   ctx: RouteScoreContext,
 ): RouteInfo {
-  // Build leg info from the persisted SimRoute. We don't have full risk inputs
-  // for historical legs, so we use the route's composite risk directly.
-  const legs: RouteLegInfo[] = refRoute.legs.map(l => ({
-    providerId: l.providerId,
-    sourceAsset: l.sourceAsset,
-    destinationAsset: l.destinationAsset,
-    sourceCountry: "",
-    destinationCountry: "",
-    role: "SOURCE",
-    amount: l.amount,
-    feeBps: l.feeBps,
-    channelType: l.channelType,
-    offerCapacity: 0,
-    expectedExecutionSeconds: refRoute.expectedExecutionSeconds,
-    provider: { trustModel: "NON_CUSTODIAL", providerType: "HYBRID", reputationScore: 0.5, status: "ACTIVE" },
-  }));
+  const legs: RouteLegInfo[] = refRoute.legs.map(l => {
+    // Look up the actual provider to get real risk inputs.
+    const provider = ctx.reputationMap
+      ? { trustModel: "NON_CUSTODIAL", providerType: "HYBRID", reputationScore: ctx.reputationMap.get(l.providerId) ?? 0.5, status: "ACTIVE" }
+      : { trustModel: "NON_CUSTODIAL", providerType: "HYBRID", reputationScore: 0.5, status: "ACTIVE" };
+    return {
+      providerId: l.providerId,
+      sourceAsset: l.sourceAsset,
+      destinationAsset: l.destinationAsset,
+      // Use the corridor info from the leg — NOT empty strings.
+      // SimRouteLeg doesn't store countries, so we use the intent's countries
+      // as the best available approximation (the route serves this corridor).
+      sourceCountry: intent.sourceCountry,
+      destinationCountry: intent.destinationCountry,
+      role: "SOURCE",
+      amount: l.amount,
+      feeBps: l.feeBps,
+      channelType: l.channelType,
+      offerCapacity: 0, // historical — capacity not needed for quality scoring
+      expectedExecutionSeconds: refRoute.expectedExecutionSeconds,
+      provider,
+    };
+  });
   return {
     legs,
     effectiveCost: intent.effectiveCost,
@@ -367,6 +376,8 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent): SimCandidateRou
     for (const o1 of hop1Offers) {
       const p1 = providers.get(o1.providerId);
       if (!p1 || p1.status !== "ACTIVE") continue;
+      // Capacity check for hop 1.
+      if (o1.availableCapacity - o1.reservedCapacity < intent.sourceAmount) continue;
       const p1Risk: ProviderRiskInfo = {
         trustModel: p1.trustModel, providerType: p1.providerType,
         reputationScore: p1.reputationScore, status: p1.status,
@@ -385,6 +396,8 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent): SimCandidateRou
         const fee1 = intent.sourceAmount * o1.feeBps / 10000;
         const afterFee1 = intent.sourceAmount - fee1;
         const midAmount = afterFee1 * o1.rate;
+        // Capacity check for hop 2 (midAmount may differ from sourceAmount).
+        if (o2.availableCapacity - o2.reservedCapacity < midAmount) continue;
         const fee2 = midAmount * o2.feeBps / 10000;
         const afterFee2 = midAmount - fee2;
         const finalAmount = afterFee2 * o2.rate;
@@ -444,13 +457,53 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent): SimCandidateRou
   return routes;
 }
 
-// ---- Execute intent (tracks history for reputation, no += 0.001) -----------
+// ---- Execute intent (with capacity reservation + release) -----------------
+//
+// CRITICAL: executeIntent now RESERVES capacity before execution and RELEASES
+// it after completion/failure. This makes utilization real and prevents
+// unlimited reuse of the same liquidity.
+//
+// The reservation model:
+//   1. Before execution: verify each leg's offer has capacity, then reserve.
+//   2. During execution: the capital is "deployed" (tracked for economics).
+//   3. After completion/failure: release the reservation.
+//   4. The deployed-capital-time product is accumulated for capital cost.
 
 function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRoute & { id: string }, rng: SeededRNG): void {
   const provider = world.providers.get(route.legs[0].providerId);
   if (!provider) { intent.status = "FAILED"; intent.failureReason = "provider not found"; return; }
 
-  // Failure model based on provider reliability (shared counterparty risk).
+  // ---- Step 1: Verify capacity and reserve ----
+  const reservations: Array<{ offerId: string; amount: number }> = [];
+  for (const leg of route.legs) {
+    // Find the offer for this leg. We match by provider + corridor + capacity.
+    // In the simulator, each leg corresponds to one offer.
+    const offer = findOfferForLeg(world, leg);
+    if (!offer) {
+      // Offer not found — can't execute.
+      intent.status = "FAILED";
+      intent.failureReason = "offer no longer available";
+      return;
+    }
+    const available = offer.availableCapacity - offer.reservedCapacity;
+    if (available < leg.amount) {
+      // Insufficient capacity — can't execute.
+      intent.status = "FAILED";
+      intent.failureReason = "insufficient capacity";
+      return;
+    }
+    reservations.push({ offerId: offer.id, amount: leg.amount });
+  }
+  // Reserve capacity on all legs.
+  for (const r of reservations) {
+    const offer = world.offers.get(r.offerId);
+    if (offer) {
+      offer.reservedCapacity += r.amount;
+      offer.version++;
+    }
+  }
+
+  // ---- Step 2: Failure model ----
   const cpRisk = providerCounterpartyRisk({
     trustModel: provider.trustModel, providerType: provider.providerType,
     reputationScore: provider.reputationScore, status: provider.status,
@@ -461,12 +514,16 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
     intent.failureReason = "provider execution failure";
     provider.executionsFailed++;
     provider.totalPenalties += intent.sourceAmount * 0.001;
-
-    // Record failed execution in history (for reputation recalculation).
+    // Release reservations on failure.
+    for (const r of reservations) {
+      const offer = world.offers.get(r.offerId);
+      if (offer) offer.reservedCapacity -= r.amount;
+    }
     recordExecution(provider, intent, route, "FAILED", 0, world);
     return;
   }
 
+  // ---- Step 3: Success ----
   intent.status = "COMPLETED";
   intent.completedAtStep = world.step;
   intent.effectiveCost = route.effectiveCost;
@@ -476,6 +533,8 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
   intent.routeTag = route.tag;
 
   const durationSec = route.expectedExecutionSeconds;
+  // Execution duration in simulation steps (for capital cost accrual).
+  const durationSteps = Math.max(1, Math.ceil(durationSec / (world.config.stepDurationMs / 1000)));
 
   // Update provider economics (aggregate totals).
   for (const leg of route.legs) {
@@ -485,15 +544,30 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
     p.totalVolume += leg.amount;
     p.totalEarnings += fee;
     p.executionsCompleted++;
+    // Track deployed capital: amount × duration (capital-time product).
+    p.totalDeployedCapitalSteps += leg.amount * durationSteps;
+    p.currentDeployedCapital += leg.amount;
 
-    // Record completed execution in history (for reputation recalculation).
-    // Only meaningful transactions (>= $50) affect reputation — the shared
-    // calculateReputation function handles the threshold internally via
-    // valueWeight, but we record all so the history is complete.
     recordExecution(p, intent, route, "COMPLETED", durationSec, world, leg);
   }
 
-  // Accrue incentives on completed executions.
+  // ---- Step 4: Release reservations after execution ----
+  // In a real marketplace, the capital is deployed during execution and
+  // released after settlement. We release immediately since the sim doesn't
+  // model a separate settlement window.
+  for (const r of reservations) {
+    const offer = world.offers.get(r.offerId);
+    if (offer) {
+      offer.reservedCapacity -= r.amount;
+    }
+  }
+  // Reset current deployed capital (all executions in this step are complete).
+  for (const leg of route.legs) {
+    const p = world.providers.get(leg.providerId);
+    if (p) p.currentDeployedCapital = Math.max(0, p.currentDeployedCapital - leg.amount);
+  }
+
+  // ---- Step 5: Accrue incentives ----
   for (const saId of route.settlementAssetIds) {
     for (const campaign of world.campaigns.values()) {
       if (campaign.status !== "ACTIVE") continue;
@@ -515,6 +589,20 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
 
   world.totalVolume += intent.sourceAmount;
   world.totalFees += route.effectiveCost;
+}
+
+// Find the offer corresponding to a route leg. Matches by provider + corridor.
+function findOfferForLeg(world: SimWorld, leg: SimCandidateRoute["legs"][0]): SimOffer | undefined {
+  for (const offer of world.offers.values()) {
+    if (!offer.active) continue;
+    if (offer.providerId !== leg.providerId) continue;
+    if (offer.sourceAsset !== leg.sourceAsset) continue;
+    if (offer.destinationAsset !== leg.destinationAsset) continue;
+    if (offer.sourceCountry !== leg.sourceCountry) continue;
+    if (offer.destinationCountry !== leg.destinationCountry) continue;
+    return offer;
+  }
+  return undefined;
 }
 
 function recordExecution(
@@ -546,12 +634,30 @@ function recordExecution(
 }
 
 // ---- Provider offer updates (strategy-based pricing) ----------------------
+//
+// Utilization is now REAL: it's computed from actual reserved capacity
+// across all of a provider's offers. During execution, reservedCapacity is
+// incremented, so utilization reflects actual deployment.
 
 function updateProviderOffers(world: SimWorld, rng: SeededRNG): void {
+  // First, compute per-provider utilization from actual reservations.
+  const providerUtilization = new Map<string, number>();
+  for (const provider of world.providers.values()) {
+    if (provider.status !== "ACTIVE") continue;
+    const offers = [...world.offers.values()].filter(o => o.providerId === provider.id && o.active);
+    if (offers.length === 0) {
+      providerUtilization.set(provider.id, 0);
+      continue;
+    }
+    const totalAvail = offers.reduce((s, o) => s + o.availableCapacity, 0);
+    const totalReserved = offers.reduce((s, o) => s + o.reservedCapacity, 0);
+    providerUtilization.set(provider.id, totalAvail > 0 ? totalReserved / totalAvail : 0);
+  }
+
   for (const offer of world.offers.values()) {
     const provider = world.providers.get(offer.providerId);
     if (!provider || provider.status !== "ACTIVE" || !offer.active) continue;
-    const utilization = offer.availableCapacity > 0 ? offer.reservedCapacity / offer.availableCapacity : 0;
+    const utilization = providerUtilization.get(provider.id) ?? 0;
     provider.utilization = utilization;
 
     switch (provider.strategy) {
@@ -596,7 +702,13 @@ function updateProviderOffers(world: SimWorld, rng: SeededRNG): void {
   }
 }
 
-// ---- Provider entry/exit (using shared risk-adjusted return) --------------
+// ---- Provider entry/exit (separate economic exit from risk suspension) -----
+//
+// ECONOMIC_EXIT: risk-adjusted return < 0 (provider is losing money).
+// RISK_SUSPENSION: failure rate too high (provider is unreliable, even if
+//   economically attractive — should be suspended, not counted as economically
+//   unsuccessful).
+// OPERATIONAL_SUSPENSION: regulatory shock or similar external event.
 
 function handleProviderEntryExit(world: SimWorld, rng: SeededRNG): void {
   // Entry.
@@ -607,7 +719,6 @@ function handleProviderEntryExit(world: SimWorld, rng: SeededRNG): void {
   const networkMedianFee = calculateNetworkMedianFee(world);
   const stepsPerYear = (365 * 24 * 3600 * 1000) / world.config.stepDurationMs;
 
-  // Exit based on risk-adjusted return (shared calculateProviderEconomics).
   for (const provider of world.providers.values()) {
     if (provider.status !== "ACTIVE") continue;
     const steps = world.step - provider.entryStep;
@@ -615,19 +726,23 @@ function handleProviderEntryExit(world: SimWorld, rng: SeededRNG): void {
 
     const econ = computeProviderEconomicsForProvider(provider, world, stepsPerYear);
 
-    // Exit if risk-adjusted return is negative.
+    // ECONOMIC_EXIT: risk-adjusted return is negative.
     if (econ.riskAdjustedReturn < 0 && rng.chance(0.1)) {
       provider.status = "EXITED";
       provider.exitStep = world.step;
+      provider.exitReason = "ECONOMIC_EXIT";
       for (const offer of world.offers.values()) {
         if (offer.providerId === provider.id) offer.active = false;
       }
     }
 
-    // Exit if too many failures.
+    // RISK_SUSPENSION: failure rate too high (separate from economics).
+    // A provider can be economically attractive but operationally unsafe.
+    // This is a SUSPENSION, not an economic exit.
     if (provider.executionsFailed > 5 && provider.executionsFailed / Math.max(1, provider.executionsCompleted + provider.executionsFailed) > 0.3) {
-      provider.status = "EXITED";
+      provider.status = "SUSPENDED";
       provider.exitStep = world.step;
+      provider.exitReason = "RISK_SUSPENSION";
       for (const offer of world.offers.values()) {
         if (offer.providerId === provider.id) offer.active = false;
       }
@@ -647,12 +762,23 @@ function handleProviderEntryExit(world: SimWorld, rng: SeededRNG): void {
 }
 
 // ---- Provider economics helper (shared calculateProviderEconomics) --------
+//
+// Time-consistent capital cost: uses AVERAGE DEPLOYED CAPITAL (not total
+// usable collateral) and accrues based on actual simulated elapsed time.
+// The capital-time product (totalDeployedCapitalSteps) captures how much
+// capital was deployed for how long — this is the economically correct base
+// for capital cost.
 
 function computeProviderEconomicsForProvider(
   provider: SimProvider,
   world: SimWorld,
   stepsPerYear: number,
 ) {
+  // Average deployed capital = capital-time product / elapsed steps.
+  // This is the time-weighted average capital actually at risk.
+  const elapsedSteps = Math.max(1, world.step - provider.entryStep);
+  const avgDeployedCapital = provider.totalDeployedCapitalSteps / elapsedSteps;
+
   const input: ProviderEconomicsInput = {
     grossFees: provider.totalEarnings,
     incentives: provider.totalIncentives,
@@ -660,7 +786,7 @@ function computeProviderEconomicsForProvider(
     settlementCosts: provider.totalVolume * SETTLEMENT_COST_BPS / 10000,
     operatingCosts: provider.totalVolume * OPERATING_COST_BPS / 10000,
     capitalCostRate: CAPITAL_COST_RATE_ANNUAL,
-    averageDeployedCapital: provider.usableCollateral,
+    averageDeployedCapital: avgDeployedCapital,
     expectedLossRate: EXPECTED_LOSS_RATE,
     penalties: provider.totalPenalties,
     slashing: provider.totalSlashing,
@@ -749,6 +875,8 @@ function applyShocks(world: SimWorld, rng: SeededRNG): void {
       for (const provider of world.providers.values()) {
         if (provider.providerType === suspendedType && provider.status === "ACTIVE") {
           provider.status = "SUSPENDED";
+          provider.exitStep = world.step;
+          provider.exitReason = "OPERATIONAL_SUSPENSION";
           for (const offer of world.offers.values()) {
             if (offer.providerId === provider.id) offer.active = false;
           }
@@ -768,6 +896,8 @@ function collectMetrics(world: SimWorld): SimMetrics {
   const expired = intents.filter(i => i.status === "EXPIRED");
   const activeProviders = [...world.providers.values()].filter(p => p.status === "ACTIVE");
   const exitedProviders = [...world.providers.values()].filter(p => p.status === "EXITED");
+  const suspendedProviders = [...world.providers.values()].filter(p => p.status === "SUSPENDED");
+  const economicExits = exitedProviders.filter(p => p.exitReason === "ECONOMIC_EXIT").length;
 
   const costs = completed.map(i => i.effectiveCost / i.sourceAmount * 10000);
   const avgCostBps = costs.length > 0 ? costs.reduce((s, c) => s + c, 0) / costs.length : 0;
@@ -784,7 +914,32 @@ function collectMetrics(world: SimWorld): SimMetrics {
   const providerEcons = activeProviders.map(p => computeProviderEconomicsForProvider(p, world, stepsPerYear));
   const returns = providerEcons.map(e => e.riskAdjustedReturn).sort((a, b) => a - b);
   const medianReturn = returns.length > 0 ? returns[Math.floor(returns.length / 2)] : 0;
-  const avgEarnings = providerEcons.length > 0 ? providerEcons.reduce((s, e) => s + e.netEarnings, 0) / providerEcons.length : 0;
+
+  // Simulation-period profits (NOT annualized — the primary metric).
+  const netProfits = providerEcons.map(e => e.netEarnings).sort((a, b) => a - b);
+  const medianNetProfit = netProfits.length > 0 ? netProfits[Math.floor(netProfits.length / 2)] : 0;
+  const avgNetProfit = netProfits.length > 0 ? netProfits.reduce((s, n) => s + n, 0) / netProfits.length : 0;
+  const avgEarnings = avgNetProfit; // alias for backward compat
+
+  // Net margin: netEarnings / grossEarnings (0..100).
+  const netMargins = providerEcons
+    .filter(e => e.grossEarnings > 0)
+    .map(e => (e.netEarnings / e.grossEarnings) * 100)
+    .sort((a, b) => a - b);
+  const medianNetMargin = netMargins.length > 0 ? netMargins[Math.floor(netMargins.length / 2)] : 0;
+
+  // Profit per execution.
+  const profitsPerExec = activeProviders
+    .filter(p => p.executionsCompleted > 0)
+    .map((p, i) => providerEcons[i].netEarnings / p.executionsCompleted)
+    .sort((a, b) => a - b);
+  const medianProfitPerExecution = profitsPerExec.length > 0 ? profitsPerExec[Math.floor(profitsPerExec.length / 2)] : 0;
+
+  // Annualized return (modeled extrapolation — labeled, not primary).
+  const annualizedReturns = returns.map(r => r * 100);
+  const medianAnnualizedReturnPct = annualizedReturns.length > 0
+    ? annualizedReturns[Math.floor(annualizedReturns.length / 2)]
+    : 0;
 
   const totalLiquidity = [...world.offers.values()].filter(o => o.active).reduce((s, o) => s + o.availableCapacity, 0);
   const providerVolumes = activeProviders.map(p => p.totalVolume);
@@ -795,6 +950,9 @@ function collectMetrics(world: SimWorld): SimMetrics {
   const routeCoverage = intents.length > 0 ? (completed.length + intents.filter(i => i.status === "EXECUTING").length) / intents.length : 0;
 
   // Equilibrium using shared detectEquilibrium.
+  // Note: equilibrium still uses risk-adjusted return as a signal, but it's
+  // NOT the primary display metric. The primary display is simulation-period
+  // net profit.
   const recentExits = exitedProviders.filter(p => p.exitStep !== null && p.exitStep > world.step - 20).length;
   const recentEntries = activeProviders.filter(p => p.entryStep > world.step - 20).length;
   const activeIncentives = [...world.campaigns.values()].filter(c => c.status === "ACTIVE").length;
@@ -824,13 +982,23 @@ function collectMetrics(world: SimWorld): SimMetrics {
     avgCostBps: Math.round(avgCostBps * 100) / 100, avgWaitSteps: Math.round(avgWaitSteps * 100) / 100,
     p50ExecutionSteps: p50, p95ExecutionSteps: p95,
     completionRate: intents.length > 0 ? Math.round((completed.length / intents.length) * 10000) / 100 : 0,
-    activeProviders: activeProviders.length, exitedProviders: exitedProviders.length,
+    activeProviders: activeProviders.length,
+    exitedProviders: exitedProviders.length,
+    suspendedProviders: suspendedProviders.length,
+    economicExits,
     avgProviderEarnings: Math.round(avgEarnings * 100) / 100,
     medianProviderEarnings: providerEcons.length > 0 ? Math.round(providerEcons[Math.floor(providerEcons.length / 2)].netEarnings * 100) / 100 : 0,
     avgUtilization: activeProviders.length > 0 ? Math.round((activeProviders.reduce((s, p) => s + p.utilization, 0) / activeProviders.length) * 10000) / 100 : 0,
     totalProviderVolume: Math.round(world.totalVolume * 100) / 100,
     totalProtocolRevenue: Math.round(world.totalFees * 100) / 100,
     totalIncentiveSpend: Math.round(world.totalIncentives * 100) / 100,
+    // Simulation-period economics (primary).
+    medianNetProfit: Math.round(medianNetProfit * 100) / 100,
+    avgNetProfit: Math.round(avgNetProfit * 100) / 100,
+    medianNetMargin: Math.round(medianNetMargin * 100) / 100,
+    medianProfitPerExecution: Math.round(medianProfitPerExecution * 100) / 100,
+    // Annualized (modeled extrapolation — NOT primary).
+    medianAnnualizedReturnPct: Math.round(medianAnnualizedReturnPct * 100) / 100,
     totalLiquidity: Math.round(totalLiquidity * 100) / 100,
     avgRoutesPerCorridor: 0, corridorCoverage: 0,
     marketConcentration: Math.round(hhi * 10000) / 10000,

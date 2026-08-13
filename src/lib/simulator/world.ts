@@ -26,6 +26,7 @@ export interface SimProvider {
   reputationScore: number;
   tier: string;
   status: string; // ACTIVE | EXITED | SUSPENDED
+  exitReason: string | null; // ECONOMIC_EXIT | RISK_SUSPENSION | OPERATIONAL_SUSPENSION | null
   strategy: string; // AGGRESSIVE | PREMIUM | LIQUIDITY_MAXIMIZER | MARKET_MAKER | INCENTIVE_SEEKER | CONSERVATIVE | OPPORTUNISTIC
   collateral: number;
   usableCollateral: number;
@@ -40,9 +41,13 @@ export interface SimProvider {
   totalSlashing: number;
   executionsCompleted: number;
   executionsFailed: number;
-  utilization: number; // reserved / available
+  utilization: number; // reserved / available (computed from actual reservations)
   entryStep: number;
   exitStep: number | null;
+  // Deployed capital tracking: sum of (amount × duration) across all executions.
+  // Used for time-consistent capital cost calculation.
+  totalDeployedCapitalSteps: number; // Σ (amount × steps_deployed) — capital-time product
+  currentDeployedCapital: number; // currently reserved/deployed capital
   // Per-execution history for faithful reputation recalculation.
   // Each record captures the amount, outcome, duration, and sim-time so the
   // shared calculateReputation function can apply recency + value weighting.
@@ -173,12 +178,20 @@ export interface SimMetrics {
   // Provider outcomes
   activeProviders: number;
   exitedProviders: number;
-  avgProviderEarnings: number;
-  medianProviderEarnings: number;
+  suspendedProviders: number; // RISK_SUSPENSION + OPERATIONAL_SUSPENSION
+  economicExits: number;      // ECONOMIC_EXIT only
+  avgProviderEarnings: number;       // simulation-period net earnings ($)
+  medianProviderEarnings: number;    // simulation-period net earnings ($)
   avgUtilization: number;
   totalProviderVolume: number;
   totalProtocolRevenue: number;
   totalIncentiveSpend: number;
+  // Provider economics (simulation-period, NOT annualized)
+  medianNetProfit: number;           // $ net earnings (sim period)
+  avgNetProfit: number;              // $ net earnings (sim period)
+  medianNetMargin: number;           // % net margin (netEarnings / grossEarnings)
+  medianProfitPerExecution: number;  // $ net earnings per execution
+  medianAnnualizedReturnPct: number; // modeled extrapolation (labeled, not primary)
   // Network outcomes
   totalLiquidity: number;
   avgRoutesPerCorridor: number;
@@ -247,6 +260,38 @@ export function createDefaultConfig(): SimConfig {
     shockStep: 50,
     shockMagnitude: 0.5,
     baselineCostBps: 300, // 3% baseline
+  };
+}
+
+// Stable-network fixture: a deterministic configuration where at least 10
+// providers remain active for 100+ steps. Used for controlled experiments
+// where the network must NOT collapse.
+//
+// Key differences from default:
+//   - 20 initial providers (enough for corridor coverage)
+//   - 0% growth (no random entry)
+//   - Lower exit threshold (providers stay longer)
+//   - Higher demand (more volume → more revenue → providers survive)
+//   - 100% NOW policy (no patient execution confounding)
+export function createStableNetworkConfig(): SimConfig {
+  return {
+    seed: 42,
+    totalSteps: 100,
+    stepDurationMs: 5000,
+    initialProviders: 20,
+    providerGrowthRate: 0.0,
+    providerExitThreshold: 0.001,
+    demandVolume: 10,
+    demandGrowth: 0.0,
+    riskDistribution: { maxReliability: 0.20, balanced: 0.60, lowestCost: 0.20 },
+    policyDistribution: { now: 1.0, waitForBetter: 0.0 },
+    enableReputation: true,
+    enableCommitments: true,
+    enableIncentives: true,
+    shockType: null,
+    shockStep: 50,
+    shockMagnitude: 0.5,
+    baselineCostBps: 300,
   };
 }
 

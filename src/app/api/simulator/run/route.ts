@@ -16,8 +16,11 @@ export async function POST(req: NextRequest) {
       totalIntents: 0, completedIntents: 0, failedIntents: 0, cancelledIntents: 0,
       expiredIntents: 0, avgCostBps: 0, avgWaitSteps: 0, p50ExecutionSteps: 0,
       p95ExecutionSteps: 0, completionRate: 0, activeProviders: 0, exitedProviders: 0,
+      suspendedProviders: 0, economicExits: 0,
       avgProviderEarnings: 0, medianProviderEarnings: 0, avgUtilization: 0,
       totalProviderVolume: 0, totalProtocolRevenue: 0, totalIncentiveSpend: 0,
+      medianNetProfit: 0, avgNetProfit: 0, medianNetMargin: 0,
+      medianProfitPerExecution: 0, medianAnnualizedReturnPct: 0,
       totalLiquidity: 0, avgRoutesPerCorridor: 0, corridorCoverage: 0,
       marketConcentration: 0, equilibriumStatus: "FORMING",
     };
@@ -39,7 +42,8 @@ export async function POST(req: NextRequest) {
     // Provider analysis.
     const providers = [...world.providers.values()].map(p => ({
       name: p.name, type: p.providerType, strategy: p.strategy, tier: p.tier,
-      status: p.status, reputation: Math.round(p.reputationScore * 100) / 100,
+      status: p.status, exitReason: p.exitReason,
+      reputation: Math.round(p.reputationScore * 100) / 100,
       volume: Math.round(p.totalVolume * 100) / 100,
       earnings: Math.round(p.totalEarnings * 100) / 100,
       incentives: Math.round(p.totalIncentives * 100) / 100,
