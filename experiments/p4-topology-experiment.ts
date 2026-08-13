@@ -7,7 +7,7 @@
 //
 // Usage: bun experiments/p4-topology-experiment.ts
 
-import { runSimulation } from "../src/lib/simulator/engine-faithful";
+import { simulateStep } from "../src/lib/simulator/engine-faithful";
 import { createWorld, createDefaultConfig, toUsdValue } from "../src/lib/simulator/world";
 import { SeededRNG } from "../src/lib/simulator/rng";
 import {
@@ -44,7 +44,7 @@ const HIGH_DEMAND_CORRIDORS: Array<[string, string, string, string]> = [
 ];
 
 // ---- Generate demand population (frozen across densities) ----
-function generateDemandPopulation(seed: number, numUsers: number, config: SimConfig): SimUser[] {
+export function generateDemandPopulation(seed: number, numUsers: number, config: SimConfig): SimUser[] {
   const rng = new SeededRNG(seed);
   const users: SimUser[] = [];
   for (let i = 0; i < numUsers; i++) {
@@ -79,8 +79,33 @@ function generateDemandPopulation(seed: number, numUsers: number, config: SimCon
   return users;
 }
 
+// Derive the top demanded corridors from the frozen demand population.
+// Returns corridors sorted by demand weight (frequency × typical amount).
+export function deriveDemandCorridors(users: SimUser[]): Array<[string, string, string, string]> {
+  const corridorDemand = new Map<string, { srcAsset: string; srcCountry: string; dstAsset: string; dstCountry: string; weight: number }>();
+  for (const u of users) {
+    const key = `${u.sourceAsset}:${u.sourceCountry}:${u.destinationAsset}:${u.destinationCountry}`;
+    const existing = corridorDemand.get(key);
+    const weight = u.frequency * u.typicalAmount;
+    if (existing) {
+      existing.weight += weight;
+    } else {
+      corridorDemand.set(key, { srcAsset: u.sourceAsset, srcCountry: u.sourceCountry, dstAsset: u.destinationAsset, dstCountry: u.destinationCountry, weight });
+    }
+  }
+  // Sort by weight descending, return top corridors.
+  const sorted = [...corridorDemand.values()].sort((a, b) => b.weight - a.weight);
+  return sorted.map(c => [c.srcAsset, c.srcCountry, c.dstAsset, c.dstCountry] as [string, string, string, string]);
+}
+
 // ---- Generate canonical 100-provider pool ----
-function generateCanonicalProviders(seed: number, count: number, topology: TopologyMode, settlementAssets: Map<string, SimSettlementAsset>): SimProvider[] {
+// demandDerivedCorridors: top corridors from the frozen demand population.
+// Used by CORRIDOR_FOCUSED topology to place capacity where demand actually is.
+export function generateCanonicalProviders(
+  seed: number, count: number, topology: TopologyMode,
+  settlementAssets: Map<string, SimSettlementAsset>,
+  demandDerivedCorridors: Array<[string, string, string, string]>,
+): SimProvider[] {
   const rng = new SeededRNG(seed);
   const providers: SimProvider[] = [];
   const stableAssetList = [...settlementAssets.values()].filter(a => a.isEligibleCollateral);
@@ -100,7 +125,6 @@ function generateCanonicalProviders(seed: number, count: number, topology: Topol
     const offers: SimOffer[] = [];
 
     if (topology === "RANDOM") {
-      // 1-3 random fiat-to-fiat corridors (current behavior).
       const numCorridors = rng.int(1, 3);
       const usedPairs = new Set<string>();
       for (let c = 0; c < numCorridors; c++) {
@@ -113,42 +137,36 @@ function generateCanonicalProviders(seed: number, count: number, topology: Topol
         corridors.push(`${ASSETS[srcIdx]}:${COUNTRIES[srcIdx]}:${ASSETS[dstIdx]}:${COUNTRIES[dstIdx]}`);
         const settlementAsset = rng.pick(stableAssetList);
         const feeBps = rng.int(5, 35);
-        offers.push(makeOffer(providerId, ASSETS[srcIdx], ASSETS[dstIdx], COUNTRIES[srcIdx], COUNTRIES[dstIdx], rng.float(0.8, 1.2), feeBps, settlementAsset.id));
+        offers.push(makeOffer(providerId, ASSETS[srcIdx], ASSETS[dstIdx], COUNTRIES[srcIdx], COUNTRIES[dstIdx], rng.float(0.8, 1.2), feeBps, settlementAsset.id, rng));
       }
     } else if (topology === "CORRIDOR_FOCUSED") {
-      // Providers concentrate on high-demand corridors.
+      // Providers concentrate on corridors DERIVED FROM ACTUAL DEMAND.
       const numCorridors = rng.int(1, 3);
       for (let c = 0; c < numCorridors; c++) {
-        const corridor = rng.pick(HIGH_DEMAND_CORRIDORS);
+        const corridor = rng.pick(demandDerivedCorridors);
         corridors.push(`${corridor[0]}:${corridor[1]}:${corridor[2]}:${corridor[3]}`);
         const settlementAsset = rng.pick(stableAssetList);
         const feeBps = rng.int(5, 35);
-        offers.push(makeOffer(providerId, corridor[0], corridor[2], corridor[1], corridor[3], rng.float(0.8, 1.2), feeBps, settlementAsset.id));
+        offers.push(makeOffer(providerId, corridor[0], corridor[2], corridor[1], corridor[3], rng.float(0.8, 1.2), feeBps, settlementAsset.id, rng));
       }
     } else if (topology === "BRIDGED") {
-      // Some providers do fiat-to-fiat (high-demand corridors), others do
-      // settlement-asset bridges (USD→USDC, USDC→EUR, etc.).
       const role = rng.next();
       if (role < 0.5) {
-        // Fiat-to-fiat on high-demand corridors.
-        const corridor = rng.pick(HIGH_DEMAND_CORRIDORS);
+        const corridor = rng.pick(demandDerivedCorridors);
         corridors.push(`${corridor[0]}:${corridor[1]}:${corridor[2]}:${corridor[3]}`);
         const settlementAsset = rng.pick(stableAssetList);
-        offers.push(makeOffer(providerId, corridor[0], corridor[2], corridor[1], corridor[3], rng.float(0.8, 1.2), rng.int(5, 35), settlementAsset.id));
+        offers.push(makeOffer(providerId, corridor[0], corridor[2], corridor[1], corridor[3], rng.float(0.8, 1.2), rng.int(5, 35), settlementAsset.id, rng));
       } else {
-        // Settlement-asset bridge: fiat → stablecoin or stablecoin → fiat.
         const sa = rng.pick(stableAssetList);
         const fiatIdx = rng.int(0, ASSETS.length - 1);
         const fiatAsset = ASSETS[fiatIdx];
         const fiatCountry = COUNTRIES[fiatIdx];
         if (rng.chance(0.5)) {
-          // fiat → stablecoin (on-ramp)
           corridors.push(`${fiatAsset}:${fiatCountry}:${sa.symbol}:GLOBAL`);
-          offers.push(makeOffer(providerId, fiatAsset, sa.symbol, fiatCountry, "GLOBAL", 1.0, rng.int(3, 10), sa.id));
+          offers.push(makeOffer(providerId, fiatAsset, sa.symbol, fiatCountry, "GLOBAL", 1.0, rng.int(3, 10), sa.id, rng));
         } else {
-          // stablecoin → fiat (off-ramp)
           corridors.push(`${sa.symbol}:GLOBAL:${fiatAsset}:${fiatCountry}`);
-          offers.push(makeOffer(providerId, sa.symbol, fiatAsset, "GLOBAL", fiatCountry, 1.0, rng.int(3, 10), sa.id));
+          offers.push(makeOffer(providerId, sa.symbol, fiatAsset, "GLOBAL", fiatCountry, 1.0, rng.int(3, 10), sa.id, rng));
         }
       }
     }
@@ -160,16 +178,16 @@ function generateCanonicalProviders(seed: number, count: number, topology: Topol
   return providers;
 }
 
-// Helper to make an offer
-function makeOffer(providerId: string, srcAsset: string, dstAsset: string, srcCountry: string, dstCountry: string, rate: number, feeBps: number, settlementAssetId: string): SimOffer {
+// Helper to make an offer (uses SeededRNG for full reproducibility)
+function makeOffer(providerId: string, srcAsset: string, dstAsset: string, srcCountry: string, dstCountry: string, rate: number, feeBps: number, settlementAssetId: string, rng: SeededRNG): SimOffer {
   return {
     id: nextId("offer"), providerId,
     capability: "FIAT_IN", sourceAsset: srcAsset, destinationAsset: dstAsset,
     sourceCountry: srcCountry, destinationCountry: dstCountry,
     rate, feeBps, minimumAmount: 10, maximumAmount: 1000000000,
-    availableCapacity: 50000 + Math.random() * 50000, reservedCapacity: 0,
+    availableCapacity: rng.float(5000, 50000), reservedCapacity: 0,
     settlementAssetId, channelType: "AUTOMATIC",
-    expectedExecutionSeconds: 30 + Math.floor(Math.random() * 90),
+    expectedExecutionSeconds: rng.int(10, 120),
     incentiveBps: 0, active: true, version: 1,
     settlementDurationSteps: 1,
   };
@@ -505,7 +523,13 @@ function runExperiment() {
       ["asset_sc", { id: "asset_sc", symbol: "SC", assetType: "INTERNAL_SETTLEMENT_UNIT", volatilityScore: 0.0, liquidityScore: 0.9, pegQuality: 1.0, incentiveRate: 0, collateralHaircut: 0.0, isEligibleCollateral: true, status: "ACTIVE" }],
       ["asset_weth", { id: "asset_weth", symbol: "WETH", assetType: "VOLATILE_TOKEN", volatilityScore: 0.6, liquidityScore: 0.6, pegQuality: null, incentiveRate: 0, collateralHaircut: 0.5, isEligibleCollateral: false, status: "ACTIVE" }],
     ]);
-    const canonicalProviders = generateCanonicalProviders(canonicalSeed, 100, topology, settlementAssets);
+
+    // Derive demand corridors from seed 0's demand population (frozen).
+    const seed0Config = makeConfig(BASE_SEED);
+    const seed0Demand = generateDemandPopulation(BASE_SEED, 50, seed0Config);
+    const demandDerivedCorridors = deriveDemandCorridors(seed0Demand);
+
+    const canonicalProviders = generateCanonicalProviders(canonicalSeed, 100, topology, settlementAssets, demandDerivedCorridors);
 
     for (const density of PROVIDER_COUNTS) {
       const metrics: RunMetrics[] = [];
@@ -522,14 +546,7 @@ function runExperiment() {
         // Run simulation manually (not via runSimulation which calls generateWorld).
         const rng = new SeededRNG(seed);
         for (let step = 0; step < config.totalSteps; step++) {
-          // Use simulateStep directly.
-          const { simulateStep } = require("../src/lib/simulator/engine-faithful");
           simulateStep(world, rng);
-        }
-        if (world.metricsHistory.length === 0) {
-          // Collect final metrics if not already.
-          const { collectMetrics } = require("../src/lib/simulator/engine-faithful");
-          // collectMetrics is internal; use the last metricsHistory or push.
         }
 
         metrics.push(extractMetrics(world, UNSERVED_PENALTY_BPS));
