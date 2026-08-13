@@ -28,7 +28,9 @@ export async function POST(req: NextRequest) {
       medianProfitPerExecution: 0, medianAnnualizedReturnPct: 0,
       medianCapitalEfficiency: 0,
       totalLiquidity: 0, avgRoutesPerCorridor: 0, corridorCoverage: 0,
-      marketConcentration: 0, equilibriumStatus: "FORMING",
+      marketConcentration: 0,
+      internalSettlementVolume: 0, inFlightValueUsd: 0, settlementTransferCount: 0,
+      equilibriumStatus: "FORMING",
     };
 
     // Corridor analysis.

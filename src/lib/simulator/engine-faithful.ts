@@ -24,7 +24,8 @@ import { SeededRNG } from "./rng";
 import {
   SimWorld, SimIntent, SimMetrics, SimProvider, SimOffer,
   SimCampaign, SimRoute, SimExecutionRecord, SimActiveReservation,
-  SimInFlightExecution,
+  SimInFlightExecution, SimInFlightLeg, SimSettlementTransfer,
+  toUsdValue,
 } from "./world";
 import { generateNewProvider } from "./generator";
 import {
@@ -77,7 +78,7 @@ export function simulateStep(world: SimWorld, rng: SeededRNG): void {
   //   7. Match + execute (routes against updated prices, creates new reservations)
   //   8. Provider entry/exit, campaign updates, shocks
   releaseExpiredReservations(world);
-  processInFlightExecutions(world);
+  processInFlightExecutions(world, rng);
   replenishLiquidity(world, rng);
   updateProviderOffers(world, rng);
   generateDemand(world, rng);
@@ -90,20 +91,91 @@ export function simulateStep(world: SimWorld, rng: SeededRNG): void {
   }
 }
 
-// Process in-flight executions: complete settlements whose completionStep
-// has arrived. At completion:
-//   - destination liquidity decreases (payout happens)
-//   - source liquidity increases (receipt happens)
-//   - provider earnings are recognized
-//   - reservation is released
-//   - execution history is recorded (for reputation)
-// This makes settlement delay affect BOTH user latency AND provider capital.
-function processInFlightExecutions(world: SimWorld): void {
+// Process in-flight executions: settle legs whose completionStep has arrived.
+// Legs settle ASYNCHRONOUSLY in dependency order (leg N+1 starts only after
+// leg N settles). This models the real multi-hop settlement chain.
+//
+// Conservation: for multi-hop routes, the intermediate settlement asset is
+// transferred from the upstream provider (debit) to the downstream provider
+// (credit). Debit == credit — no assets created or destroyed.
+function processInFlightExecutions(world: SimWorld, rng: SeededRNG): void {
   const remaining: SimInFlightExecution[] = [];
   for (const exec of world.inFlightExecutions) {
-    if (world.step >= exec.completionStep) {
-      // Settlement completes NOW.
-      completeSettlement(world, exec);
+    // Process legs in dependency order.
+    let allSettled = true;
+    let anyFailed = false;
+    for (let i = 0; i < exec.legs.length; i++) {
+      const leg = exec.legs[i];
+      if (leg.status === "SETTLED") continue;
+      if (leg.status === "FAILED") { anyFailed = true; break; }
+      // This leg is PENDING or EXECUTING.
+      if (leg.status === "PENDING") {
+        // Check if upstream leg has settled (dependency chain).
+        if (i > 0 && exec.legs[i - 1].status !== "SETTLED") {
+          allSettled = false;
+          break; // can't start this leg yet
+        }
+        // Start this leg: sample stochastic settlement outcome, set to EXECUTING.
+        let durationSteps = leg.durationSteps;
+        if (world.config.enableStochasticSettlement) {
+          const p = world.providers.get(leg.providerId);
+          if (p) {
+            const outcome = sampleSettlementOutcome(rng, p.reliabilityProfile);
+            if (outcome === "FAILURE") {
+              // Settlement failure — mark leg failed, cancel execution.
+              leg.status = "FAILED";
+              leg.settlementOutcome = "FAILURE";
+              p.executionsFailed++;
+              p.settlementsFailed++;
+              p.totalPenalties += leg.amount * 0.001;
+              anyFailed = true;
+              break;
+            }
+            leg.settlementOutcome = outcome;
+            if (outcome === "DELAYED") durationSteps = leg.durationSteps * 2;
+            else if (outcome === "RETRY") durationSteps = leg.durationSteps * 3;
+          }
+        }
+        leg.durationSteps = durationSteps; // update with stochastic duration
+        leg.status = "EXECUTING";
+        leg.startStep = world.step;
+        leg.completionStep = world.step + durationSteps;
+        // Reserve capacity for this leg.
+        const offer = world.offers.get(leg.offerId);
+        if (offer) {
+          offer.reservedCapacity += leg.reservation.amount;
+          offer.version++;
+        }
+        const p = world.providers.get(leg.providerId);
+        if (p) {
+          p.currentDeployedCapital += leg.reservation.amount;
+          p.totalDeployedCapitalSteps += leg.reservation.amount * durationSteps;
+        }
+        allSettled = false;
+        break; // only one leg starts per step (dependency chain)
+      }
+      // leg.status === "EXECUTING" — check if it's time to settle.
+      if (world.step >= leg.completionStep) {
+        // Settle this leg (may transition to SETTLED or FAILED).
+        settleLeg(world, exec, i);
+        if ((leg.status as string) === "FAILED") {
+          anyFailed = true;
+          break;
+        }
+        // If this isn't the last leg, create a conserved transfer to the next leg.
+        if (i < exec.legs.length - 1) {
+          createSettlementTransfer(world, exec, i);
+        }
+      } else {
+        allSettled = false;
+        break; // still executing
+      }
+    }
+
+    if (anyFailed) {
+      failExecution(world, exec);
+    } else if (allSettled) {
+      completeExecution(world, exec);
     } else {
       remaining.push(exec);
     }
@@ -111,84 +183,167 @@ function processInFlightExecutions(world: SimWorld): void {
   world.inFlightExecutions = remaining;
 }
 
-// Complete a settlement: consume liquidity, credit provider, release reservation.
-function completeSettlement(world: SimWorld, exec: SimInFlightExecution): void {
+// Settle a single leg: consume liquidity, credit provider, release reservation.
+// For the FIRST leg (external input): source balance increases (user pays in).
+// For the LAST leg (external output): destination balance decreases (payout).
+// For intermediate legs: the settlement asset is debited from this provider
+// and credited to the next provider via createSettlementTransfer.
+function settleLeg(world: SimWorld, exec: SimInFlightExecution, legIndex: number): void {
+  const leg = exec.legs[legIndex];
+  const p = world.providers.get(leg.providerId);
+  if (!p) {
+    leg.status = "FAILED";
+    leg.settlementOutcome = "FAILURE";
+    return;
+  }
+
+  const durationSec = (world.step - leg.startStep) * (world.config.stepDurationMs / 1000);
+
+  // Credit provider economics.
+  const fee = leg.amount * leg.feeBps / 10000;
+  p.totalVolume += leg.amount;
+  p.totalEarnings += fee;
+  p.executionsCompleted++;
+
+  // Track settlement outcome.
+  if (leg.settlementOutcome === "FAST") p.settlementsFast++;
+  else if (leg.settlementOutcome === "DELAYED") p.settlementsDelayed++;
+  else if (leg.settlementOutcome === "RETRY") p.settlementsRetried++;
+
+  // Consume liquidity CONSERVINGLY:
+  if (world.config.enableLiquidityInventory) {
+    // Source balance increases (provider receives the source asset).
+    // For the first leg, this is external user input (boundary flow).
+    // For intermediate legs, this is the settlement asset received from the
+    // upstream provider via the transfer (credited in createSettlementTransfer).
+    // For the last leg, the source asset IS the settlement asset from upstream.
+    const srcBalance = p.liquidity.balances.get(leg.sourceAsset) ?? 0;
+    p.liquidity.balances.set(leg.sourceAsset, srcBalance + leg.amount);
+
+    // Destination balance decreases (provider pays out the destination asset).
+    // For the last leg, this is the external payout (boundary flow).
+    // For intermediate legs, this is the settlement asset paid to the next
+    // provider — debited here, credited to the next provider in createSettlementTransfer.
+    const dstBalance = p.liquidity.balances.get(leg.destinationAsset) ?? 0;
+    p.liquidity.balances.set(leg.destinationAsset, Math.max(0, dstBalance - leg.payoutAmount));
+  }
+
+  // Release the reservation for this leg.
+  const offer = world.offers.get(leg.offerId);
+  if (offer) {
+    offer.reservedCapacity = Math.max(0, offer.reservedCapacity - leg.reservation.amount);
+  }
+  p.currentDeployedCapital = Math.max(0, p.currentDeployedCapital - leg.reservation.amount);
+
+  // Record execution in history (for reputation recalculation).
+  const corridorKey = `${p.id}:${leg.sourceAsset}:${leg.destinationAsset}::`;
+  const record: SimExecutionRecord = {
+    providerId: p.id,
+    amount: leg.amount,
+    outcome: "COMPLETED",
+    durationSeconds: durationSec,
+    step: world.step,
+    timeMs: world.timeMs,
+    feeBps: leg.feeBps,
+    corridorKey,
+  };
+  p.executionHistory.push(record);
+  if (p.executionHistory.length > 500) {
+    p.executionHistory = p.executionHistory.slice(-500);
+  }
+
+  // Accrue incentives for this leg (leg/campaign-aware).
+  for (const campaign of world.campaigns.values()) {
+    if (campaign.status !== "ACTIVE") continue;
+    const offerForLeg = world.offers.get(leg.offerId);
+    if (offerForLeg && offerForLeg.settlementAssetId === campaign.settlementAssetId) {
+      const inc = leg.amount * campaign.incentiveBps / 10000;
+      const remainingBudget = campaign.totalBudget - campaign.accrued;
+      if (remainingBudget > 0) {
+        const actualInc = Math.min(inc, remainingBudget);
+        campaign.accrued += actualInc;
+        world.totalIncentives += actualInc;
+        p.totalIncentives += actualInc;
+      }
+    }
+  }
+
+  leg.status = "SETTLED";
+}
+
+// Create a conserved settlement transfer: the intermediate settlement asset
+// moves from the upstream provider (who paid it out) to the downstream provider
+// (who will receive it as source asset). Debit == credit.
+// The upstream provider's destination-asset debit was already done in settleLeg.
+// Here we credit the downstream provider's source-asset balance so that when
+// their leg settles, the source balance increase matches the transfer.
+function createSettlementTransfer(world: SimWorld, exec: SimInFlightExecution, fromLegIndex: number): void {
+  const fromLeg = exec.legs[fromLegIndex];
+  const toLeg = exec.legs[fromLegIndex + 1];
+  // The settlement asset is the destination of the from-leg = source of the to-leg.
+  const asset = fromLeg.destinationAsset;
+  const amount = fromLeg.payoutAmount; // the amount paid out by from-leg
+
+  // Credit the downstream provider's source-asset balance NOW (so it's available
+  // when their leg starts executing). This is the conserved transfer:
+  // from-leg debited the asset, to-leg credits it.
+  if (world.config.enableLiquidityInventory) {
+    const toProvider = world.providers.get(toLeg.providerId);
+    if (toProvider) {
+      const balance = toProvider.liquidity.balances.get(asset) ?? 0;
+      toProvider.liquidity.balances.set(asset, balance + amount);
+    }
+  }
+
+  // Record the transfer for auditing/metrics.
+  const transfer: SimSettlementTransfer = {
+    id: `transfer_${++reservationCounter}`,
+    executionId: exec.id,
+    fromProviderId: fromLeg.providerId,
+    toProviderId: toLeg.providerId,
+    asset,
+    amount,
+    fromLegIndex,
+    toLegIndex: fromLegIndex + 1,
+    settlementStep: world.step,
+    status: "COMPLETED",
+  };
+  world.settlementTransfers.push(transfer);
+}
+
+// Fail an execution: an upstream leg failed, so downstream legs can't settle.
+// Release all remaining reservations and mark intent FAILED.
+function failExecution(world: SimWorld, exec: SimInFlightExecution): void {
   const intent = world.intents.find(i => i.id === exec.intentId);
   if (!intent) return;
+  intent.status = "FAILED";
+  intent.failureReason = "upstream settlement failure (dependency chain)";
+  // Release all reservations for legs that were EXECUTING or PENDING.
+  for (const leg of exec.legs) {
+    if (leg.status === "EXECUTING" || leg.status === "PENDING") {
+      const offer = world.offers.get(leg.offerId);
+      if (offer) {
+        offer.reservedCapacity = Math.max(0, offer.reservedCapacity - leg.reservation.amount);
+      }
+      const p = world.providers.get(leg.providerId);
+      if (p) {
+        p.currentDeployedCapital = Math.max(0, p.currentDeployedCapital - leg.reservation.amount);
+        p.executionsFailed++;
+      }
+      leg.status = "FAILED";
+    }
+  }
+}
 
-  // Mark intent COMPLETED (user sees settlement complete NOW, not at start).
+// Complete an execution: all legs have settled. Mark intent COMPLETED.
+function completeExecution(world: SimWorld, exec: SimInFlightExecution): void {
+  const intent = world.intents.find(i => i.id === exec.intentId);
+  if (!intent) return;
   intent.status = "COMPLETED";
   intent.completedAtStep = world.step;
   intent.effectiveCost = exec.effectiveCost;
   intent.netOutput = exec.netOutput;
   intent.waitedSteps = world.step - intent.createdAtStep;
-
-  const durationSec = (world.step - exec.startStep) * (world.config.stepDurationMs / 1000);
-
-  // For each leg: consume liquidity, credit provider, release reservation.
-  for (const leg of exec.legs) {
-    const p = world.providers.get(leg.providerId);
-    if (!p) continue;
-
-    const fee = leg.amount * leg.feeBps / 10000;
-    p.totalVolume += leg.amount;
-    p.totalEarnings += fee;
-    p.executionsCompleted++;
-
-    // Consume liquidity NOW (at settlement, not at start).
-    if (world.config.enableLiquidityInventory) {
-      const srcBalance = p.liquidity.balances.get(leg.sourceAsset) ?? 0;
-      const dstBalance = p.liquidity.balances.get(leg.destinationAsset) ?? 0;
-      // Source balance increases (provider receives incoming transfer).
-      p.liquidity.balances.set(leg.sourceAsset, srcBalance + leg.amount);
-      // Destination balance decreases (provider pays out).
-      p.liquidity.balances.set(leg.destinationAsset, Math.max(0, dstBalance - leg.payoutAmount));
-    }
-
-    // Release the reservation for this leg.
-    const offer = world.offers.get(leg.offerId);
-    if (offer) {
-      offer.reservedCapacity = Math.max(0, offer.reservedCapacity - leg.amount);
-    }
-    p.currentDeployedCapital = Math.max(0, p.currentDeployedCapital - leg.amount);
-
-    // Record execution in history (for reputation recalculation).
-    const corridorKey = `${p.id}:${leg.sourceAsset}:${leg.destinationAsset}::`;
-    const record: SimExecutionRecord = {
-      providerId: p.id,
-      amount: leg.amount,
-      outcome: "COMPLETED",
-      durationSeconds: durationSec,
-      step: world.step,
-      timeMs: world.timeMs,
-      feeBps: leg.feeBps,
-      corridorKey,
-    };
-    p.executionHistory.push(record);
-    if (p.executionHistory.length > 500) {
-      p.executionHistory = p.executionHistory.slice(-500);
-    }
-  }
-
-  // Accrue incentives (leg/campaign-aware) — only at settlement.
-  for (const campaign of world.campaigns.values()) {
-    if (campaign.status !== "ACTIVE") continue;
-    for (const leg of exec.legs) {
-      const offer = world.offers.get(leg.offerId);
-      if (offer && offer.settlementAssetId === campaign.settlementAssetId) {
-        const inc = leg.amount * campaign.incentiveBps / 10000;
-        const remainingBudget = campaign.totalBudget - campaign.accrued;
-        if (remainingBudget > 0) {
-          const actualInc = Math.min(inc, remainingBudget);
-          campaign.accrued += actualInc;
-          world.totalIncentives += actualInc;
-          const p = world.providers.get(leg.providerId);
-          if (p) p.totalIncentives += actualInc;
-        }
-      }
-    }
-  }
-
   world.totalVolume += intent.sourceAmount;
   world.totalFees += exec.effectiveCost;
 }
@@ -742,36 +897,9 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
         }
       }
     }
-    // Settlement duration for this leg (from the offer's expectedExecutionSeconds).
-    let durationSteps = offer.settlementDurationSteps;
-    // Stochastic settlement: sample outcome from provider's reliability profile.
-    if (world.config.enableStochasticSettlement) {
-      const p = world.providers.get(leg.providerId);
-      if (p) {
-        const outcome = sampleSettlementOutcome(rng, p.reliabilityProfile);
-        if (outcome === "FAILURE") {
-          // Settlement failure — release reservation, mark intent failed.
-          intent.status = "FAILED";
-          intent.failureReason = "settlement failure (stochastic)";
-          p.executionsFailed++;
-          p.settlementsFailed++;
-          p.totalPenalties += leg.amount * 0.001;
-          recordExecution(p, intent, route, "FAILED", 0, world);
-          return;
-        }
-        // Adjust duration based on outcome.
-        if (outcome === "FAST") {
-          p.settlementsFast++;
-          // durationSteps stays as advertised.
-        } else if (outcome === "DELAYED") {
-          p.settlementsDelayed++;
-          durationSteps *= 2; // delayed = 2× advertised
-        } else if (outcome === "RETRY") {
-          p.settlementsRetried++;
-          durationSteps *= 3; // retry = 3× advertised
-        }
-      }
-    }
+    // Settlement duration for this leg (base — stochastic outcome sampled
+    // when the leg STARTS executing in processInFlightExecutions).
+    const durationSteps = offer.settlementDurationSteps;
     reservations.push({ offer, amount: leg.amount, durationSteps });
   }
 
@@ -801,41 +929,23 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
     return;
   }
 
-  // ---- Step 3: Success — create IN-FLIGHT execution (not COMPLETED yet) ----
+  // ---- Step 3: Success — create IN-FLIGHT execution with per-leg async state ----
   //
-  // The intent is EXECUTING (not COMPLETED) until the settlement duration
-  // elapses. Liquidity is NOT consumed at start — only at settlement completion.
-  // This makes settlement delay affect BOTH user latency AND provider capital.
+  // Legs settle ASYNCHRONOUSLY in dependency order:
+  //   leg 0 starts EXECUTING now → settles → transfers asset to leg 1 →
+  //   leg 1 starts EXECUTING → settles → ... → last leg settles → COMPLETED
   //
-  // Capital IS reserved immediately (so capacity is constrained), but the
-  // payout/receipt happens at settlement.
+  // Only the FIRST leg starts executing now. Subsequent legs are PENDING until
+  // their upstream leg settles and the intermediate settlement asset is transferred.
+  // This models the real multi-hop dependency chain and conserves intermediate assets.
   intent.status = "EXECUTING";
   intent.selectedRouteId = route.id;
   intent.routeTag = route.tag;
   intent.effectiveCost = route.effectiveCost;
   intent.netOutput = route.netOutput;
 
-  // Find the max duration across all legs (the route completes when the
-  // slowest leg settles).
-  let maxDurationSteps = 1;
-  let settlementOutcome: "FAST" | "DELAYED" | "RETRY" = "FAST";
-  for (const r of reservations) {
-    if (r.durationSteps > maxDurationSteps) {
-      maxDurationSteps = r.durationSteps;
-    }
-  }
-  // Track the outcome for the in-flight record (use the first leg's outcome).
-  if (world.config.enableStochasticSettlement && reservations.length > 0) {
-    // We already sampled per-leg above; use the max-duration leg's outcome.
-    // For simplicity, derive from maxDurationSteps vs base.
-    const baseDuration = Math.max(...reservations.map(r => r.offer.settlementDurationSteps));
-    if (maxDurationSteps >= baseDuration * 3) settlementOutcome = "RETRY";
-    else if (maxDurationSteps >= baseDuration * 2) settlementOutcome = "DELAYED";
-    else settlementOutcome = "FAST";
-  }
-
-  // Build the in-flight execution record.
-  const inFlightLegs = route.legs.map((leg, i) => {
+  // Build per-leg in-flight state.
+  const inFlightLegs: SimInFlightLeg[] = route.legs.map((leg, i) => {
     const r = reservations[i];
     const p = world.providers.get(leg.providerId);
     return {
@@ -848,8 +958,30 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
       feeBps: leg.feeBps,
       payoutAmount: leg.amount * leg.rate,
       providerName: p?.name ?? "Unknown",
+      // Per-leg async state.
+      status: i === 0 ? "EXECUTING" : "PENDING",  // only first leg starts now
+      startStep: i === 0 ? world.step : 0,
+      completionStep: i === 0 ? world.step + r.durationSteps : 0,
+      durationSteps: r.durationSteps,
+      settlementOutcome: "FAST",  // will be set when leg settles
+      reservation: { offerId: r.offer.id, providerId: leg.providerId, amount: leg.amount },
     };
   });
+
+  // Reserve capacity ONLY for the first leg (subsequent legs reserve when they start).
+  if (inFlightLegs.length > 0) {
+    const firstLeg = inFlightLegs[0];
+    const firstOffer = world.offers.get(firstLeg.offerId);
+    if (firstOffer) {
+      firstOffer.reservedCapacity += firstLeg.reservation.amount;
+      firstOffer.version++;
+    }
+    const firstProvider = world.providers.get(firstLeg.providerId);
+    if (firstProvider) {
+      firstProvider.currentDeployedCapital += firstLeg.reservation.amount;
+      firstProvider.totalDeployedCapitalSteps += firstLeg.reservation.amount * firstLeg.durationSteps;
+    }
+  }
 
   const inFlight: SimInFlightExecution = {
     id: `exec_${++reservationCounter}`,
@@ -859,28 +991,14 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
     effectiveCost: route.effectiveCost,
     netOutput: route.netOutput,
     startStep: world.step,
-    completionStep: world.step + maxDurationSteps,
-    settlementOutcome,
-    reservations: reservations.map(r => ({
-      offerId: r.offer.id,
-      providerId: r.offer.providerId,
-      amount: r.amount,
-    })),
+    settlementOutcome: "FAST",
+    currentLegIndex: 0,
   };
   world.inFlightExecutions.push(inFlight);
 
-  // Track deployed capital (capital-time product) — reserved NOW.
-  for (let i = 0; i < route.legs.length; i++) {
-    const leg = route.legs[i];
-    const r = reservations[i];
-    const p = world.providers.get(leg.providerId);
-    if (!p) continue;
-    p.totalDeployedCapitalSteps += leg.amount * r.durationSteps;
-    p.currentDeployedCapital += leg.amount;
-  }
-
-  // Note: liquidity is NOT consumed here. It will be consumed at settlement
-  // completion in completeSettlement(). Incentives are also NOT accrued here.
+  // Note: liquidity is NOT consumed here. It will be consumed at each leg's
+  // settlement in settleLeg(). Intermediate assets are conserved via
+  // createSettlementTransfer(). Incentives are accrued per-leg at settlement.
 }
 
 // Find the offer corresponding to a route leg. Matches by provider + corridor.
@@ -1348,6 +1466,16 @@ function collectMetrics(world: SimWorld): SimMetrics {
     totalLiquidity: Math.round(totalLiquidity * 100) / 100,
     avgRoutesPerCorridor: 0, corridorCoverage: 0,
     marketConcentration: Math.round(hhi * 10000) / 10000,
+    // Multi-hop conservation metrics (P4.7).
+    internalSettlementVolume: Math.round(
+      world.settlementTransfers.reduce((s, t) => s + toUsdValue(t.asset, t.amount), 0) * 100
+    ) / 100,
+    inFlightValueUsd: Math.round(
+      world.inFlightExecutions.reduce((s, exec) =>
+        s + exec.legs.reduce((ls, l) => ls + toUsdValue(l.sourceAsset, l.amount), 0), 0
+      ) * 100
+    ) / 100,
+    settlementTransferCount: world.settlementTransfers.length,
     equilibriumStatus: eqResult.status,
   };
 }

@@ -131,32 +131,65 @@ export interface SimActiveReservation {
   releaseStep: number; // startStep + settlementDurationSteps
 }
 
-// In-flight execution: an execution that has started but not yet settled.
-// The intent is EXECUTING (not COMPLETED) until the settlement duration elapses.
-// Liquidity is NOT consumed at start — only at settlement completion.
-// This makes settlement delay affect BOTH user latency AND provider capital.
+// In-flight execution: an execution that has started but not yet fully settled.
+// Each leg settles ASYNCHRONOUSLY — leg N+1 can only start after leg N settles
+// (the intermediate settlement asset must be available before the next leg
+// can pay it out). This models the real dependency chain in multi-hop routes.
+//
+// Conservation: intermediate settlement-asset movements are tracked as
+// SimSettlementTransfer records. Provider A's debit == Provider B's credit.
+// No settlement assets are created or destroyed.
+export interface SimInFlightLeg {
+  providerId: string;
+  offerId: string;
+  sourceAsset: string;
+  destinationAsset: string;
+  amount: number;            // source-asset amount
+  rate: number;
+  feeBps: number;
+  payoutAmount: number;      // destination-asset amount to be paid at settlement
+  providerName: string;
+  // Per-leg settlement state (asynchronous).
+  status: "PENDING" | "EXECUTING" | "SETTLED" | "FAILED";
+  startStep: number;         // when this leg started executing (after upstream settled)
+  completionStep: number;    // when this leg settles (startStep + durationSteps)
+  durationSteps: number;    // settlement duration for this leg
+  settlementOutcome: "FAST" | "DELAYED" | "RETRY" | "FAILURE";
+  // Reservation for this leg (to release when it settles).
+  reservation: { offerId: string; providerId: string; amount: number };
+}
+
 export interface SimInFlightExecution {
   id: string;
   intentId: string;
   routeId: string;
-  legs: Array<{
-    providerId: string;
-    offerId: string;
-    sourceAsset: string;
-    destinationAsset: string;
-    amount: number;
-    rate: number;
-    feeBps: number;
-    payoutAmount: number;     // destination-asset amount to be paid at settlement
-    providerName: string;
-  }>;
+  legs: SimInFlightLeg[];
   effectiveCost: number;
   netOutput: number;
   startStep: number;
-  completionStep: number;     // startStep + max(leg durationSteps)
+  // No single completionStep — legs settle asynchronously.
+  // The execution is COMPLETED when ALL legs are SETTLED.
   settlementOutcome: "FAST" | "DELAYED" | "RETRY";
-  // Reservations to release at completion.
-  reservations: Array<{ offerId: string; providerId: string; amount: number }>;
+  // Tracks which leg is currently executing (the dependency chain pointer).
+  currentLegIndex: number;
+}
+
+// Settlement transfer: a conserved internal movement of a settlement asset
+// from one provider to another. For USD→USDC→EUR:
+//   - Leg 1 settles: Provider A pays out USDC → transfer to Provider B
+//   - Leg 2 settles: Provider B receives that USDC, pays out EUR
+// The USDC debit at A == the USDC credit at B. No assets created.
+export interface SimSettlementTransfer {
+  id: string;
+  executionId: string;
+  fromProviderId: string;     // provider paying out the settlement asset
+  toProviderId: string;       // provider receiving the settlement asset
+  asset: string;              // settlement asset symbol (e.g. "USDC")
+  amount: number;             // amount of settlement asset transferred
+  fromLegIndex: number;       // leg that produced this transfer (source)
+  toLegIndex: number;         // leg that consumes this transfer (destination)
+  settlementStep: number;     // when the transfer occurred
+  status: "PENDING" | "COMPLETED" | "FAILED";
 }
 
 // Settlement reliability profile: per-provider-type probability distribution
@@ -349,6 +382,10 @@ export interface SimMetrics {
   avgRoutesPerCorridor: number;
   corridorCoverage: number;
   marketConcentration: number; // HHI index
+  // Multi-hop conservation metrics (P4.7)
+  internalSettlementVolume: number;  // total $ value of internal settlement-asset transfers
+  inFlightValueUsd: number;          // current $ value of in-flight executions
+  settlementTransferCount: number;   // number of internal transfers
   // Equilibrium
   equilibriumStatus: string; // POSITIVE | FRAGILE | NEGATIVE | FORMING
 }
@@ -371,6 +408,10 @@ export interface SimWorld {
   // The intent is EXECUTING (not COMPLETED) until settlement completes.
   // Liquidity is NOT consumed at start — only at settlement completion.
   inFlightExecutions: SimInFlightExecution[];
+  // Settlement transfers: conserved internal asset movements between providers.
+  // For multi-hop routes, the intermediate settlement asset is transferred
+  // from the upstream provider to the downstream provider. Debit == credit.
+  settlementTransfers: SimSettlementTransfer[];
   metricsHistory: SimMetrics[];
   // Running tallies
   totalVolume: number;
@@ -493,6 +534,7 @@ export function createWorld(config: SimConfig): SimWorld {
     campaigns: new Map(),
     activeReservations: [],
     inFlightExecutions: [],
+    settlementTransfers: [],
     metricsHistory: [],
     totalVolume: 0,
     totalFees: 0,
