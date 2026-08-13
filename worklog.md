@@ -600,3 +600,21 @@ Stage Summary:
 - Legacy routes with missing snapshotOfferVersion are rejected with LEGACY_ROUTE_SNAPSHOT_MISSING — no silent fill from the current offer.
 - The committed offer version is recorded in the route_terms_frozen audit event, making the committed market state fully reconstructable.
 - The core execution/economic architecture is now frozen.
+
+---
+Task ID: P3.8-CAS
+Agent: main (Z.ai Code)
+Task: Atomic offer version compare-and-swap at route commitment. The final concurrency hardening. No new features.
+
+Work Log:
+- Added STEP 2 (compare-and-swap) in reserveRoute(): for each leg, performs UPDATE LiquidityOffer SET version = version + 1 WHERE id = offerId AND version = snapshotOfferVersion. If 0 rows affected → StaleRouteError → transaction rolls back.
+- The CAS is the REAL concurrency guard: even if another transaction modifies the offer after the validation read in STEP 1, the CAS will fail and the entire reservation rolls back. No mixed economics.
+- snapshotOfferVersion is NOT updated by the CAS — it stays as the observed version. The incremented version (N+1) is visible to future provider updates.
+- Updated P3.6 and P3.7 tests to use future lastTickAt to prevent ticker interference.
+- Tests: tests/p3-cas.test.ts (17 assertions) — no mutation succeeds, CAS increments version, stale version rejected, concurrent reservations only one succeeds, multi-leg atomic rollback, post-reservation frozen, legacy rejected.
+- All existing tests pass (collateral 23, P3.6 commitment 22, P3.7 versioning 16). Lint + type-check clean.
+- Pushed to GitHub (commit 87d7c9d).
+
+Stage Summary:
+- The offer version compare-and-swap is now truly atomic. Two concurrent transactions cannot both commit the same observed offer state. If a provider updates their offer between route discovery and reservation, the CAS fails and the route is rejected — no mixed economics.
+- The core execution/economic architecture is now frozen.
