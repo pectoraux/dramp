@@ -19,7 +19,14 @@ const failures: string[] = [];
 function assert(cond: boolean, label: string) {
   if (cond) passed++; else { failed++; failures.push(label); console.error(`  ✗ ${label}`); }
 }
-function approxEq(a: number, b: number, eps = 0.01): boolean {
+// Single monetary epsilon for ALL conservation checks.
+// The simulator uses float64 arithmetic. After ~100 operations on ~$100k
+// balances, accumulated rounding error is well below 0.01. We use 0.01
+// as the universal tolerance — any discrepancy larger than this indicates
+// a real conservation violation, not floating-point noise.
+const MONETARY_EPSILON = 0.01;
+
+function approxEq(a: number, b: number, eps = MONETARY_EPSILON): boolean {
   return Math.abs(a - b) < eps;
 }
 
@@ -153,10 +160,7 @@ async function main() {
       const inflow = externalInflows[asset] ?? 0;
       const outflow = externalOutflows[asset] ?? 0;
       const expected = initialBalances[asset] + inflow - outflow;
-      if (step < 3 && asset === "USD") {
-        console.log(`  DEBUG step ${step} USD: spendable=${totalSpendable(world, asset).toFixed(2)}, encumbered=${totalEncumbered(world, asset).toFixed(2)}, treasury=${totalTreasury(world, asset).toFixed(2)}, total=${current.toFixed(2)}, inflow=${inflow.toFixed(2)}, expected=${expected.toFixed(2)}`);
-      }
-      if (!approxEq(current, expected, 1.0)) {
+      if (!approxEq(current, expected)) {
         stepFailures++;
         console.error(`  Step ${step}: ${asset} conservation FAILED: expected ${expected.toFixed(2)}, actual ${current.toFixed(2)}, delta ${(current - expected).toFixed(2)}`);
       }
@@ -198,26 +202,34 @@ async function main() {
     console.log(`    expected: ${expected.toFixed(2)}, actual: ${finalTotal.toFixed(2)}, delta: ${(finalTotal - expected).toFixed(2)}`);
     console.log(`    spendable=${finalSpendable.toFixed(2)}, encumbered=${finalEncumbered.toFixed(2)}, treasury=${finalTreasury.toFixed(2)}`);
 
-    // For internal assets (USDC): exact conservation (tolerance 1.0).
-    // For boundary assets (USD, EUR): tolerance includes treasury replenishment
-    // side-effects and multi-step settlement timing (tolerance 5.0).
-    const tolerance = asset === "USDC" ? 1.0 : 5.0;
-    assert(approxEq(finalTotal, expected, tolerance),
-      `${asset}: initial(${initialBalances[asset].toFixed(2)}) + inflows(${inflow.toFixed(2)}) - outflows(${outflow.toFixed(2)}) = ${expected.toFixed(2)} ≈ final(${finalTotal.toFixed(2)}) [tol=${tolerance}]`);
+    // ALL assets use the same MONETARY_EPSILON. Treasury replenishment is
+    // internal (treasury → operating, both in totalAsset) so it has zero
+    // effect on the conservation equation. No special tolerance needed.
+    assert(approxEq(finalTotal, expected),
+      `${asset}: initial(${initialBalances[asset].toFixed(2)}) + inflows(${inflow.toFixed(2)}) - outflows(${outflow.toFixed(2)}) = ${expected.toFixed(2)} ≈ final(${finalTotal.toFixed(2)}) [eps=${MONETARY_EPSILON}]`);
   }
 
   // 2. CAPACITY CONSERVATION (exact equation).
   console.log("\n  --- 2. Capacity Conservation ---");
   for (const o of world.offers.values()) {
     if (!o.active) continue;
+    // Only reconcile offers that existed at initialization. Dynamically created
+    // offers (from provider growth) have no initialCapacity entry — they would
+    // need a CAPACITY_CREATED mutation to be included. This fixture has
+    // providerGrowthRate=0 so no dynamic offers exist, but the check is
+    // explicit for robustness.
+    if (!(o.id in initialCapacity)) {
+      console.log(`  Offer ${o.id}: dynamically created — excluded from capacity reconciliation`);
+      continue;
+    }
     const mutations = world.capacityMutations
       .filter(m => m.offerId === o.id)
       .reduce((s, m) => s + m.delta, 0);
     const expected = initialCapacity[o.id] + mutations;
     const actual = o.availableCapacity + o.reservedCapacity;
     console.log(`  Offer ${o.id}: initial=${initialCapacity[o.id].toFixed(2)}, mutations=${mutations.toFixed(2)}, expected=${expected.toFixed(2)}, actual=${actual.toFixed(2)}`);
-    assert(approxEq(actual, expected, 0.1),
-      `Offer ${o.id}: initial(${initialCapacity[o.id].toFixed(2)}) + mutations(${mutations.toFixed(2)}) = ${expected.toFixed(2)} ≈ available+reserved(${actual.toFixed(2)})`);
+    assert(approxEq(actual, expected),
+      `Offer ${o.id}: initial(${initialCapacity[o.id].toFixed(2)}) + mutations(${mutations.toFixed(2)}) = ${expected.toFixed(2)} ≈ available+reserved(${actual.toFixed(2)}) [eps=${MONETARY_EPSILON}]`);
   }
 
   // 3. CAPITAL-TIME RECONCILIATION (exact equation).
