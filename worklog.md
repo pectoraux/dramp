@@ -834,3 +834,30 @@ Stage Summary:
 - Demand has patience: customers abandon if price or latency exceeds their limits. Congestion now causes customer loss, not just retry.
 - All new assumptions are explicitly versioned in SimConfig. P4.4 behavior can be restored by disabling the P4.5 flags.
 - The simulator is now economically realistic enough for controlled experiments. Next steps (P4.6-P4.8): FX volatility, adaptive agents, Monte Carlo stress testing.
+
+---
+Task ID: P4.6-SettlementLifecycle
+Agent: main (Z.ai Code)
+Task: Fix settlement lifecycle (delay must affect user latency), liquidity conservation (no money creation), and add FX valuation. Do not add FX volatility, adaptive agents, or Monte Carlo yet.
+
+Work Log:
+- Added SimInFlightExecution type (id, intentId, legs, startStep, completionStep, settlementOutcome, reservations) to world.ts. Added inFlightExecutions array to SimWorld.
+- Added processInFlightExecutions() as step 2 of simulateStep — completes settlements whose completionStep has arrived. At completion: consume liquidity, credit provider, release reservation, record execution history, accrue incentives.
+- Rewrote executeIntent: no longer marks intent COMPLETED immediately. Sets status to EXECUTING, creates SimInFlightExecution with completionStep = startStep + maxDurationSteps. Capital IS reserved (capacity constrained), but liquidity is NOT consumed until settlement. Incentives NOT accrued until settlement.
+- Added completeSettlement() function: called by processInFlightExecutions when settlement time is up. Marks intent COMPLETED, consumes liquidity (payout decreases destination, receipt increases source), credits provider earnings, releases reservation, records execution history, accrues leg/campaign-aware incentives.
+- Added FX_REFERENCE_RATES (USD=1.0, EUR=1.08, NGN=0.00065, WETH=2500, etc.) and toUsdValue() helper to world.ts. Enables cross-asset liquidity valuation.
+- Added treasury (SimLiquidityInventory) to SimProvider. Treasury holds 2-4× operating balances — finite source for replenishment.
+- Rewrote replenishLiquidity(): transfers from treasury → operating (conservation). min(needed, treasuryBalance) with random variation. Treasury decreases by exactly the amount operating increases. No money creation.
+- Added totalReplenished to SimProvider (tracks total treasury → operating transfers).
+- Updated updateProviderOffers: computes utilization from BOTH activeReservations AND inFlightExecutions (in-flight reservations persist across steps).
+- Added createTreasury() to generator: gives providers finite treasury balances per asset.
+- Added 6 new settlement lifecycle metrics: inFlightExecutions, avgSettlementLatencySteps, p50/p95SettlementLatencySteps, totalLiquidityReplenished, totalExternalLiquidityInjected.
+- Tests: P4 mechanics expanded to 99 assertions — settlement lifecycle (EXECUTING status, completionStep > createdAtStep), liquidity conservation (treasury transfer, no 'balance += topUp'), FX valuation (reference rates, toUsdValue).
+- All tests pass: P4 canonical 91, P4 simulator 21, P4 faithful 19, P4 mechanics 99. Lint clean.
+- Pushed to GitHub (commit a08ee1d).
+
+Stage Summary:
+- Settlement delay now affects BOTH user latency AND provider capital. A DELAYED (2×) settlement means the user waits 2× longer for COMPLETED status, and the provider's capital is locked for 2× longer.
+- Liquidity is conserved: treasury → operating transfers are the only source of replenishment. No balances are created from nowhere. When treasury is depleted, providers must wait for settlement receipts.
+- FX valuation enables meaningful cross-asset comparison: $50k USD vs ₦50k are now correctly valued differently.
+- The simulator is now economically coherent: settlement timing, liquidity conservation, and FX valuation are all modeled correctly. Next steps (P4.7-P4.8): adaptive agents, Monte Carlo stress testing.
