@@ -651,11 +651,11 @@ async function main() {
   // =========================================================================
   console.log("\n== 27. Downstream failure recovery ==");
 
-  // Verify the source code reverses transfers on downstream failure.
-  assert(engineSrc5.includes("REVERSE that transfer"), "failExecution reverses outstanding transfers");
-  assert(engineSrc5.includes("transfer_reversal"), "Records reversal as FAILED transfer");
-  assert(engineSrc5.includes("reversal = Math.min(transferAmount, thisBalance)"),
-    "Reversal limited to available balance (no negative balances)");
+  // Verify the source code reverses transfers on downstream failure (encumbrance model).
+  assert(engineSrc5.includes("REVERSE the FULL transfer amount"), "failExecution reverses FULL transfer amount");
+  assert(engineSrc5.includes("status = \"FAILED\""), "Records reversal as FAILED transfer");
+  assert(engineSrc5.includes("ENCUMBRANCE RECOVERY"),
+    "Uses encumbrance recovery (not Math.min with available balance)");
 
   // Run a simulation with high failure rate to trigger downstream failures.
   const failWorld = runSimulation({

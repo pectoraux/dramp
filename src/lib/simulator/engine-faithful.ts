@@ -140,6 +140,9 @@ function processInFlightExecutions(world: SimWorld, rng: SeededRNG): void {
         leg.status = "EXECUTING";
         leg.startStep = world.step;
         leg.completionStep = world.step + durationSteps;
+        // Release encumbrance: the upstream transfer becomes spendable now
+        // that this leg has successfully started. The transfer → COMPLETED.
+        releaseEncumbrance(world, exec, i);
         // Reserve capacity for this leg (do NOT increment version — version
         // tracks economic changes, not reservations. Production separates these).
         const offer = world.offers.get(leg.offerId);
@@ -301,18 +304,21 @@ function createSettlementTransfer(world: SimWorld, exec: SimInFlightExecution, f
   const asset = fromLeg.destinationAsset;
   const amount = fromLeg.payoutAmount; // the amount paid out by from-leg
 
-  // Credit the downstream provider's source-asset balance NOW (so it's available
-  // when their leg starts executing). This is the conserved transfer:
-  // from-leg debited the asset, to-leg credits it.
+  // ENCUMBRANCE MODEL (P4.7.2A): do NOT credit the downstream provider's
+  // spendable balance yet. Instead, hold the amount as ENCUMBERED balance
+  // belonging to the downstream provider. It becomes spendable only when
+  // the downstream leg successfully starts (releaseEncumbrance).
+  // If the downstream leg fails, the FULL amount returns to the upstream
+  // provider (failExecution reversal).
   if (world.config.enableLiquidityInventory) {
     const toProvider = world.providers.get(toLeg.providerId);
     if (toProvider) {
-      const balance = toProvider.liquidity.balances.get(asset) ?? 0;
-      toProvider.liquidity.balances.set(asset, balance + amount);
+      const encumberedBalance = toProvider.encumbered.balances.get(asset) ?? 0;
+      toProvider.encumbered.balances.set(asset, encumberedBalance + amount);
     }
   }
 
-  // Record the transfer for auditing/metrics.
+  // Record the transfer as IN_FLIGHT (not yet COMPLETED).
   const transfer: SimSettlementTransfer = {
     id: `transfer_${++reservationCounter}`,
     executionId: exec.id,
@@ -323,28 +329,68 @@ function createSettlementTransfer(world: SimWorld, exec: SimInFlightExecution, f
     fromLegIndex,
     toLegIndex: fromLegIndex + 1,
     settlementStep: world.step,
-    status: "COMPLETED",
+    status: "IN_FLIGHT",
   };
   world.settlementTransfers.push(transfer);
 }
 
+// Release encumbrance: when a downstream leg successfully starts executing,
+// move the encumbered settlement-asset amount to the provider's spendable
+// operating balance. The transfer becomes COMPLETED.
+function releaseEncumbrance(world: SimWorld, exec: SimInFlightExecution, legIndex: number): void {
+  if (legIndex === 0) return; // first leg has no upstream transfer
+  const leg = exec.legs[legIndex];
+  const upstreamLeg = exec.legs[legIndex - 1];
+  const asset = upstreamLeg.destinationAsset; // == leg.sourceAsset
+  const amount = upstreamLeg.payoutAmount;
+
+  if (world.config.enableLiquidityInventory) {
+    const provider = world.providers.get(leg.providerId);
+    if (provider) {
+      // Move from encumbered → spendable operating balance.
+      const encumberedBalance = provider.encumbered.balances.get(asset) ?? 0;
+      const operatingBalance = provider.liquidity.balances.get(asset) ?? 0;
+      const releaseAmount = Math.min(amount, encumberedBalance);
+      provider.encumbered.balances.set(asset, encumberedBalance - releaseAmount);
+      provider.liquidity.balances.set(asset, operatingBalance + releaseAmount);
+
+      // Mark the corresponding transfer as COMPLETED.
+      for (const transfer of world.settlementTransfers) {
+        if (transfer.executionId === exec.id && transfer.toLegIndex === legIndex && transfer.status === "IN_FLIGHT") {
+          transfer.status = "COMPLETED";
+          break;
+        }
+      }
+    }
+  }
+}
+
 // Fail an execution: a leg failed. Release all remaining reservations, mark
 // intent FAILED, and REVERSE any outstanding internal transfers from upstream
-// legs that already settled (so settlement assets aren't stranded).
+// legs that already settled.
 //
-// Recovery rule (Prompt 4.7.1): if leg N failed but leg N-1 already settled
-// and transferred a settlement asset to leg N's provider, that transfer must
-// be reversed — the settlement asset returns to the upstream provider.
+// ENCUMBRANCE RECOVERY (P4.7.2A): if leg N failed but leg N-1 already settled
+// and created an IN_FLIGHT transfer, the FULL transfer amount is returned to
+// the upstream provider. The encumbered balance (which hasn't been released to
+// spendable operating balance yet) is debited, and the full amount is credited
+// back to the upstream provider's spendable balance.
+//
+// If the downstream leg already started (EXECUTING) and the encumbrance was
+// released to spendable balance, the full amount is still returned — debited
+// from the downstream provider's spendable balance. If the provider has
+// insufficient balance, the shortfall becomes an explicit obligation (recorded
+// but not silently destroyed).
 function failExecution(world: SimWorld, exec: SimInFlightExecution): void {
   const intent = world.intents.find(i => i.id === exec.intentId);
   if (!intent) return;
   intent.status = "FAILED";
   intent.failureReason = "upstream settlement failure (dependency chain)";
 
-  // Find the failed leg and reverse any transfers from upstream settled legs.
   for (let i = 0; i < exec.legs.length; i++) {
     const leg = exec.legs[i];
-    if (leg.status === "EXECUTING" || leg.status === "PENDING") {
+    // Process legs that failed OR were cancelled (EXECUTING/PENDING when the
+    // failure was detected). Legs already SETTLED are left as-is.
+    if (leg.status === "EXECUTING" || leg.status === "PENDING" || leg.status === "FAILED") {
       // This leg failed or was cancelled. Release its reservation.
       const offer = world.offers.get(leg.offerId);
       if (offer) {
@@ -358,35 +404,46 @@ function failExecution(world: SimWorld, exec: SimInFlightExecution): void {
       leg.status = "FAILED";
 
       // If this leg had an upstream leg that already settled and transferred
-      // a settlement asset to this provider, REVERSE that transfer: return
-      // the settlement asset to the upstream provider.
+      // a settlement asset, REVERSE the FULL transfer amount.
       if (i > 0 && exec.legs[i - 1].status === "SETTLED" && world.config.enableLiquidityInventory) {
         const upstreamLeg = exec.legs[i - 1];
-        const settlementAsset = upstreamLeg.destinationAsset; // == leg.sourceAsset
+        const settlementAsset = upstreamLeg.destinationAsset;
         const transferAmount = upstreamLeg.payoutAmount;
-        // Reverse: debit this provider (who received it), credit upstream (who paid it).
         const thisProvider = world.providers.get(leg.providerId);
         const upstreamProvider = world.providers.get(upstreamLeg.providerId);
         if (thisProvider && upstreamProvider) {
-          const thisBalance = thisProvider.liquidity.balances.get(settlementAsset) ?? 0;
+          // First, try to reverse from encumbered balance (if leg never started).
+          const encumberedBal = thisProvider.encumbered.balances.get(settlementAsset) ?? 0;
+          const fromEncumbered = Math.min(transferAmount, encumberedBal);
+          thisProvider.encumbered.balances.set(settlementAsset, encumberedBal - fromEncumbered);
+
+          // If encumbered didn't cover the full amount, take from spendable balance.
+          const remaining = transferAmount - fromEncumbered;
+          if (remaining > 0) {
+            const spendableBal = thisProvider.liquidity.balances.get(settlementAsset) ?? 0;
+            const fromSpendable = Math.min(remaining, spendableBal);
+            thisProvider.liquidity.balances.set(settlementAsset, spendableBal - fromSpendable);
+            // If spendable didn't cover it either, record the shortfall as an
+            // explicit obligation (not silently destroyed).
+            const shortfall = remaining - fromSpendable;
+            if (shortfall > 0) {
+              // Record the shortfall — the downstream provider owes this amount.
+              // For now, we track it as a penalty (the provider is liable).
+              thisProvider.totalPenalties += shortfall;
+            }
+          }
+
+          // Credit the FULL transfer amount back to the upstream provider.
           const upstreamBalance = upstreamProvider.liquidity.balances.get(settlementAsset) ?? 0;
-          // Only reverse what's available (don't go negative).
-          const reversal = Math.min(transferAmount, thisBalance);
-          thisProvider.liquidity.balances.set(settlementAsset, thisBalance - reversal);
-          upstreamProvider.liquidity.balances.set(settlementAsset, upstreamBalance + reversal);
-          // Record the reversal as a FAILED transfer.
-          world.settlementTransfers.push({
-            id: `transfer_reversal_${++reservationCounter}`,
-            executionId: exec.id,
-            fromProviderId: leg.providerId,       // reversed: this provider returns it
-            toProviderId: upstreamLeg.providerId,  // to the upstream provider
-            asset: settlementAsset,
-            amount: reversal,
-            fromLegIndex: i,
-            toLegIndex: i - 1,
-            settlementStep: world.step,
-            status: "FAILED",
-          });
+          upstreamProvider.liquidity.balances.set(settlementAsset, upstreamBalance + transferAmount);
+
+          // Mark the corresponding transfer as FAILED.
+          for (const transfer of world.settlementTransfers) {
+            if (transfer.executionId === exec.id && transfer.toLegIndex === i) {
+              transfer.status = "FAILED";
+              break;
+            }
+          }
         }
       }
     }

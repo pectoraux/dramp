@@ -195,6 +195,7 @@ function generateProvider(
     // Initialized after corridors are built (below).
     liquidity: { balances: new Map() },
     treasury: { balances: new Map() },
+    encumbered: { balances: new Map() },
     totalReplenished: 0,
     reliabilityProfile: getReliabilityProfile(rng, providerType),
   };
@@ -323,6 +324,7 @@ export function generateNewProvider(
     executionHistory: [],
     liquidity: { balances: new Map() },
     treasury: { balances: new Map() },
+    encumbered: { balances: new Map() },
     totalReplenished: 0,
     reliabilityProfile: getReliabilityProfile(rng, providerType),
   };

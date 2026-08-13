@@ -65,6 +65,11 @@ export interface SimProvider {
   // Liquidity inventory: actual cash balances per asset, SEPARATE from collateral.
   // A provider can be well-collateralized but lack destination liquidity.
   liquidity: SimLiquidityInventory;
+  // Encumbered liquidity: settlement-asset amounts held in escrow from upstream
+  // transfers that haven't been released to spendable operating balance yet.
+  // The downstream provider can't spend these until its leg successfully starts.
+  // If the downstream leg fails, the full amount returns to the upstream provider.
+  encumbered: SimLiquidityInventory;
   // Treasury: finite source for liquidity replenishment. When a provider needs
   // more operating liquidity, it transfers from treasury → operating balance.
   // This CONSERVES money — no balances are created from nowhere.
@@ -179,6 +184,15 @@ export interface SimInFlightExecution {
 //   - Leg 1 settles: Provider A pays out USDC → transfer to Provider B
 //   - Leg 2 settles: Provider B receives that USDC, pays out EUR
 // The USDC debit at A == the USDC credit at B. No assets created.
+//
+// ENCUMBRANCE MODEL (P4.7.2A):
+// When the upstream leg settles, the transfer is created with status IN_FLIGHT.
+// The amount is debited from A's available balance but is NOT yet credited to
+// B's spendable balance. Instead it's held as encumbered balance belonging to
+// B. Only when B's downstream leg successfully starts does the encumbered
+// balance become spendable operating liquidity (status → COMPLETED).
+// If the downstream leg fails, the FULL amount is returned to A (status → FAILED).
+// This prevents B from spending the transfer before the obligation resolves.
 export interface SimSettlementTransfer {
   id: string;
   executionId: string;
@@ -189,7 +203,7 @@ export interface SimSettlementTransfer {
   fromLegIndex: number;       // leg that produced this transfer (source)
   toLegIndex: number;         // leg that consumes this transfer (destination)
   settlementStep: number;     // when the transfer occurred
-  status: "PENDING" | "COMPLETED" | "FAILED";
+  status: "IN_FLIGHT" | "COMPLETED" | "FAILED";
 }
 
 // Settlement reliability profile: per-provider-type probability distribution
