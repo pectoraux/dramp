@@ -635,3 +635,55 @@ Work Log:
 Stage Summary:
 - The concurrent offer-update vs reservation test gap is now closed. The CAS mechanism is proven to correctly serialize reservation vs offer mutation — no mixed economics possible.
 - The core execution/economic architecture is frozen.
+
+---
+Task ID: P4-Sim-UI
+Agent: full-stack-developer
+Task: Build dRamp simulator UI in the existing Ops panel
+
+Work Log:
+- Read worklog + simulator API routes (`/api/simulator/scenarios`, `/api/simulator/run`) + `lib/simulator/world.ts` + `engine.ts` to confirm exact request/response shapes (SimConfig, SimMetrics, metricsHistory emitted every 5 steps + final, corridors sorted by demand, providers sorted by volume).
+- Added simulator TS types to `src/components/dramp/types.ts`: SimConfig, SimScenario, SimScenariosResponse, SimMetrics, SimMetricsPoint, SimCorridor, SimProviderResult, SimRunResponse.
+- Built `src/components/dramp/simulator-panel.tsx` (~1500 LOC) as a single self-contained client component exporting `SimulatorPanel`:
+  - **Scenario picker**: fetches `GET /api/simulator/scenarios` on mount, renders all 9 preset scenarios as clickable cards (Provider Growth, Largest Provider Exit, Stablecoin Incentive Bootstrap, Volatile Settlement Asset, Patient Execution Comparison, Liquidity Shock, Demand Surge, No Incentives Baseline, Reputation Disabled). Each card shows name, description, seed/steps/providers/shock badges. Clicking a card pre-fills the config form and marks it "Selected" with an emerald ring + toast.
+  - **Config form**: editable NumberFields for seed, totalSteps, initialProviders, providerGrowthRate, demandVolume, baselineCostBps; Select for shockType (NONE/LIQUIDITY/PROVIDER_EXIT/ASSET_DEPEG/INCENTIVE_END/DEMAND_SURGE/REGULATORY); NumberFields for shockStep & shockMagnitude; Switch toggles for enableReputation/enableCommitments/enableIncentives (each in an emerald-tinted card when on). Reset button restores defaults; Run simulation button POSTs to `/api/simulator/run` with emerald styling and spinner.
+  - **Results dashboard**: after the simulation POST resolves, renders
+    - Equilibrium banner (POSITIVE=emerald, FRAGILE=amber, NEGATIVE=rose, FORMING=zinc) with description text + seed/shock summary.
+    - Stat cards grouped by User outcomes (totalIntents, completionRate, avgCostBps vs baseline, avgWaitSteps + p50/p95), Provider outcomes (activeProviders, avgProviderEarnings + median, avgUtilization, totalProviderVolume), Network outcomes (totalLiquidity, marketConcentration HHI, totalProtocolRevenue, totalIncentiveSpend). Cards have icons, accent-colored numbers, sub-text.
+    - Metrics history chart (Recharts LineChart, 72h height, dual Y-axes: left for cost/completion/providers, right for liquidity in k/M). 4 lines: avgCostBps (emerald), completionRate (sky), activeProviders (amber), totalLiquidity (violet). X-axis = step. CartesianGrid, Tooltip with formatted values, Legend with human-readable labels.
+    - Corridor analysis table (corridor, demand, completed, failed, avgCostBps, completion rate with colored progress bar). Sorted by demand, top 20.
+    - Provider leaderboard table (rank, name+type+strategy badges, tier badge with dot, status badge, reputation %, volume, earnings, executions, utilization with progress bar). Sorted by volume. Exited providers dimmed.
+    - Compare CTA card with "Slot A" / "Slot B" buttons to load the current result into either comparison slot.
+  - **Comparison mode**: separate tab with two scenario preset dropdowns (A and B) and a "Run both" button that fires two `/api/simulator/run` POSTs in parallel. After both finish, shows a "Side-by-side metrics" table with 13 rows (equilibrium, completion rate, avg cost, active providers, exited providers, avg earnings, total volume, total liquidity, market concentration, protocol revenue, incentive spend, avg wait, p95). Each row shows A value, Δ (abs or %), B value; the better performer is highlighted in emerald. Help text per row explains directionality (Higher/Lower is better). Slots can also be populated from the Single run tab via "Slot A/B" buttons.
+  - Loading skeleton (3 scenario cards + 64-row skeleton) while scenarios fetch; full skeleton block during simulation run.
+  - Dark theme consistent with existing dRamp UI: emerald accent, zinc background, custom scrollbars (`dramp-scroll`), responsive (grid collapses from 4→2→1 cols on mobile; tables scroll horizontally with max-h-96 vertical).
+- Wired "Simulator" sub-nav item into `src/components/dramp/ops-panel.tsx`:
+  - Imported `SimulatorPanel` + `FlaskConical` icon.
+  - Added `"simulator"` to `OpsView` union and `VIEWS` array (last item, after "Funnel").
+  - Added `{view === "simulator" && <SimulatorPanel />}` to the view switch.
+- Pre-existing lint fix: `src/lib/simulator/engine.ts` was using `require()` dynamic imports inside `runSimulation` (forbidden by `@typescript-eslint/no-require-imports`). Replaced with static top-level ES imports (`createWorld` from `./world`, `generateWorld` from `./generator`). Verified no circular dep exists (generator.ts imports from world.ts + rng.ts only). This was blocking `bun run lint` from passing — now clean.
+- Lint: 0 errors, 0 warnings.
+
+Self-verification (agent-browser + VLM):
+- Logged in as admin (ekontetevi@gmail.com / Payswap123456) — auth screen → main app.
+- Navigated to **Ops** tab → **Simulator** sub-nav item visible at end of sub-nav row.
+- Clicked Simulator → Scenario library renders all 9 preset cards. Config form pre-filled with default config (seed=42, totalSteps=100, initialProviders=10, providerGrowthRate=0.05, demandVolume=5, baselineCostBps=300, shock=None, all toggles ON).
+- Clicked "Provider Growth (5→50)" scenario card → form updates to initialProviders=5, providerGrowthRate=0.15, card marked "Selected" with emerald ring + toast.
+- Clicked "Run simulation" → POST /api/simulator/run 200 OK. Results dashboard rendered:
+  - Equilibrium banner: "Negative equilibrium" (rose, NEGATIVE badge) — realistic for the small 5-provider growth scenario.
+  - 12 stat cards in 3 groups: User outcomes (108 intents, 17.6% completion, 19.6 bps avg cost vs 300 bps baseline, 2.7 avg wait), Provider outcomes (3 active / 15 exited, 0.40 avg earnings, 0.0% util, 5,221.28 volume), Network outcomes (144,278.69 liquidity, 0.501 HHI, 15.18 protocol revenue, 0.00 incentive spend).
+  - Metrics history chart: Recharts LineChart, dual Y-axis (left 0-30, right 0-600k), 4 colored lines (avgCostBps emerald, completionRate sky, activeProviders amber, totalLiquidity violet), 21 samples, X-axis step labels (5,10,15,...,100), legend with 4 series, formatted tooltip. DOM-verified: 4 `<Line>` elements, 31 X-axis tick labels, 4 legend SVGs.
+  - Corridor analysis table: ~20 rows sorted by demand, columns Corridor / Demand / Done / Failed / Avg cost (bps) / Rate (with colored progress bar). Example: "PHP:PH → NGN:NG" corridors.
+  - Provider leaderboard table: 18 providers ranked by volume with Tier badge (Verified/New) + colored dot, Status badge (Exited dimmed, Active), reputation %, volume, earnings (emerald), executions, utilization bar. Top: FastCorridor K (Premium, Exited), Sahara F.
+  - Compare CTA at bottom with "Slot A" / "Slot B" buttons.
+- Switched to **Comparison** tab → two dropdowns (Scenario A=Provider Growth, Scenario B=Largest Provider Exit) + "Run both" button. Clicked "Run both" → both POSTs fired in parallel, both 200 OK. Side-by-side metrics table rendered with 13 rows. VLM confirmed: green highlight on better performers with correct directionality (A wins completion rate 17.6% > B; A wins active providers 3 > B; A wins earnings 0.40 > B; A wins liquidity 144k > B; rows like "Exited providers" and "Avg wait" highlight B when lower is better).
+- No console errors. No page errors. No layout overflow.
+- VLM screenshots confirmed: emerald accent visible, dark theme, professional fintech aesthetic, dual-axis chart with 4 colored lines, green highlighting in comparison table, no visual issues.
+
+Stage Summary:
+- dRamp Network Simulator UI delivered in `src/components/dramp/simulator-panel.tsx` (~1500 LOC) and wired into the existing Ops panel as a "Simulator" sub-nav item (last position, FlaskConical icon).
+- Single-run mode: scenario picker (9 presets) → editable config form → run button → results dashboard (equilibrium banner + 12 stat cards in 3 groups + Recharts dual-axis line chart + corridor table + provider leaderboard table + compare slot CTA).
+- Comparison mode: two scenario dropdowns → "Run both" parallel POST → 13-row side-by-side metrics table with green highlighting on the better performer per row + help text per metric.
+- Dark theme, emerald accent, fully responsive, custom scrollbar styling, loading skeletons during scenarios fetch + during simulation run.
+- Pre-existing `@typescript-eslint/no-require-imports` errors in `lib/simulator/engine.ts` fixed (replaced `require()` with static ES imports). `bun run lint` now passes clean.
+- Verified end-to-end via agent-browser + VLM: scenarios fetch, config pre-fill, simulation POST 200, equilibrium badge, 12 stat cards, dual-axis chart with 4 lines, corridor table, provider leaderboard table, comparison table with green highlighting. No console/page errors. No layout overflow.

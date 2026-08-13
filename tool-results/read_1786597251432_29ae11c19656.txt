@@ -1,0 +1,1287 @@
+     1→"use client";
+     2→
+     3→import { useState } from "react";
+     4→import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+     5→import { Button } from "@/components/ui/button";
+     6→import { Input } from "@/components/ui/input";
+     7→import { Label } from "@/components/ui/label";
+     8→import { Badge } from "@/components/ui/badge";
+     9→import { Skeleton } from "@/components/ui/skeleton";
+    10→import { Progress } from "@/components/ui/progress";
+    11→import {
+    12→  Select,
+    13→  SelectContent,
+    14→  SelectItem,
+    15→  SelectTrigger,
+    16→  SelectValue,
+    17→} from "@/components/ui/select";
+    18→import {
+    19→  Dialog,
+    20→  DialogContent,
+    21→  DialogDescription,
+    22→  DialogFooter,
+    23→  DialogHeader,
+    24→  DialogTitle,
+    25→  DialogTrigger,
+    26→} from "@/components/ui/dialog";
+    27→import {
+    28→  Textarea,
+    29→} from "@/components/ui/textarea";
+    30→import { usePolling } from "@/hooks/use-polling";
+    31→import { toast } from "sonner";
+    32→import { cn } from "@/lib/utils";
+    33→import {
+    34→  formatMoney,
+    35→  formatDuration,
+    36→  formatTimestamp,
+    37→  formatPercent,
+    38→  prettyEnum,
+    39→  riskBarColor,
+    40→  shortId,
+    41→  toNum,
+    42→} from "./format";
+    43→import type {
+    44→  OpsOverview,
+    45→  OpsQueueResponse,
+    46→  OpsQueueItem,
+    47→  OpsBottlenecks,
+    48→  OpsProviderRiskResponse,
+    49→  OpsProviderRisk,
+    50→  OpsAssetRiskResponse,
+    51→  OpsAssetRisk,
+    52→  OpsConcentration,
+    53→  OpsDisputesResponse,
+    54→  OpsDispute,
+    55→  OpsReconciliationResponse,
+    56→  OpsReconciliationItem,
+    57→  IncentivesResponse,
+    58→  IncentiveCampaign,
+    59→  OnboardingProvider,
+    60→  OnboardingProvidersResponse,
+    61→} from "./types";
+    62→import { NetworkHealthView as EconNetworkHealthView } from "./network-health-view";
+    63→import { UnitEconomicsView as EconUnitEconomicsView } from "./unit-economics-view";
+    64→import { AcquisitionFunnel as EconAcquisitionFunnel } from "./acquisition-funnel";
+    65→import {
+    66→  Activity,
+    67→  Gauge,
+    68→  ListChecks,
+    69→  AlertTriangle,
+    70→  ShieldAlert,
+    71→  ShieldCheck,
+    72→  Coins,
+    73→  Scale,
+    74→  Gavel,
+    75→  FileCheck2,
+    76→  Gift,
+    77→  UserCheck,
+    78→  Loader2,
+    79→  ArrowRight,
+    80→  Clock,
+    81→  CheckCircle2,
+    82→  XCircle,
+    83→  Flag,
+    84→  Layers,
+    85→  TrendingUp,
+    86→  Building2,
+    87→} from "lucide-react";
+    88→
+    89→type OpsView =
+    90→  | "overview"
+    91→  | "queue"
+    92→  | "bottlenecks"
+    93→  | "provider-risk"
+    94→  | "asset-risk"
+    95→  | "concentration"
+    96→  | "disputes"
+    97→  | "reconciliation"
+    98→  | "incentives"
+    99→  | "onboarding"
+   100→  | "network-health"
+   101→  | "unit-economics"
+   102→  | "funnel";
+   103→
+   104→const VIEWS: { key: OpsView; label: string; icon: React.ReactNode }[] = [
+   105→  { key: "overview", label: "Overview", icon: <Gauge className="size-3.5" /> },
+   106→  { key: "queue", label: "Queue", icon: <ListChecks className="size-3.5" /> },
+   107→  { key: "bottlenecks", label: "Bottlenecks", icon: <AlertTriangle className="size-3.5" /> },
+   108→  { key: "provider-risk", label: "Provider risk", icon: <ShieldAlert className="size-3.5" /> },
+   109→  { key: "asset-risk", label: "Asset risk", icon: <Coins className="size-3.5" /> },
+   110→  { key: "concentration", label: "Concentration", icon: <Scale className="size-3.5" /> },
+   111→  { key: "disputes", label: "Disputes", icon: <Gavel className="size-3.5" /> },
+   112→  { key: "reconciliation", label: "Reconciliation", icon: <FileCheck2 className="size-3.5" /> },
+   113→  { key: "incentives", label: "Incentives", icon: <Gift className="size-3.5" /> },
+   114→  { key: "onboarding", label: "Onboarding", icon: <UserCheck className="size-3.5" /> },
+   115→  { key: "network-health", label: "Network health", icon: <Activity className="size-3.5" /> },
+   116→  { key: "unit-economics", label: "Unit economics", icon: <TrendingUp className="size-3.5" /> },
+   117→  { key: "funnel", label: "Funnel", icon: <Layers className="size-3.5" /> },
+   118→];
+   119→
+   120→export function OpsPanel() {
+   121→  const [view, setView] = useState<OpsView>("overview");
+   122→
+   123→  return (
+   124→    <div className="space-y-4">
+   125→      <div>
+   126→        <h2 className="text-lg font-semibold flex items-center gap-2">
+   127→          <Activity className="size-5 text-emerald-500" /> Network Operations
+   128→        </h2>
+   129→        <p className="text-xs text-muted-foreground">
+   130→          Real-time view of executions, risk, disputes, reconciliation, incentives, and provider onboarding.
+   131→        </p>
+   132→      </div>
+   133→
+   134→      {/* Sub-nav */}
+   135→      <div className="flex overflow-x-auto dramp-scroll gap-1 border-b pb-2">
+   136→        {VIEWS.map((v) => (
+   137→          <button
+   138→            key={v.key}
+   139→            onClick={() => setView(v.key)}
+   140→            className={cn(
+   141→              "flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap",
+   142→              view === v.key
+   143→                ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+   144→                : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+   145→            )}
+   146→          >
+   147→            {v.icon}
+   148→            {v.label}
+   149→          </button>
+   150→        ))}
+   151→      </div>
+   152→
+   153→      {view === "overview" && <OverviewView />}
+   154→      {view === "queue" && <QueueView />}
+   155→      {view === "bottlenecks" && <BottlenecksView />}
+   156→      {view === "provider-risk" && <ProviderRiskView />}
+   157→      {view === "asset-risk" && <AssetRiskView />}
+   158→      {view === "concentration" && <ConcentrationView />}
+   159→      {view === "disputes" && <DisputesView />}
+   160→      {view === "reconciliation" && <ReconciliationView />}
+   161→      {view === "incentives" && <IncentivesView />}
+   162→      {view === "onboarding" && <OnboardingView />}
+   163→      {view === "network-health" && <NetworkHealthView />}
+   164→      {view === "unit-economics" && <UnitEconomicsView />}
+   165→      {view === "funnel" && <AcquisitionFunnel />}
+   166→    </div>
+   167→  );
+   168→}
+   169→
+   170→// ---------------------------------------------------------------------------
+   171→// Network health / unit economics / funnel — delegate to economics components
+   172→// ---------------------------------------------------------------------------
+   173→function NetworkHealthView() {
+   174→  return <EconNetworkHealthView />;
+   175→}
+   176→
+   177→function UnitEconomicsView() {
+   178→  return <EconUnitEconomicsView />;
+   179→}
+   180→
+   181→function AcquisitionFunnel() {
+   182→  return <EconAcquisitionFunnel />;
+   183→}
+   184→
+   185→// ---------------------------------------------------------------------------
+   186→// Overview
+   187→// ---------------------------------------------------------------------------
+   188→function OverviewView() {
+   189→  const { data, loading } = usePolling<OpsOverview>("/api/ops/overview", 5000);
+   190→  if (loading && !data) {
+   191→    return <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">{[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-24" />)}</div>;
+   192→  }
+   193→  if (!data) return null;
+   194→  const cards: { label: string; value: string; icon: React.ReactNode; accent?: "emerald" | "rose" | "amber" | "sky" }[] = [
+   195→    { label: "Total volume", value: formatMoney(data.totalVolume), icon: <TrendingUp className="size-4 text-emerald-500" />, accent: "emerald" },
+   196→    { label: "Completed", value: String(data.completedCount), icon: <CheckCircle2 className="size-4 text-emerald-500" /> },
+   197→    { label: "Active executions", value: String(data.activeExecutionCount), icon: <Activity className="size-4 text-sky-500" />, accent: "sky" },
+   198→    { label: "Active providers", value: String(data.activeProviders), icon: <Building2 className="size-4 text-emerald-500" /> },
+   199→    { label: "Available liquidity", value: formatMoney(data.availableLiquidity), icon: <Coins className="size-4 text-emerald-500" /> },
+   200→    { label: "Reserved liquidity", value: formatMoney(data.reservedLiquidity), icon: <Coins className="size-4 text-amber-500" />, accent: "amber" },
+   201→    { label: "Aggregate exposure", value: formatMoney(data.aggregateExposure), icon: <ShieldAlert className="size-4 text-amber-500" />, accent: "amber" },
+   202→    { label: "Aggregate collateral", value: formatMoney(data.aggregateCollateral), icon: <ShieldCheck className="size-4 text-emerald-500" /> },
+   203→    { label: "Unsettled obligations", value: formatMoney(data.unsettledObligations), icon: <Clock className="size-4 text-amber-500" />, accent: "amber" },
+   204→    { label: "Incentive budget", value: formatMoney(data.incentiveBudget), icon: <Gift className="size-4 text-emerald-500" /> },
+   205→    { label: "Incentive accrued", value: formatMoney(data.incentiveAccrued), icon: <Gift className="size-4 text-sky-500" /> },
+   206→    { label: "Incentive paid", value: formatMoney(data.incentivePaid), icon: <Gift className="size-4 text-emerald-500" /> },
+   207→  ];
+   208→  return (
+   209→    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+   210→      {cards.map((c) => (
+   211→        <Card key={c.label} className="py-3">
+   212→          <CardContent className="py-1">
+   213→            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+   214→              {c.icon}
+   215→              {c.label}
+   216→            </div>
+   217→            <div className={cn(
+   218→              "text-xl font-mono tabular-nums mt-1 font-semibold",
+   219→              c.accent === "emerald" && "text-emerald-600 dark:text-emerald-400",
+   220→              c.accent === "rose" && "text-rose-600 dark:text-rose-400",
+   221→              c.accent === "amber" && "text-amber-600 dark:text-amber-400",
+   222→              c.accent === "sky" && "text-sky-600 dark:text-sky-400",
+   223→            )}>
+   224→              {c.value}
+   225→            </div>
+   226→          </CardContent>
+   227→        </Card>
+   228→      ))}
+   229→    </div>
+   230→  );
+   231→}
+   232→
+   233→// ---------------------------------------------------------------------------
+   234→// Execution queue
+   235→// ---------------------------------------------------------------------------
+   236→function QueueView() {
+   237→  const { data, loading } = usePolling<OpsQueueResponse>("/api/ops/queue", 3000);
+   238→  const queue = data?.queue ?? [];
+   239→  return (
+   240→    <Card className="py-3">
+   241→      <CardHeader className="pb-2">
+   242→        <CardTitle className="text-sm flex items-center gap-2">
+   243→          <ListChecks className="size-4 text-emerald-500" /> Waiting intents
+   244→          <Badge variant="outline" className="text-[10px] py-0 h-4">{queue.length}</Badge>
+   245→        </CardTitle>
+   246→        <CardDescription className="text-xs">SEARCHING executions waiting for liquidity.</CardDescription>
+   247→      </CardHeader>
+   248→      <CardContent className="px-2">
+   249→        {loading && queue.length === 0 ? (
+   250→          <Skeleton className="h-32 w-full" />
+   251→        ) : queue.length === 0 ? (
+   252→          <div className="text-xs text-muted-foreground text-center py-8">No waiting intents.</div>
+   253→        ) : (
+   254→          <div className="dramp-scroll overflow-x-auto max-h-[60vh] overflow-y-auto">
+   255→            <table className="w-full text-xs">
+   256→              <thead className="text-muted-foreground border-b sticky top-0 bg-card">
+   257→                <tr>
+   258→                  <th className="text-left font-medium px-2 py-1.5">Execution</th>
+   259→                  <th className="text-left font-medium px-2 py-1.5">Corridor</th>
+   260→                  <th className="text-right font-medium px-2 py-1.5">Amount</th>
+   261→                  <th className="text-left font-medium px-2 py-1.5">Risk</th>
+   262→                  <th className="text-left font-medium px-2 py-1.5">Policy</th>
+   263→                  <th className="text-right font-medium px-2 py-1.5">Elapsed</th>
+   264→                  <th className="text-right font-medium px-2 py-1.5">Remaining</th>
+   265→                  <th className="text-left font-medium px-2 py-1.5">Wait</th>
+   266→                </tr>
+   267→              </thead>
+   268→              <tbody>
+   269→                {queue.map((q) => <QueueRow key={q.executionId} item={q} />)}
+   270→              </tbody>
+   271→            </table>
+   272→          </div>
+   273→        )}
+   274→      </CardContent>
+   275→    </Card>
+   276→  );
+   277→}
+   278→
+   279→function QueueRow({ item }: { item: OpsQueueItem }) {
+   280→  const longWait = item.elapsedSeconds > 120;
+   281→  const pct = Math.max(0, Math.min(100, (item.elapsedSeconds / Math.max(1, item.elapsedSeconds + item.remainingWaitSeconds)) * 100));
+   282→  return (
+   283→    <tr className={cn("border-b last:border-0 hover:bg-muted/30", longWait && "bg-rose-500/5")}>
+   284→      <td className="px-2 py-1.5 font-mono text-[10px]">{shortId(item.executionId, 10)}</td>
+   285→      <td className="px-2 py-1.5 font-mono text-[10px]">
+   286→        {item.sourceAsset}:{item.sourceCountry} <ArrowRight className="inline size-2.5 mx-0.5 text-muted-foreground" /> {item.destinationAsset}:{item.destinationCountry}
+   287→      </td>
+   288→      <td className="px-2 py-1.5 text-right font-mono tabular-nums">{formatMoney(item.amount)} {item.sourceAsset}</td>
+   289→      <td className="px-2 py-1.5"><Badge variant="outline" className="text-[10px] py-0 h-4">{prettyEnum(item.riskTolerance)}</Badge></td>
+   290→      <td className="px-2 py-1.5"><Badge variant="outline" className="text-[10px] py-0 h-4">{prettyEnum(item.executionPolicy)}</Badge></td>
+   291→      <td className={cn("px-2 py-1.5 text-right font-mono tabular-nums", longWait && "text-rose-600 dark:text-rose-400 font-medium")}>
+   292→        {formatDuration(item.elapsedSeconds)}
+   293→      </td>
+   294→      <td className="px-2 py-1.5 text-right font-mono tabular-nums">{formatDuration(item.remainingWaitSeconds)}</td>
+   295→      <td className="px-2 py-1.5 w-24">
+   296→        <div className="h-1.5 rounded-full bg-muted overflow-hidden">
+   297→          <div className={cn("h-full rounded-full", longWait ? "bg-rose-500" : "bg-amber-500")} style={{ width: `${pct}%` }} />
+   298→        </div>
+   299→      </td>
+   300→    </tr>
+   301→  );
+   302→}
+   303→
+   304→// ---------------------------------------------------------------------------
+   305→// Bottlenecks
+   306→// ---------------------------------------------------------------------------
+   307→function BottlenecksView() {
+   308→  const { data, loading } = usePolling<OpsBottlenecks>("/api/ops/bottlenecks", 5000);
+   309→  if (loading && !data) return <Skeleton className="h-64 w-full" />;
+   310→  if (!data) return null;
+   311→
+   312→  return (
+   313→    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+   314→      <Card className="py-3">
+   315→        <CardHeader className="pb-2">
+   316→          <CardTitle className="text-sm flex items-center gap-2">
+   317→            <AlertTriangle className="size-4 text-amber-500" /> Corridor demand
+   318→            <Badge variant="outline" className="text-[10px] py-0 h-4">{data.corridorDemand.length}</Badge>
+   319→          </CardTitle>
+   320→        </CardHeader>
+   321→        <CardContent className="pt-2 space-y-2 max-h-96 overflow-y-auto dramp-scroll">
+   322→          {data.corridorDemand.length === 0 ? (
+   323→            <div className="text-xs text-muted-foreground text-center py-4">No corridor demand bottlenecks.</div>
+   324→          ) : data.corridorDemand.map((c, i) => (
+   325→            <div key={i} className="rounded-md border bg-muted/30 p-2 text-xs">
+   326→              <div className="font-mono text-[10px]">{c.corridor}</div>
+   327→              <div className="flex items-center justify-between mt-1 text-[10px] text-muted-foreground">
+   328→                <span>{c.count} intent{c.count === 1 ? "" : "s"}</span>
+   329→                <span className="font-mono">{formatMoney(c.totalAmount)}</span>
+   330→              </div>
+   331→            </div>
+   332→          ))}
+   333→        </CardContent>
+   334→      </Card>
+   335→
+   336→      <Card className="py-3">
+   337→        <CardHeader className="pb-2">
+   338→          <CardTitle className="text-sm flex items-center gap-2">
+   339→            <ShieldAlert className="size-4 text-rose-500" /> Providers near capacity
+   340→            <Badge variant="outline" className="text-[10px] py-0 h-4">{data.providersNearCapacity.length}</Badge>
+   341→          </CardTitle>
+   342→          <CardDescription className="text-xs">{"Reserved / available > 70%"}</CardDescription>
+   343→        </CardHeader>
+   344→        <CardContent className="pt-2 space-y-2 max-h-96 overflow-y-auto dramp-scroll">
+   345→          {data.providersNearCapacity.length === 0 ? (
+   346→            <div className="text-xs text-muted-foreground text-center py-4">All providers within safe capacity.</div>
+   347→          ) : data.providersNearCapacity.map((p, i) => (
+   348→            <div key={i} className="rounded-md border bg-muted/30 p-2 text-xs space-y-1">
+   349→              <div className="flex items-center justify-between">
+   350→                <span className="font-medium">{p.providerName}</span>
+   351→                <Badge variant="outline" className={cn("text-[10px] py-0 h-4", p.utilization > 90 ? "border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-300" : "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-300")}>
+   352→                  {p.utilization}%
+   353→                </Badge>
+   354→              </div>
+   355→              <div className="text-[10px] text-muted-foreground">{prettyEnum(p.providerType)} · {p.corridor}</div>
+   356→              <div className="text-[10px] text-muted-foreground font-mono">reserved {formatMoney(p.reserved)} / {formatMoney(p.available)}</div>
+   357→              <Progress value={p.utilization} className="h-1" />
+   358→            </div>
+   359→          ))}
+   360→        </CardContent>
+   361→      </Card>
+   362→
+   363→      <Card className="py-3">
+   364→        <CardHeader className="pb-2">
+   365→          <CardTitle className="text-sm flex items-center gap-2">
+   366→            <Clock className="size-4 text-amber-500" /> Manual bottlenecks
+   367→            <Badge variant="outline" className="text-[10px] py-0 h-4">{data.manualBottlenecks.length}</Badge>
+   368→          </CardTitle>
+   369→          <CardDescription className="text-xs">Offers on MANUAL channels.</CardDescription>
+   370→        </CardHeader>
+   371→        <CardContent className="pt-2 space-y-2 max-h-96 overflow-y-auto dramp-scroll">
+   372→          {data.manualBottlenecks.length === 0 ? (
+   373→            <div className="text-xs text-muted-foreground text-center py-4">No manual bottlenecks.</div>
+   374→          ) : data.manualBottlenecks.map((b, i) => (
+   375→            <div key={i} className="rounded-md border bg-muted/30 p-2 text-xs">
+   376→              <div className="flex items-center justify-between">
+   377→                <span className="font-medium">{b.providerName}</span>
+   378→                <Badge variant="outline" className="text-[10px] py-0 h-4 border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-300">
+   379→                  {formatDuration(b.expectedExecutionSeconds)}
+   380→                </Badge>
+   381→              </div>
+   382→              <div className="text-[10px] text-muted-foreground font-mono mt-0.5">{b.corridor}</div>
+   383→            </div>
+   384→          ))}
+   385→        </CardContent>
+   386→      </Card>
+   387→    </div>
+   388→  );
+   389→}
+   390→
+   391→// ---------------------------------------------------------------------------
+   392→// Provider risk
+   393→// ---------------------------------------------------------------------------
+   394→function ProviderRiskView() {
+   395→  const { data, loading } = usePolling<OpsProviderRiskResponse>("/api/ops/provider-risk", 5000);
+   396→  const providers = data?.providers ?? [];
+   397→  return (
+   398→    <Card className="py-3">
+   399→      <CardHeader className="pb-2">
+   400→        <CardTitle className="text-sm flex items-center gap-2">
+   401→          <ShieldAlert className="size-4 text-emerald-500" /> Provider counterparty risk
+   402→          <Badge variant="outline" className="text-[10px] py-0 h-4">{providers.length}</Badge>
+   403→        </CardTitle>
+   404→      </CardHeader>
+   405→      <CardContent className="px-2">
+   406→        {loading && providers.length === 0 ? (
+   407→          <Skeleton className="h-32 w-full" />
+   408→        ) : providers.length === 0 ? (
+   409→          <div className="text-xs text-muted-foreground text-center py-8">No providers.</div>
+   410→        ) : (
+   411→          <div className="dramp-scroll overflow-x-auto max-h-[65vh] overflow-y-auto">
+   412→            <table className="w-full text-xs">
+   413→              <thead className="text-muted-foreground border-b sticky top-0 bg-card">
+   414→                <tr>
+   415→                  <th className="text-left font-medium px-2 py-1.5">Provider</th>
+   416→                  <th className="text-left font-medium px-2 py-1.5">Type</th>
+   417→                  <th className="text-left font-medium px-2 py-1.5">Status</th>
+   418→                  <th className="text-right font-medium px-2 py-1.5">Reputation</th>
+   419→                  <th className="text-center font-medium px-2 py-1.5">Cpty risk</th>
+   420→                  <th className="text-right font-medium px-2 py-1.5">Exposure</th>
+   421→                  <th className="text-right font-medium px-2 py-1.5">Max</th>
+   422→                  <th className="text-left font-medium px-2 py-1.5">Utilization</th>
+   423→                  <th className="text-right font-medium px-2 py-1.5">Offers</th>
+   424→                  <th className="text-right font-medium px-2 py-1.5">Oblig.</th>
+   425→                  <th className="text-center font-medium px-2 py-1.5">Flag</th>
+   426→                </tr>
+   427→              </thead>
+   428→              <tbody>
+   429→                {providers.map((p) => <ProviderRiskRow key={p.id} p={p} />)}
+   430→              </tbody>
+   431→            </table>
+   432→          </div>
+   433→        )}
+   434→      </CardContent>
+   435→    </Card>
+   436→  );
+   437→}
+   438→
+   439→function ProviderRiskRow({ p }: { p: OpsProviderRisk }) {
+   440→  const risk = toNum(p.counterpartyRisk);
+   441→  return (
+   442→    <tr className={cn("border-b last:border-0 hover:bg-muted/30", p.flagged && "bg-rose-500/5")}>
+   443→      <td className="px-2 py-1.5 font-medium">{p.name}</td>
+   444→      <td className="px-2 py-1.5"><Badge variant="outline" className="text-[10px] py-0 h-4">{prettyEnum(p.providerType)}</Badge></td>
+   445→      <td className="px-2 py-1.5">
+   446→        <Badge variant="outline" className={cn("text-[10px] py-0 h-4", p.status === "ACTIVE" ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300" : "border-zinc-500/40 bg-zinc-500/10 text-zinc-600 dark:text-zinc-300")}>
+   447→          {prettyEnum(p.status)}
+   448→        </Badge>
+   449→      </td>
+   450→      <td className="px-2 py-1.5 text-right font-mono tabular-nums">{(p.reputationScore * 100).toFixed(0)}%</td>
+   451→      <td className="px-2 py-1.5 text-center">
+   452→        <span className={cn("inline-block size-2.5 rounded-full", riskBarColor(risk))} title={`Risk ${(risk * 100).toFixed(0)}%`} />
+   453→      </td>
+   454→      <td className="px-2 py-1.5 text-right font-mono tabular-nums">{formatMoney(p.exposure)}</td>
+   455→      <td className="px-2 py-1.5 text-right font-mono tabular-nums text-muted-foreground">{formatMoney(p.maxExposure)}</td>
+   456→      <td className="px-2 py-1.5 w-32">
+   457→        <div className="flex items-center gap-1.5">
+   458→          <div className="h-1.5 rounded-full bg-muted overflow-hidden flex-1">
+   459→            <div className={cn("h-full rounded-full", p.utilization > 80 ? "bg-rose-500" : p.utilization > 50 ? "bg-amber-500" : "bg-emerald-500")} style={{ width: `${Math.min(100, p.utilization)}%` }} />
+   460→          </div>
+   461→          <span className="text-[10px] font-mono tabular-nums w-8 text-right">{p.utilization}%</span>
+   462→        </div>
+   463→      </td>
+   464→      <td className="px-2 py-1.5 text-right font-mono tabular-nums">{p.activeOffers}</td>
+   465→      <td className="px-2 py-1.5 text-right font-mono tabular-nums">{p.activeObligations}</td>
+   466→      <td className="px-2 py-1.5 text-center">
+   467→        {p.flagged ? (
+   468→          <Badge variant="outline" className="text-[10px] py-0 h-4 border-rose-500/50 bg-rose-500/15 text-rose-600 dark:text-rose-300"><Flag className="size-2.5" />Flagged</Badge>
+   469→        ) : (
+   470→          <span className="text-muted-foreground text-[10px]">—</span>
+   471→        )}
+   472→      </td>
+   473→    </tr>
+   474→  );
+   475→}
+   476→
+   477→// ---------------------------------------------------------------------------
+   478→// Asset risk
+   479→// ---------------------------------------------------------------------------
+   480→function AssetRiskView() {
+   481→  const { data, loading } = usePolling<OpsAssetRiskResponse>("/api/ops/asset-risk", 5000);
+   482→  const assets = data?.assets ?? [];
+   483→  return (
+   484→    <Card className="py-3">
+   485→      <CardHeader className="pb-2">
+   486→        <CardTitle className="text-sm flex items-center gap-2">
+   487→          <Coins className="size-4 text-emerald-500" /> Settlement asset risk
+   488→          <Badge variant="outline" className="text-[10px] py-0 h-4">{assets.length}</Badge>
+   489→        </CardTitle>
+   490→        <CardDescription className="text-xs">
+   491→          Hard invariant: <span className="font-medium text-rose-600 dark:text-rose-400">VOLATILE_TOKEN assets are never collateral-eligible</span>.
+   492→        </CardDescription>
+   493→      </CardHeader>
+   494→      <CardContent className="px-2">
+   495→        {loading && assets.length === 0 ? (
+   496→          <Skeleton className="h-32 w-full" />
+   497→        ) : assets.length === 0 ? (
+   498→          <div className="text-xs text-muted-foreground text-center py-8">No settlement assets.</div>
+   499→        ) : (
+   500→          <div className="dramp-scroll overflow-x-auto max-h-[65vh] overflow-y-auto">
+   501→            <table className="w-full text-xs">
+   502→              <thead className="text-muted-foreground border-b sticky top-0 bg-card">
+   503→                <tr>
+   504→                  <th className="text-left font-medium px-2 py-1.5">Symbol</th>
+   505→                  <th className="text-left font-medium px-2 py-1.5">Type</th>
+   506→                  <th className="text-right font-medium px-2 py-1.5">Volatility</th>
+   507→                  <th className="text-right font-medium px-2 py-1.5">Liquidity</th>
+   508→                  <th className="text-right font-medium px-2 py-1.5">Peg</th>
+   509→                  <th className="text-right font-medium px-2 py-1.5">Incent.</th>
+   510→                  <th className="text-center font-medium px-2 py-1.5">Risk score</th>
+   511→                  <th className="text-left font-medium px-2 py-1.5">Status</th>
+   512→                  <th className="text-center font-medium px-2 py-1.5">Collateral</th>
+   513→                  <th className="text-right font-medium px-2 py-1.5">Offers</th>
+   514→                  <th className="text-right font-medium px-2 py-1.5">Providers</th>
+   515→                </tr>
+   516→              </thead>
+   517→              <tbody>
+   518→                {assets.map((a) => <AssetRiskRow key={a.id} a={a} />)}
+   519→              </tbody>
+   520→            </table>
+   521→          </div>
+   522→        )}
+   523→      </CardContent>
+   524→    </Card>
+   525→  );
+   526→}
+   527→
+   528→function AssetRiskRow({ a }: { a: OpsAssetRisk }) {
+   529→  const volatile = a.assetType === "VOLATILE_TOKEN";
+   530→  const risk = toNum(a.riskScore);
+   531→  return (
+   532→    <tr className={cn("border-b last:border-0 hover:bg-muted/30", volatile && "bg-rose-500/5")}>
+   533→      <td className="px-2 py-1.5 font-mono font-medium">{a.symbol}</td>
+   534→      <td className="px-2 py-1.5">
+   535→        <Badge variant="outline" className={cn("text-[10px] py-0 h-4", volatile ? "border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-300" : "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300")}>
+   536→          {prettyEnum(a.assetType)}
+   537→        </Badge>
+   538→      </td>
+   539→      <td className="px-2 py-1.5 text-right font-mono tabular-nums">{formatPercent(a.volatilityScore)}</td>
+   540→      <td className="px-2 py-1.5 text-right font-mono tabular-nums">{formatPercent(a.liquidityScore)}</td>
+   541→      <td className="px-2 py-1.5 text-right font-mono tabular-nums">{formatPercent(a.pegQuality)}</td>
+   542→      <td className="px-2 py-1.5 text-right font-mono tabular-nums">{a.incentiveRate ? `${a.incentiveRate} bps` : "—"}</td>
+   543→      <td className="px-2 py-1.5 text-center">
+   544→        <span className={cn("inline-block size-2.5 rounded-full", riskBarColor(risk))} title={`Risk ${(risk * 100).toFixed(0)}%`} />
+   545→      </td>
+   546→      <td className="px-2 py-1.5">
+   547→        <Badge variant="outline" className={cn("text-[10px] py-0 h-4", a.status === "ACTIVE" ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300" : "border-zinc-500/40 bg-zinc-500/10 text-zinc-600 dark:text-zinc-300")}>
+   548→          {prettyEnum(a.status)}
+   549→        </Badge>
+   550→      </td>
+   551→      <td className="px-2 py-1.5 text-center">
+   552→        {a.isEligibleCollateral && !volatile ? (
+   553→          <Badge variant="outline" className="text-[10px] py-0 h-4 border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300">Eligible</Badge>
+   554→        ) : (
+   555→          <Badge variant="outline" className="text-[10px] py-0 h-4 border-rose-500/50 bg-rose-500/15 text-rose-600 dark:text-rose-300 font-medium">
+   556→            <ShieldAlert className="size-2.5" /> NOT collateral
+   557→          </Badge>
+   558→        )}
+   559→      </td>
+   560→      <td className="px-2 py-1.5 text-right font-mono tabular-nums">{a.dependentOfferCount}</td>
+   561→      <td className="px-2 py-1.5 text-right font-mono tabular-nums">{a.providerCount}</td>
+   562→    </tr>
+   563→  );
+   564→}
+   565→
+   566→// ---------------------------------------------------------------------------
+   567→// Concentration
+   568→// ---------------------------------------------------------------------------
+   569→function ConcentrationView() {
+   570→  const { data, loading } = usePolling<OpsConcentration>("/api/ops/concentration", 6000);
+   571→  if (loading && !data) return <Skeleton className="h-64 w-full" />;
+   572→  if (!data) return null;
+   573→  const maxType = Math.max(1, ...data.offersByProviderType.map((d) => d.count ?? 0));
+   574→  const maxCountry = Math.max(1, ...data.offersByCountry.map((d) => d.count ?? 0));
+   575→  const maxCollateral = Math.max(1, ...data.collateralByAsset.map((d) => toNum(d.amount)));
+   576→
+   577→  return (
+   578→    <div className="space-y-4">
+   579→      <div className="grid grid-cols-2 gap-3">
+   580→        <Card className="py-3">
+   581→          <CardContent className="py-1">
+   582→            <div className="flex items-center gap-2 text-xs text-muted-foreground"><Building2 className="size-4 text-emerald-500" /> Active providers</div>
+   583→            <div className="text-xl font-mono tabular-nums mt-1 font-semibold">{data.totalActiveProviders}</div>
+   584→          </CardContent>
+   585→        </Card>
+   586→        <Card className="py-3">
+   587→          <CardContent className="py-1">
+   588→            <div className="flex items-center gap-2 text-xs text-muted-foreground"><Layers className="size-4 text-emerald-500" /> Active offers</div>
+   589→            <div className="text-xl font-mono tabular-nums mt-1 font-semibold">{data.totalActiveOffers}</div>
+   590→          </CardContent>
+   591→        </Card>
+   592→      </div>
+   593→
+   594→      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+   595→        <ConcentrationCard title="Offers by provider type" items={data.offersByProviderType.map((d) => ({ label: prettyEnum(d.type ?? ""), value: d.count ?? 0, share: d.share }))} max={maxType} accent="emerald" />
+   596→        <ConcentrationCard title="Offers by country" items={data.offersByCountry.map((d) => ({ label: d.country ?? "", value: d.count ?? 0 }))} max={maxCountry} accent="sky" />
+   597→        <ConcentrationCard title="Collateral by asset" items={data.collateralByAsset.map((d) => ({ label: d.asset ?? "", value: toNum(d.amount), display: formatMoney(d.amount) }))} max={maxCollateral} accent="amber" />
+   598→      </div>
+   599→    </div>
+   600→  );
+   601→}
+   602→
+   603→function ConcentrationCard({
+   604→  title,
+   605→  items,
+   606→  max,
+   607→  accent,
+   608→}: {
+   609→  title: string;
+   610→  items: { label: string; value: number; share?: number; display?: string }[];
+   611→  max: number;
+   612→  accent: "emerald" | "sky" | "amber";
+   613→}) {
+   614→  const barColor = accent === "emerald" ? "bg-emerald-500" : accent === "sky" ? "bg-sky-500" : "bg-amber-500";
+   615→  return (
+   616→    <Card className="py-3">
+   617→      <CardHeader className="pb-2">
+   618→        <CardTitle className="text-sm flex items-center gap-2">
+   619→          <Scale className="size-4 text-emerald-500" /> {title}
+   620→          <Badge variant="outline" className="text-[10px] py-0 h-4">{items.length}</Badge>
+   621→        </CardTitle>
+   622→      </CardHeader>
+   623→      <CardContent className="pt-2 space-y-2 max-h-80 overflow-y-auto dramp-scroll">
+   624→        {items.length === 0 ? (
+   625→          <div className="text-xs text-muted-foreground text-center py-4">No data.</div>
+   626→        ) : items.map((it, i) => (
+   627→          <div key={i} className="space-y-1">
+   628→            <div className="flex items-center justify-between text-xs">
+   629→              <span className="font-mono">{it.label}</span>
+   630→              <span className="font-mono tabular-nums text-muted-foreground">
+   631→                {it.display ?? it.value}{typeof it.share === "number" ? ` · ${it.share}%` : ""}
+   632→              </span>
+   633→            </div>
+   634→            <div className="h-1.5 rounded-full bg-muted overflow-hidden">
+   635→              <div className={cn("h-full rounded-full", barColor)} style={{ width: `${Math.max(2, (it.value / max) * 100)}%` }} />
+   636→            </div>
+   637→          </div>
+   638→        ))}
+   639→      </CardContent>
+   640→    </Card>
+   641→  );
+   642→}
+   643→
+   644→// ---------------------------------------------------------------------------
+   645→// Disputes
+   646→// ---------------------------------------------------------------------------
+   647→const DISPUTE_RESOLUTIONS = [
+   648→  { v: "RESOLVED_PROVIDER", label: "Resolved — provider" },
+   649→  { v: "RESOLVED_USER", label: "Resolved — user" },
+   650→  { v: "PARTIAL_COMPENSATION", label: "Partial compensation" },
+   651→  { v: "SLASHED", label: "Slashed collateral" },
+   652→  { v: "CLOSED", label: "Closed" },
+   653→];
+   654→
+   655→function DisputesView() {
+   656→  const { data, loading, refetch } = usePolling<OpsDisputesResponse>("/api/ops/disputes", 6000);
+   657→  const disputes = data?.disputes ?? [];
+   658→  const [resolving, setResolving] = useState<string | null>(null);
+   659→
+   660→  return (
+   661→    <Card className="py-3">
+   662→      <CardHeader className="pb-2">
+   663→        <CardTitle className="text-sm flex items-center gap-2">
+   664→          <Gavel className="size-4 text-emerald-500" /> Disputes
+   665→          <Badge variant="outline" className="text-[10px] py-0 h-4">{disputes.length}</Badge>
+   666→        </CardTitle>
+   667→      </CardHeader>
+   668→      <CardContent className="pt-2 space-y-2 max-h-[70vh] overflow-y-auto dramp-scroll">
+   669→        {loading && disputes.length === 0 ? (
+   670→          <Skeleton className="h-32 w-full" />
+   671→        ) : disputes.length === 0 ? (
+   672→          <div className="text-xs text-muted-foreground text-center py-8">No disputes on record.</div>
+   673→        ) : disputes.map((d) => (
+   674→          <DisputeRow key={d.id} d={d} resolving={resolving === d.id} onResolving={setResolving} onResolved={() => refetch()} />
+   675→        ))}
+   676→      </CardContent>
+   677→    </Card>
+   678→  );
+   679→}
+   680→
+   681→function DisputeRow({
+   682→  d,
+   683→  resolving,
+   684→  onResolving,
+   685→  onResolved,
+   686→}: {
+   687→  d: OpsDispute;
+   688→  resolving: boolean;
+   689→  onResolving: (id: string | null) => void;
+   690→  onResolved: () => void;
+   691→}) {
+   692→  const [resolution, setResolution] = useState<string>("RESOLVED_PROVIDER");
+   693→  const [compensationAmount, setCompensationAmount] = useState("");
+   694→  const [slashedAmount, setSlashedAmount] = useState("");
+   695→  const [note, setNote] = useState("");
+   696→  const [open, setOpen] = useState(false);
+   697→
+   698→  const isResolved = d.status === "RESOLVED" || !!d.resolution;
+   699→
+   700→  async function submit() {
+   701→    onResolving(d.id);
+   702→    try {
+   703→      const body: any = { resolution };
+   704→      if (compensationAmount) body.compensationAmount = Number(compensationAmount);
+   705→      if (slashedAmount) body.slashedAmount = Number(slashedAmount);
+   706→      if (note) body.note = note;
+   707→      const res = await fetch(`/api/ops/disputes/${d.id}/resolve`, {
+   708→        method: "POST",
+   709→        headers: { "Content-Type": "application/json" },
+   710→        body: JSON.stringify(body),
+   711→      });
+   712→      const json = await res.json();
+   713→      if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+   714→      toast.success("Dispute resolved", { description: `${d.providerName} · ${resolution}` });
+   715→      setOpen(false);
+   716→      onResolved();
+   717→    } catch (err) {
+   718→      toast.error("Resolve failed", { description: err instanceof Error ? err.message : "unknown" });
+   719→    } finally {
+   720→      onResolving(null);
+   721→    }
+   722→  }
+   723→
+   724→  return (
+   725→    <div className={cn("rounded-md border bg-card p-3 space-y-2", isResolved && "opacity-70")}>
+   726→      <div className="flex items-start justify-between gap-2 flex-wrap">
+   727→        <div className="space-y-0.5">
+   728→          <div className="flex items-center gap-1.5 flex-wrap">
+   729→            <span className="font-medium text-sm">{d.providerName}</span>
+   730→            <Badge variant="outline" className="text-[10px] py-0 h-4 border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-300">{prettyEnum(d.reason)}</Badge>
+   731→            <Badge variant="outline" className={cn("text-[10px] py-0 h-4", isResolved ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300" : "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-300")}>
+   732→              {prettyEnum(d.status)}
+   733→            </Badge>
+   734→          </div>
+   735→          <div className="text-[10px] text-muted-foreground">
+   736→            <span className="font-mono">{d.corridor}</span> · exec <span className="font-mono">{shortId(d.executionId, 8)}</span> · {formatTimestamp(d.createdAt)}
+   737→          </div>
+   738→          {d.description && <div className="text-xs text-muted-foreground italic mt-1">"{d.description}"</div>}
+   739→          {(d.compensationAmount || d.slashedAmount) && (
+   740→            <div className="text-[10px] text-muted-foreground mt-1 flex items-center gap-2">
+   741→              {d.compensationAmount && <span>compensation: <span className="font-mono text-foreground">{formatMoney(d.compensationAmount)}</span></span>}
+   742→              {d.slashedAmount && <span>slashed: <span className="font-mono text-rose-600 dark:text-rose-400">{formatMoney(d.slashedAmount)}</span></span>}
+   743→            </div>
+   744→          )}
+   745→        </div>
+   746→        {!isResolved && (
+   747→          <Dialog open={open} onOpenChange={setOpen}>
+   748→            <DialogTrigger asChild>
+   749→              <Button size="sm" variant="outline">Resolve</Button>
+   750→            </DialogTrigger>
+   751→            <DialogContent>
+   752→              <DialogHeader>
+   753→                <DialogTitle>Resolve dispute — {d.providerName}</DialogTitle>
+   754→                <DialogDescription>Choose a resolution. Amounts are optional and depend on the resolution type.</DialogDescription>
+   755→              </DialogHeader>
+   756→              <div className="space-y-3 py-2">
+   757→                <div className="space-y-1">
+   758→                  <Label className="text-xs">Resolution</Label>
+   759→                  <Select value={resolution} onValueChange={setResolution}>
+   760→                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+   761→                    <SelectContent>
+   762→                      {DISPUTE_RESOLUTIONS.map((r) => <SelectItem key={r.v} value={r.v}>{r.label}</SelectItem>)}
+   763→                    </SelectContent>
+   764→                  </Select>
+   765→                </div>
+   766→                <div className="grid grid-cols-2 gap-3">
+   767→                  <div className="space-y-1">
+   768→                    <Label className="text-xs">Compensation amount</Label>
+   769→                    <Input type="number" min="0" step="any" value={compensationAmount} onChange={(e) => setCompensationAmount(e.target.value)} placeholder="0" className="font-mono" />
+   770→                  </div>
+   771→                  <div className="space-y-1">
+   772→                    <Label className="text-xs">Slashed amount</Label>
+   773→                    <Input type="number" min="0" step="any" value={slashedAmount} onChange={(e) => setSlashedAmount(e.target.value)} placeholder="0" className="font-mono" />
+   774→                  </div>
+   775→                </div>
+   776→                <div className="space-y-1">
+   777→                  <Label className="text-xs">Note (optional)</Label>
+   778→                  <Textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Resolution context…" rows={2} />
+   779→                </div>
+   780→              </div>
+   781→              <DialogFooter>
+   782→                <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
+   783→                <Button onClick={submit} disabled={resolving} className="bg-emerald-600 hover:bg-emerald-700 text-white">
+   784→                  {resolving ? <><Loader2 className="size-4 animate-spin" /> Resolving…</> : <><Gavel className="size-4" /> Resolve</>}
+   785→                </Button>
+   786→              </DialogFooter>
+   787→            </DialogContent>
+   788→          </Dialog>
+   789→        )}
+   790→      </div>
+   791→    </div>
+   792→  );
+   793→}
+   794→
+   795→// ---------------------------------------------------------------------------
+   796→// Reconciliation
+   797→// ---------------------------------------------------------------------------
+   798→const RECONCILE_STATUSES = ["RESOLVED", "FALSE_POSITIVE", "ESCALATED"];
+   799→
+   800→function ReconciliationView() {
+   801→  const { data, loading, refetch } = usePolling<OpsReconciliationResponse>("/api/ops/reconciliation", 6000);
+   802→  const items = data?.items ?? [];
+   803→  const [resolving, setResolving] = useState<string | null>(null);
+   804→
+   805→  return (
+   806→    <Card className="py-3">
+   807→      <CardHeader className="pb-2">
+   808→        <CardTitle className="text-sm flex items-center gap-2">
+   809→          <FileCheck2 className="size-4 text-emerald-500" /> Reconciliation queue
+   810→          <Badge variant="outline" className="text-[10px] py-0 h-4">{items.length}</Badge>
+   811→        </CardTitle>
+   812→        <CardDescription className="text-xs">Discrepancies between expected and reported obligation amounts.</CardDescription>
+   813→      </CardHeader>
+   814→      <CardContent className="pt-2 space-y-2 max-h-[70vh] overflow-y-auto dramp-scroll">
+   815→        {loading && items.length === 0 ? (
+   816→          <Skeleton className="h-32 w-full" />
+   817→        ) : items.length === 0 ? (
+   818→          <div className="text-xs text-muted-foreground text-center py-8">No reconciliation items.</div>
+   819→        ) : items.map((it) => (
+   820→          <ReconRow key={it.id} item={it} resolving={resolving === it.id} onResolving={setResolving} onResolved={() => refetch()} />
+   821→        ))}
+   822→      </CardContent>
+   823→    </Card>
+   824→  );
+   825→}
+   826→
+   827→function ReconRow({
+   828→  item,
+   829→  resolving,
+   830→  onResolving,
+   831→  onResolved,
+   832→}: {
+   833→  item: OpsReconciliationItem;
+   834→  resolving: boolean;
+   835→  onResolving: (id: string | null) => void;
+   836→  onResolved: () => void;
+   837→}) {
+   838→  const [status, setStatus] = useState("RESOLVED");
+   839→  const [resolution, setResolution] = useState("");
+   840→  const [open, setOpen] = useState(false);
+   841→  const isResolved = item.status === "RESOLVED" || item.status === "FALSE_POSITIVE";
+   842→
+   843→  async function submit() {
+   844→    onResolving(item.id);
+   845→    try {
+   846→      const res = await fetch(`/api/ops/reconciliation/${item.id}/resolve`, {
+   847→        method: "POST",
+   848→        headers: { "Content-Type": "application/json" },
+   849→        body: JSON.stringify({ status, resolution }),
+   850→      });
+   851→      const json = await res.json();
+   852→      if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+   853→      toast.success("Reconciliation item resolved", { description: `${shortId(item.id, 8)} · ${status}` });
+   854→      setOpen(false);
+   855→      onResolved();
+   856→    } catch (err) {
+   857→      toast.error("Resolve failed", { description: err instanceof Error ? err.message : "unknown" });
+   858→    } finally {
+   859→      onResolving(null);
+   860→    }
+   861→  }
+   862→
+   863→  const sev = item.severity;
+   864→  return (
+   865→    <div className={cn("rounded-md border bg-card p-3 space-y-1", isResolved && "opacity-70")}>
+   866→      <div className="flex items-start justify-between gap-2 flex-wrap">
+   867→        <div className="space-y-0.5">
+   868→          <div className="flex items-center gap-1.5 flex-wrap">
+   869→            <Badge variant="outline" className={cn("text-[10px] py-0 h-4", sev === "CRITICAL" ? "border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-300" : sev === "HIGH" ? "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-300" : "border-zinc-500/40 bg-zinc-500/10 text-zinc-600 dark:text-zinc-300")}>
+   870→              {prettyEnum(item.type)} · {prettyEnum(item.severity)}
+   871→            </Badge>
+   872→            <Badge variant="outline" className={cn("text-[10px] py-0 h-4", isResolved ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300" : "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-300")}>
+   873→              {prettyEnum(item.status)}
+   874→            </Badge>
+   875→            <span className="text-[10px] text-muted-foreground font-mono">{shortId(item.id, 8)}</span>
+   876→          </div>
+   877→          {item.description && <div className="text-xs text-foreground/80 mt-0.5">{item.description}</div>}
+   878→          <div className="text-[10px] text-muted-foreground mt-0.5">
+   879→            provider <span className="font-mono">{shortId(item.providerId, 8)}</span>
+   880→            {item.executionId && <> · exec <span className="font-mono">{shortId(item.executionId, 8)}</span></>}
+   881→            {item.asset && <> · <span className="font-mono">{item.asset}</span></>}
+   882→            {item.expectedAmount && <> · expected <span className="font-mono">{formatMoney(item.expectedAmount)}</span></>}
+   883→            {item.reportedAmount && <> · reported <span className="font-mono">{formatMoney(item.reportedAmount)}</span></>}
+   884→          </div>
+   885→        </div>
+   886→        {!isResolved && (
+   887→          <Dialog open={open} onOpenChange={setOpen}>
+   888→            <DialogTrigger asChild>
+   889→              <Button size="sm" variant="outline">Resolve</Button>
+   890→            </DialogTrigger>
+   891→            <DialogContent>
+   892→              <DialogHeader>
+   893→                <DialogTitle>Resolve reconciliation item</DialogTitle>
+   894→                <DialogDescription>Mark this discrepancy as resolved or escalate.</DialogDescription>
+   895→              </DialogHeader>
+   896→              <div className="space-y-3 py-2">
+   897→                <div className="space-y-1">
+   898→                  <Label className="text-xs">New status</Label>
+   899→                  <Select value={status} onValueChange={setStatus}>
+   900→                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+   901→                    <SelectContent>
+   902→                      {RECONCILE_STATUSES.map((s) => <SelectItem key={s} value={s}>{prettyEnum(s)}</SelectItem>)}
+   903→                    </SelectContent>
+   904→                  </Select>
+   905→                </div>
+   906→                <div className="space-y-1">
+   907→                  <Label className="text-xs">Resolution note</Label>
+   908→                  <Textarea value={resolution} onChange={(e) => setResolution(e.target.value)} placeholder="How was this resolved?" rows={3} />
+   909→                </div>
+   910→              </div>
+   911→              <DialogFooter>
+   912→                <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
+   913→                <Button onClick={submit} disabled={resolving} className="bg-emerald-600 hover:bg-emerald-700 text-white">
+   914→                  {resolving ? <><Loader2 className="size-4 animate-spin" /> Resolving…</> : <><FileCheck2 className="size-4" /> Resolve</>}
+   915→                </Button>
+   916→              </DialogFooter>
+   917→            </DialogContent>
+   918→          </Dialog>
+   919→        )}
+   920→      </div>
+   921→    </div>
+   922→  );
+   923→}
+   924→
+   925→// ---------------------------------------------------------------------------
+   926→// Incentives
+   927→// ---------------------------------------------------------------------------
+   928→function IncentivesView() {
+   929→  const { data, loading, refetch } = usePolling<IncentivesResponse>("/api/incentives", 6000);
+   930→  const campaigns = data?.campaigns ?? [];
+   931→  const [creating, setCreating] = useState(false);
+   932→
+   933→  return (
+   934→    <Card className="py-3">
+   935→      <CardHeader className="pb-2">
+   936→        <div className="flex items-center justify-between">
+   937→          <CardTitle className="text-sm flex items-center gap-2">
+   938→            <Gift className="size-4 text-emerald-500" /> Settlement incentive campaigns
+   939→            <Badge variant="outline" className="text-[10px] py-0 h-4">{campaigns.length}</Badge>
+   940→          </CardTitle>
+   941→          <CreateCampaignDialog onCreated={() => refetch()} triggerCreating={setCreating} />
+   942→        </div>
+   943→      </CardHeader>
+   944→      <CardContent className="pt-2 space-y-2 max-h-[70vh] overflow-y-auto dramp-scroll">
+   945→        {loading && campaigns.length === 0 ? (
+   946→          <Skeleton className="h-32 w-full" />
+   947→        ) : campaigns.length === 0 ? (
+   948→          <div className="text-xs text-muted-foreground text-center py-8">No incentive campaigns yet.</div>
+   949→        ) : campaigns.map((c) => <CampaignRow key={c.id} c={c} />)}
+   950→        {creating && <div className="text-[10px] text-muted-foreground">Creating…</div>}
+   951→      </CardContent>
+   952→    </Card>
+   953→  );
+   954→}
+   955→
+   956→function CampaignRow({ c }: { c: IncentiveCampaign }) {
+   957→  const used = toNum(c.accrued) + toNum(c.paid);
+   958→  const pct = toNum(c.totalBudget) > 0 ? Math.min(100, (used / toNum(c.totalBudget)) * 100) : 0;
+   959→  return (
+   960→    <div className="rounded-md border bg-card p-3 space-y-2">
+   961→      <div className="flex items-start justify-between gap-2 flex-wrap">
+   962→        <div className="space-y-0.5">
+   963→          <div className="flex items-center gap-1.5 flex-wrap">
+   964→            <span className="font-medium text-sm">{c.name}</span>
+   965→            <Badge variant="outline" className="text-[10px] py-0 h-4">{c.settlementAsset}</Badge>
+   966→            <Badge variant="outline" className={cn("text-[10px] py-0 h-4", c.status === "ACTIVE" ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300" : "border-zinc-500/40 bg-zinc-500/10 text-zinc-600 dark:text-zinc-300")}>
+   967→              {prettyEnum(c.status)}
+   968→            </Badge>
+   969→            <Badge variant="outline" className="text-[10px] py-0 h-4 border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300">{c.incentiveBps} bps</Badge>
+   970→          </div>
+   971→          <div className="text-[10px] text-muted-foreground">
+   972→            {prettyEnum(c.fundingSource)}{c.sponsor ? ` · ${c.sponsor}` : ""} · {formatTimestamp(c.startDate)} → {formatTimestamp(c.endDate)}
+   973→          </div>
+   974→        </div>
+   975→      </div>
+   976→      <div className="space-y-1">
+   977→        <div className="flex items-center justify-between text-[10px] text-muted-foreground font-mono tabular-nums">
+   978→          <span>accrued {formatMoney(c.accrued)}</span>
+   979→          <span>paid {formatMoney(c.paid)}</span>
+   980→          <span>budget {formatMoney(c.totalBudget)}</span>
+   981→        </div>
+   982→        <Progress value={pct} className="h-1.5" />
+   983→      </div>
+   984→    </div>
+   985→  );
+   986→}
+   987→
+   988→function CreateCampaignDialog({ onCreated, triggerCreating }: { onCreated: () => void; triggerCreating: (b: boolean) => void }) {
+   989→  const [open, setOpen] = useState(false);
+   990→  const [name, setName] = useState("");
+   991→  const [settlementAssetId, setSettlementAssetId] = useState("");
+   992→  const [incentiveBps, setIncentiveBps] = useState("25");
+   993→  const [fundingSource, setFundingSource] = useState("dramp");
+   994→  const [totalBudget, setTotalBudget] = useState("10000");
+   995→  const [startDate, setStartDate] = useState(() => new Date().toISOString().slice(0, 10));
+   996→  const [endDate, setEndDate] = useState(() => {
+   997→    const d = new Date(); d.setDate(d.getDate() + 30);
+   998→    return d.toISOString().slice(0, 10);
+   999→  });
+  1000→  const [saving, setSaving] = useState(false);
+  1001→
+  1002→  const [assets, setAssets] = useState<{ id: string; symbol: string }[]>([]);
+  1003→  // load assets on open
+  1004→  async function loadAssets() {
+  1005→    try {
+  1006→      const res = await fetch("/api/settlement-assets");
+  1007→      const json = await res.json();
+  1008→      setAssets((json.assets ?? []).map((a: any) => ({ id: a.id, symbol: a.symbol })));
+  1009→      if (json.assets?.[0]?.id) setSettlementAssetId(json.assets[0].id);
+  1010→    } catch { /* ignore */ }
+  1011→  }
+  1012→
+  1013→  async function submit() {
+  1014→    if (!name || !settlementAssetId || !totalBudget) {
+  1015→      toast.error("Fill in name, asset and budget");
+  1016→      return;
+  1017→    }
+  1018→    setSaving(true);
+  1019→    triggerCreating(true);
+  1020→    try {
+  1021→      const res = await fetch("/api/incentives", {
+  1022→        method: "POST",
+  1023→        headers: { "Content-Type": "application/json" },
+  1024→        body: JSON.stringify({
+  1025→          name,
+  1026→          settlementAssetId,
+  1027→          incentiveBps: Number(incentiveBps),
+  1028→          fundingSource,
+  1029→          startDate,
+  1030→          endDate,
+  1031→          totalBudget: Number(totalBudget),
+  1032→        }),
+  1033→      });
+  1034→      const json = await res.json();
+  1035→      if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+  1036→      toast.success("Campaign created", { description: shortId(json.id, 8) });
+  1037→      setOpen(false);
+  1038→      setName(""); setTotalBudget("10000"); setIncentiveBps("25");
+  1039→      onCreated();
+  1040→    } catch (err) {
+  1041→      toast.error("Create failed", { description: err instanceof Error ? err.message : "unknown" });
+  1042→    } finally {
+  1043→      setSaving(false);
+  1044→      triggerCreating(false);
+  1045→    }
+  1046→  }
+  1047→
+  1048→  return (
+  1049→    <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (o) loadAssets(); }}>
+  1050→      <DialogTrigger asChild>
+  1051→        <Button size="sm" className="bg-emerald-600 hover:bg-emerald-700 text-white">
+  1052→          <Gift className="size-3.5" /> Create campaign
+  1053→        </Button>
+  1054→      </DialogTrigger>
+  1055→      <DialogContent>
+  1056→        <DialogHeader>
+  1057→          <DialogTitle>Create incentive campaign</DialogTitle>
+  1058→          <DialogDescription>Subsidize a settlement asset to attract liquidity.</DialogDescription>
+  1059→        </DialogHeader>
+  1060→        <div className="space-y-3 py-2">
+  1061→          <div className="space-y-1">
+  1062→            <Label className="text-xs">Name</Label>
+  1063→            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="USDC corridor subsidy" />
+  1064→          </div>
+  1065→          <div className="grid grid-cols-2 gap-3">
+  1066→            <div className="space-y-1">
+  1067→              <Label className="text-xs">Settlement asset</Label>
+  1068→              <Select value={settlementAssetId} onValueChange={setSettlementAssetId}>
+  1069→                <SelectTrigger className="w-full"><SelectValue placeholder="Select asset" /></SelectTrigger>
+  1070→                <SelectContent>
+  1071→                  {assets.map((a) => <SelectItem key={a.id} value={a.id}>{a.symbol}</SelectItem>)}
+  1072→                </SelectContent>
+  1073→              </Select>
+  1074→            </div>
+  1075→            <div className="space-y-1">
+  1076→              <Label className="text-xs">Incentive (bps)</Label>
+  1077→              <Input type="number" min="0" value={incentiveBps} onChange={(e) => setIncentiveBps(e.target.value)} className="font-mono" />
+  1078→            </div>
+  1079→            <div className="space-y-1">
+  1080→              <Label className="text-xs">Funding source</Label>
+  1081→              <Input value={fundingSource} onChange={(e) => setFundingSource(e.target.value)} />
+  1082→            </div>
+  1083→            <div className="space-y-1">
+  1084→              <Label className="text-xs">Total budget</Label>
+  1085→              <Input type="number" min="0" value={totalBudget} onChange={(e) => setTotalBudget(e.target.value)} className="font-mono" />
+  1086→            </div>
+  1087→            <div className="space-y-1">
+  1088→              <Label className="text-xs">Start date</Label>
+  1089→              <Input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+  1090→            </div>
+  1091→            <div className="space-y-1">
+  1092→              <Label className="text-xs">End date</Label>
+  1093→              <Input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+  1094→            </div>
+  1095→          </div>
+  1096→        </div>
+  1097→        <DialogFooter>
+  1098→          <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
+  1099→          <Button onClick={submit} disabled={saving} className="bg-emerald-600 hover:bg-emerald-700 text-white">
+  1100→            {saving ? <><Loader2 className="size-4 animate-spin" /> Creating…</> : <><Gift className="size-4" /> Create</>}
+  1101→          </Button>
+  1102→        </DialogFooter>
+  1103→      </DialogContent>
+  1104→    </Dialog>
+  1105→  );
+  1106→}
+  1107→
+  1108→// ---------------------------------------------------------------------------
+  1109→// Onboarding
+  1110→// ---------------------------------------------------------------------------
+  1111→const ONBOARDING_STATUSES = ["APPLIED", "REVIEW", "APPROVED", "ACTIVE", "SUSPENDED", "REJECTED"];
+  1112→
+  1113→function OnboardingView() {
+  1114→  const { data, loading, refetch } = usePolling<OnboardingProvidersResponse>("/api/providers", 6000);
+  1115→  const providers = (data?.providers ?? []) as unknown as OnboardingProvider[];
+  1116→  const pending = providers.filter((p) => p.status === "APPLIED" || p.status === "REVIEW");
+  1117→  const all = providers;
+  1118→  const [updating, setUpdating] = useState<string | null>(null);
+  1119→
+  1120→  async function update(id: string, status: string) {
+  1121→    setUpdating(id);
+  1122→    try {
+  1123→      const res = await fetch(`/api/onboarding/providers/${id}`, {
+  1124→        method: "PATCH",
+  1125→        headers: { "Content-Type": "application/json" },
+  1126→        body: JSON.stringify({ status }),
+  1127→      });
+  1128→      const json = await res.json();
+  1129→      if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+  1130→      toast.success(`Provider ${status.toLowerCase()}`, { description: shortId(id, 8) });
+  1131→      refetch();
+  1132→    } catch (err) {
+  1133→      toast.error("Update failed", { description: err instanceof Error ? err.message : "unknown" });
+  1134→    } finally {
+  1135→      setUpdating(null);
+  1136→    }
+  1137→  }
+  1138→
+  1139→  return (
+  1140→    <div className="space-y-4">
+  1141→      {pending.length > 0 && (
+  1142→        <Card className="py-3 border-amber-500/30">
+  1143→          <CardHeader className="pb-2">
+  1144→            <CardTitle className="text-sm flex items-center gap-2">
+  1145→              <UserCheck className="size-4 text-amber-500" /> Pending applications
+  1146→              <Badge variant="outline" className="text-[10px] py-0 h-4 border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-300">{pending.length}</Badge>
+  1147→            </CardTitle>
+  1148→          </CardHeader>
+  1149→          <CardContent className="pt-2 space-y-2">
+  1150→            {pending.map((p) => (
+  1151→              <OnboardingRow key={p.id} p={p} updating={updating === p.id} onApprove={() => update(p.id, "APPROVED")} onReject={() => update(p.id, "REJECTED")} onReview={() => update(p.id, "REVIEW")} onActivate={() => update(p.id, "ACTIVE")} />
+  1152→            ))}
+  1153→          </CardContent>
+  1154→        </Card>
+  1155→      )}
+  1156→
+  1157→      <Card className="py-3">
+  1158→        <CardHeader className="pb-2">
+  1159→          <CardTitle className="text-sm flex items-center gap-2">
+  1160→            <Building2 className="size-4 text-emerald-500" /> All providers
+  1161→            <Badge variant="outline" className="text-[10px] py-0 h-4">{all.length}</Badge>
+  1162→          </CardTitle>
+  1163→        </CardHeader>
+  1164→        <CardContent className="px-2">
+  1165→          {loading && all.length === 0 ? (
+  1166→            <Skeleton className="h-32 w-full" />
+  1167→          ) : all.length === 0 ? (
+  1168→            <div className="text-xs text-muted-foreground text-center py-8">No providers.</div>
+  1169→          ) : (
+  1170→            <div className="dramp-scroll overflow-x-auto max-h-[60vh] overflow-y-auto">
+  1171→              <table className="w-full text-xs">
+  1172→                <thead className="text-muted-foreground border-b sticky top-0 bg-card">
+  1173→                  <tr>
+  1174→                    <th className="text-left font-medium px-2 py-1.5">Name</th>
+  1175→                    <th className="text-left font-medium px-2 py-1.5">Type</th>
+  1176→                    <th className="text-left font-medium px-2 py-1.5">Trust</th>
+  1177→                    <th className="text-left font-medium px-2 py-1.5">Jurisdiction</th>
+  1178→                    <th className="text-left font-medium px-2 py-1.5">Contact</th>
+  1179→                    <th className="text-center font-medium px-2 py-1.5">API</th>
+  1180→                    <th className="text-left font-medium px-2 py-1.5">Status</th>
+  1181→                    <th className="text-right font-medium px-2 py-1.5">Lifecycle</th>
+  1182→                  </tr>
+  1183→                </thead>
+  1184→                <tbody>
+  1185→                  {all.map((p) => <OnboardingTableRow key={p.id} p={p} updating={updating === p.id} onUpdate={(s) => update(p.id, s)} />)}
+  1186→                </tbody>
+  1187→              </table>
+  1188→            </div>
+  1189→          )}
+  1190→        </CardContent>
+  1191→      </Card>
+  1192→    </div>
+  1193→  );
+  1194→}
+  1195→
+  1196→function OnboardingRow({
+  1197→  p,
+  1198→  updating,
+  1199→  onApprove,
+  1200→  onReject,
+  1201→  onReview,
+  1202→  onActivate,
+  1203→}: {
+  1204→  p: OnboardingProvider;
+  1205→  updating: boolean;
+  1206→  onApprove: () => void;
+  1207→  onReject: () => void;
+  1208→  onReview: () => void;
+  1209→  onActivate: () => void;
+  1210→}) {
+  1211→  return (
+  1212→    <div className="rounded-md border bg-card p-3 space-y-2">
+  1213→      <div className="flex items-start justify-between gap-2 flex-wrap">
+  1214→        <div className="space-y-0.5">
+  1215→          <div className="flex items-center gap-1.5 flex-wrap">
+  1216→            <span className="font-medium text-sm">{p.name}</span>
+  1217→            <Badge variant="outline" className="text-[10px] py-0 h-4">{prettyEnum(p.providerType)}</Badge>
+  1218→            <Badge variant="outline" className="text-[10px] py-0 h-4">{prettyEnum(p.trustModel)}</Badge>
+  1219→            <Badge variant="outline" className={cn("text-[10px] py-0 h-4", p.status === "APPLIED" ? "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-300" : "border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-300")}>
+  1220→              {prettyEnum(p.status)}
+  1221→            </Badge>
+  1222→          </div>
+  1223→          <div className="text-[10px] text-muted-foreground">
+  1224→            {p.jurisdiction && <>jurisdiction <span className="font-mono">{p.jurisdiction}</span> · </>}
+  1225→            {p.contactEmail && <>contact <span className="font-mono">{p.contactEmail}</span></>}
+  1226→          </div>
+  1227→          {p.onboardingNote && <div className="text-xs text-muted-foreground italic mt-1">"{p.onboardingNote}"</div>}
+  1228→        </div>
+  1229→        <div className="flex items-center gap-1.5">
+  1230→          {p.status === "APPLIED" && (
+  1231→            <Button size="sm" variant="outline" onClick={onReview} disabled={updating}>
+  1232→              {updating ? <Loader2 className="size-3 animate-spin" /> : <UserCheck className="size-3.5" />} Review
+  1233→            </Button>
+  1234→          )}
+  1235→          <Button size="sm" onClick={onApprove} disabled={updating} className="bg-emerald-600 hover:bg-emerald-700 text-white h-8">
+  1236→            {updating ? <Loader2 className="size-3.5 animate-spin" /> : <CheckCircle2 className="size-3.5" />} Approve
+  1237→          </Button>
+  1238→          <Button size="sm" variant="outline" onClick={onActivate} disabled={updating} className="h-8">
+  1239→            Activate
+  1240→          </Button>
+  1241→          <Button size="sm" variant="outline" onClick={onReject} disabled={updating} className="text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 h-8">
+  1242→            <XCircle className="size-3.5" /> Reject
+  1243→          </Button>
+  1244→        </div>
+  1245→      </div>
+  1246→    </div>
+  1247→  );
+  1248→}
+  1249→
+  1250→function OnboardingTableRow({
+  1251→  p,
+  1252→  updating,
+  1253→  onUpdate,
+  1254→}: {
+  1255→  p: OnboardingProvider;
+  1256→  updating: boolean;
+  1257→  onUpdate: (status: string) => void;
+  1258→}) {
+  1259→  return (
+  1260→    <tr className="border-b last:border-0 hover:bg-muted/30">
+  1261→      <td className="px-2 py-1.5 font-medium">{p.name}</td>
+  1262→      <td className="px-2 py-1.5"><Badge variant="outline" className="text-[10px] py-0 h-4">{prettyEnum(p.providerType)}</Badge></td>
+  1263→      <td className="px-2 py-1.5"><Badge variant="outline" className="text-[10px] py-0 h-4">{prettyEnum(p.trustModel)}</Badge></td>
+  1264→      <td className="px-2 py-1.5 text-[10px] text-muted-foreground font-mono">{p.jurisdiction ?? "—"}</td>
+  1265→      <td className="px-2 py-1.5 text-[10px] text-muted-foreground font-mono">{p.contactEmail ?? "—"}</td>
+  1266→      <td className="px-2 py-1.5 text-center">
+  1267→        <Badge variant="outline" className={cn("text-[10px] py-0 h-4", p.apiIntegrationStatus === "CONNECTED" ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300" : p.apiIntegrationStatus === "PENDING" ? "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-300" : "border-zinc-500/40 bg-zinc-500/10 text-zinc-600 dark:text-zinc-300")}>
+  1268→          {p.apiIntegrationStatus ?? "NONE"}
+  1269→        </Badge>
+  1270→      </td>
+  1271→      <td className="px-2 py-1.5">
+  1272→        <Badge variant="outline" className={cn("text-[10px] py-0 h-4", p.status === "ACTIVE" ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300" : p.status === "APPLIED" || p.status === "REVIEW" ? "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-300" : p.status === "REJECTED" || p.status === "SUSPENDED" ? "border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-300" : "border-zinc-500/40 bg-zinc-500/10 text-zinc-600 dark:text-zinc-300")}>
+  1273→          {prettyEnum(p.status)}
+  1274→        </Badge>
+  1275→      </td>
+  1276→      <td className="px-2 py-1.5 text-right">
+  1277→        <Select value={p.status} onValueChange={onUpdate} disabled={updating}>
+  1278→          <SelectTrigger className="h-7 text-[10px] w-[120px] ml-auto"><SelectValue /></SelectTrigger>
+  1279→          <SelectContent>
+  1280→            {ONBOARDING_STATUSES.map((s) => <SelectItem key={s} value={s}>{prettyEnum(s)}</SelectItem>)}
+  1281→          </SelectContent>
+  1282→        </Select>
+  1283→      </td>
+  1284→    </tr>
+  1285→  );
+  1286→}
+  1287→

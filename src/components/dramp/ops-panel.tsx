@@ -62,6 +62,7 @@ import type {
 import { NetworkHealthView as EconNetworkHealthView } from "./network-health-view";
 import { UnitEconomicsView as EconUnitEconomicsView } from "./unit-economics-view";
 import { AcquisitionFunnel as EconAcquisitionFunnel } from "./acquisition-funnel";
+import { SimulatorPanel } from "./simulator-panel";
 import {
   Activity,
   Gauge,
@@ -84,6 +85,7 @@ import {
   Layers,
   TrendingUp,
   Building2,
+  FlaskConical,
 } from "lucide-react";
 
 type OpsView =
@@ -99,7 +101,8 @@ type OpsView =
   | "onboarding"
   | "network-health"
   | "unit-economics"
-  | "funnel";
+  | "funnel"
+  | "simulator";
 
 const VIEWS: { key: OpsView; label: string; icon: React.ReactNode }[] = [
   { key: "overview", label: "Overview", icon: <Gauge className="size-3.5" /> },
@@ -115,6 +118,7 @@ const VIEWS: { key: OpsView; label: string; icon: React.ReactNode }[] = [
   { key: "network-health", label: "Network health", icon: <Activity className="size-3.5" /> },
   { key: "unit-economics", label: "Unit economics", icon: <TrendingUp className="size-3.5" /> },
   { key: "funnel", label: "Funnel", icon: <Layers className="size-3.5" /> },
+  { key: "simulator", label: "Simulator", icon: <FlaskConical className="size-3.5" /> },
 ];
 
 export function OpsPanel() {
@@ -163,6 +167,7 @@ export function OpsPanel() {
       {view === "network-health" && <NetworkHealthView />}
       {view === "unit-economics" && <UnitEconomicsView />}
       {view === "funnel" && <AcquisitionFunnel />}
+      {view === "simulator" && <SimulatorPanel />}
     </div>
   );
 }

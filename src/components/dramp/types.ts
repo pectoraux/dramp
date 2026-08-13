@@ -948,3 +948,106 @@ export interface CommitmentSampleResponse {
   met: boolean;
   available: string | number;
 }
+
+// ---------------------------------------------------------------------------
+// Network Simulator (P4)
+// ---------------------------------------------------------------------------
+export interface SimConfig {
+  seed: number;
+  totalSteps: number;
+  stepDurationMs: number;
+  initialProviders: number;
+  providerGrowthRate: number;
+  providerExitThreshold: number;
+  demandVolume: number;
+  demandGrowth: number;
+  riskDistribution: { maxReliability: number; balanced: number; lowestCost: number };
+  policyDistribution: { now: number; waitForBetter: number };
+  enableReputation: boolean;
+  enableCommitments: boolean;
+  enableIncentives: boolean;
+  shockType: string | null;
+  shockStep: number;
+  shockMagnitude: number;
+  baselineCostBps: number;
+}
+
+export interface SimScenario {
+  id: string;
+  name: string;
+  description: string;
+  config: SimConfig;
+}
+
+export interface SimScenariosResponse {
+  scenarios: SimScenario[];
+  defaultConfig: SimConfig;
+}
+
+export interface SimMetrics {
+  totalIntents: number;
+  completedIntents: number;
+  failedIntents: number;
+  cancelledIntents: number;
+  expiredIntents: number;
+  avgCostBps: number;
+  avgWaitSteps: number;
+  p50ExecutionSteps: number;
+  p95ExecutionSteps: number;
+  completionRate: number;
+  activeProviders: number;
+  exitedProviders: number;
+  avgProviderEarnings: number;
+  medianProviderEarnings: number;
+  avgUtilization: number;
+  totalProviderVolume: number;
+  totalProtocolRevenue: number;
+  totalIncentiveSpend: number;
+  totalLiquidity: number;
+  avgRoutesPerCorridor: number;
+  corridorCoverage: number;
+  marketConcentration: number;
+  equilibriumStatus: string; // POSITIVE | FRAGILE | NEGATIVE | FORMING
+}
+
+export interface SimMetricsPoint extends SimMetrics {
+  step: number;
+}
+
+export interface SimCorridor {
+  corridor: string;
+  demand: number;
+  supply: number;
+  completed: number;
+  failed: number;
+  avgCost: number;
+  avgCostBps: number;
+}
+
+export interface SimProviderResult {
+  name: string;
+  type: string;
+  strategy: string;
+  tier: string;
+  status: string;
+  reputation: number;
+  volume: number;
+  earnings: number;
+  incentives: number;
+  executions: number;
+  failures: number;
+  utilization: number;
+  entryStep: number;
+  exitStep: number | null;
+}
+
+export interface SimRunResponse {
+  config: SimConfig;
+  metrics: SimMetrics;
+  metricsHistory: SimMetrics[];
+  corridors: SimCorridor[];
+  providers: SimProviderResult[];
+  totalIntents: number;
+  seed: number;
+  steps: number;
+}
