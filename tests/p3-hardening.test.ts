@@ -209,34 +209,47 @@ async function main() {
   }
 
   // =========================================================================
-  // 5. netEarnings = grossEarnings - grossCosts
+  // 5. Provider economics: canonical P&L from shared.calculateProviderEconomics
   // =========================================================================
-  console.log("\n== 5. Provider economics: netEarnings = gross - costs ==");
+  console.log("\n== 5. Provider economics: canonical P&L ==");
 
   const providers = await api(admin, "GET", "/api/providers");
   const testProvider = providers.json.providers[0];
   const econ = await api(admin, "GET", `/api/economics/provider/${testProvider.id}`);
   assert(econ.status === 200, "Provider economics returns 200");
   assert(econ.json.earnings.grossEarnings !== undefined, "Has grossEarnings field");
-  assert(econ.json.earnings.grossCosts !== undefined, "Has grossCosts field");
+  assert(econ.json.earnings.grossCosts !== undefined, "Has grossCosts field (legacy: penalties + slashing)");
+  assert(econ.json.earnings.totalCosts !== undefined, "Has totalCosts field (canonical: all costs)");
   assert(econ.json.earnings.netEarnings !== undefined, "Has netEarnings field");
 
-  // Verify the formula: netEarnings = grossEarnings - grossCosts.
-  const grossE = Number(econ.json.earnings.grossEarnings);
-  const grossC = Number(econ.json.earnings.grossCosts);
-  const netE = Number(econ.json.earnings.netEarnings);
-  assert(Math.abs(netE - (grossE - grossC)) < 0.01, `netEarnings (${netE}) = grossEarnings (${grossE}) - grossCosts (${grossC})`);
-
   // Verify grossEarnings = executionFees + incentives + rebates.
+  const grossE = Number(econ.json.earnings.grossEarnings);
   const fees = Number(econ.json.earnings.executionFees);
   const inc = Number(econ.json.earnings.incentives);
   const reb = Number(econ.json.earnings.rebates);
   assert(Math.abs(grossE - (fees + inc + reb)) < 0.01, `grossEarnings (${grossE}) = fees (${fees}) + incentives (${inc}) + rebates (${reb})`);
 
-  // Verify grossCosts = penalties + slashing.
+  // Verify grossCosts (legacy) = penalties + slashing.
+  const grossC = Number(econ.json.earnings.grossCosts);
   const pen = Number(econ.json.earnings.penalties);
   const sla = Number(econ.json.earnings.slashing);
   assert(Math.abs(grossC - (pen + sla)) < 0.01, `grossCosts (${grossC}) = penalties (${pen}) + slashing (${sla})`);
+
+  // Verify totalCosts (canonical) = settlementCosts + operatingCosts + capitalCost
+  // + expectedLoss + penalties + slashing. This is the shared.calculateProviderEconomics formula.
+  const totalC = Number(econ.json.earnings.totalCosts);
+  const settleC = Number(econ.json.earnings.settlementCosts);
+  const opC = Number(econ.json.earnings.operatingCosts);
+  const capC = Number(econ.json.earnings.capitalCost);
+  const expL = Number(econ.json.earnings.expectedLoss);
+  assert(Math.abs(totalC - (settleC + opC + capC + expL + pen + sla)) < 0.01,
+    `totalCosts (${totalC}) = settlement (${settleC}) + operating (${opC}) + capital (${capC}) + expectedLoss (${expL}) + penalties (${pen}) + slashing (${sla})`);
+
+  // Verify netEarnings (canonical) = grossEarnings - totalCosts.
+  // This is the FULL economics, not the legacy grossEarnings - grossCosts.
+  const netE = Number(econ.json.earnings.netEarnings);
+  assert(Math.abs(netE - (grossE - totalC)) < 0.01,
+    `netEarnings (${netE}) = grossEarnings (${grossE}) - totalCosts (${totalC})`);
 
   // =========================================================================
   // 6. COMMITMENT RELIABILITY available for routing
