@@ -1084,12 +1084,12 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
   });
 
   // Reserve capacity ONLY for the first leg (subsequent legs reserve when they start).
+  // Do NOT increment version — version tracks economic changes only, not reservations.
   if (inFlightLegs.length > 0) {
     const firstLeg = inFlightLegs[0];
     const firstOffer = world.offers.get(firstLeg.offerId);
     if (firstOffer) {
       firstOffer.reservedCapacity += firstLeg.reservation.amount;
-      firstOffer.version++;
     }
     const firstProvider = world.providers.get(firstLeg.providerId);
     if (firstProvider) {
