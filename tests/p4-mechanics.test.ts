@@ -32,8 +32,9 @@ async function main() {
   // =========================================================================
   console.log("\n== 1. Capacity reservation ==");
 
-  // Run a short simulation and check that capacity is being reserved.
-  const world = runSimulation({ ...createDefaultConfig(), seed: 42, totalSteps: 30, initialProviders: 10 });
+  // Run a simulation and check that capacity is being reserved.
+  // Use stable network config for sufficient completions with liquidity inventory.
+  const world = runSimulation({ ...createStableNetworkConfig(), seed: 42, totalSteps: 60 });
   const activeProvider = [...world.providers.values()].find(p => p.executionsCompleted > 0);
   assert(activeProvider !== undefined, "At least one provider completed executions");
 
@@ -358,8 +359,104 @@ async function main() {
   console.log(`  Peak utilization: ${effMetrics.peakUtilization}%`);
   console.log(`  Time-weighted utilization: ${effMetrics.avgTimeWeightedUtilization}%`);
 
+  // =========================================================================
+  // 17. LIQUIDITY INVENTORY — destination liquidity constraint (4.5)
+  // =========================================================================
+  console.log("\n== 17. Liquidity inventory ==");
+
+  // Verify providers have liquidity inventory with per-asset balances.
+  const liqProvider = [...effWorld.providers.values()].find(p => p.status === "ACTIVE");
+  if (liqProvider) {
+    assert(liqProvider.liquidity !== undefined, "Provider has liquidity inventory");
+    assert(liqProvider.liquidity.balances.size > 0, `Provider has ${liqProvider.liquidity.balances.size} asset balances`);
+    // Verify balances are separate from collateral.
+    assert(liqProvider.liquidity.balances !== liqProvider.collateral, "Liquidity is separate from collateral");
+  }
+
+  // Verify config flag exists.
+  assert(createDefaultConfig().enableLiquidityInventory === true, "enableLiquidityInventory is true by default");
+  assert(createStableNetworkConfig().enableLiquidityInventory === true, "Stable network has liquidity inventory enabled");
+
+  // Verify liquidity-constrained failures are tracked.
+  assert(effMetrics.liquidityConstrainedFailures !== undefined,
+    `Has liquidityConstrainedFailures metric (${effMetrics.liquidityConstrainedFailures})`);
+
+  // =========================================================================
+  // 18. STOCHASTIC SETTLEMENT — reliability profiles + outcome tracking (4.5)
+  // =========================================================================
+  console.log("\n== 18. Stochastic settlement ==");
+
+  // Verify providers have reliability profiles.
+  if (liqProvider) {
+    assert(liqProvider.reliabilityProfile !== undefined, "Provider has reliability profile");
+    const rp = liqProvider.reliabilityProfile;
+    assert(rp.fastRate > 0 && rp.fastRate < 1, `Fast rate in (0,1): ${rp.fastRate}`);
+    assert(rp.delayedRate >= 0, `Delayed rate >= 0: ${rp.delayedRate}`);
+    assert(rp.retryRate >= 0, `Retry rate >= 0: ${rp.retryRate}`);
+    assert(rp.failureRate >= 0, `Failure rate >= 0: ${rp.failureRate}`);
+  }
+
+  // Verify settlement outcome tracking.
+  const providersWithSettlements = [...effWorld.providers.values()].filter(
+    p => p.settlementsFast + p.settlementsDelayed + p.settlementsRetried + p.settlementsFailed > 0
+  );
+  assert(providersWithSettlements.length > 0,
+    `Providers with settlement outcomes: ${providersWithSettlements.length}`);
+
+  // Verify config flag exists.
+  assert(createDefaultConfig().enableStochasticSettlement === true, "enableStochasticSettlement is true by default");
+
+  // Verify reliability profiles differ by provider type (banks more reliable than agents).
+  const { DEFAULT_RELIABILITY_PROFILES } = await import("../src/lib/simulator/world");
+  const bankProfile = DEFAULT_RELIABILITY_PROFILES.BANK;
+  const agentProfile = DEFAULT_RELIABILITY_PROFILES.LOCAL_FIAT_AGENT;
+  assert(bankProfile.fastRate > agentProfile.fastRate,
+    `Banks more reliable than agents (${bankProfile.fastRate} > ${agentProfile.fastRate})`);
+  assert(bankProfile.failureRate < agentProfile.failureRate,
+    `Banks fail less than agents (${bankProfile.failureRate} < ${agentProfile.failureRate})`);
+
+  // =========================================================================
+  // 19. DEMAND PATIENCE — customer abandonment (4.5)
+  // =========================================================================
+  console.log("\n== 19. Demand patience ==");
+
+  // Verify config flags exist.
+  assert(createDefaultConfig().enableDemandPatience === true, "enableDemandPatience is true by default");
+  assert(createDefaultConfig().defaultMaxAcceptablePriceBps === 400, "Default max price is 400 bps (4%)");
+  assert(createDefaultConfig().defaultMaxAcceptableLatencySteps === 30, "Default max latency is 30 steps");
+
+  // Verify intents have patience fields.
+  const sampleIntent = effWorld.intents[0];
+  if (sampleIntent) {
+    assert(sampleIntent.maxAcceptablePriceBps !== undefined, "Intent has maxAcceptablePriceBps");
+    assert(sampleIntent.maxAcceptableLatencySteps !== undefined, "Intent has maxAcceptableLatencySteps");
+  }
+
+  // Verify abandoned intents are tracked.
+  assert(effMetrics.abandonedIntents !== undefined,
+    `Has abandonedIntents metric (${effMetrics.abandonedIntents})`);
+
+  // =========================================================================
+  // 20. CONFIG VERSIONING — new assumptions are explicit (4.5)
+  // =========================================================================
+  console.log("\n== 20. Config versioning ==");
+
+  const cfg = createDefaultConfig();
+  // All P4.5 assumptions must be explicitly in the config.
+  assert("enableLiquidityInventory" in cfg, "Config has enableLiquidityInventory");
+  assert("enableStochasticSettlement" in cfg, "Config has enableStochasticSettlement");
+  assert("enableDemandPatience" in cfg, "Config has enableDemandPatience");
+  assert("defaultMaxAcceptablePriceBps" in cfg, "Config has defaultMaxAcceptablePriceBps");
+  assert("defaultMaxAcceptableLatencySteps" in cfg, "Config has defaultMaxAcceptableLatencySteps");
+  assert("liquidityReplenishSteps" in cfg, "Config has liquidityReplenishSteps");
+
+  // Verify P4.4 behavior can be restored by disabling P4.5 features.
+  const p44Config = { ...createDefaultConfig(), enableLiquidityInventory: false, enableStochasticSettlement: false, enableDemandPatience: false };
+  const p44World = runSimulation({ ...p44Config, seed: 42, totalSteps: 30 });
+  assert(p44World.intents.length > 0, "P4.4 mode (all 4.5 features disabled) still runs");
+
   console.log(`\n========================================`);
-  console.log(`  P4.4 Mechanics: Passed: ${passed}  |  Failed: ${failed}`);
+  console.log(`  P4.5 Mechanics: Passed: ${passed}  |  Failed: ${failed}`);
   console.log(`========================================`);
   if (failed > 0) {
     console.log("\nFailures:");

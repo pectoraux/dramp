@@ -14,7 +14,8 @@ export async function POST(req: NextRequest) {
     const world = runSimulation(config);
     const finalMetrics = world.metricsHistory[world.metricsHistory.length - 1] ?? {
       totalIntents: 0, completedIntents: 0, failedIntents: 0, cancelledIntents: 0,
-      expiredIntents: 0, avgCostBps: 0, avgWaitSteps: 0, p50ExecutionSteps: 0,
+      expiredIntents: 0, abandonedIntents: 0, liquidityConstrainedFailures: 0,
+      avgCostBps: 0, avgWaitSteps: 0, p50ExecutionSteps: 0,
       p95ExecutionSteps: 0, completionRate: 0, activeProviders: 0, exitedProviders: 0,
       suspendedProviders: 0, economicExits: 0,
       avgProviderEarnings: 0, medianProviderEarnings: 0, avgUtilization: 0,

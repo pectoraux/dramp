@@ -33,6 +33,12 @@ export interface SimProvider {
   lockedCollateral: number;
   maxExposure: number;
   corridors: string[]; // ["USD:US:EUR:EU", ...]
+  // Liquidity inventory: actual cash balances per asset, SEPARATE from collateral.
+  // A provider can be well-collateralized but lack destination liquidity.
+  liquidity: SimLiquidityInventory;
+  // Settlement reliability profile (stochastic settlement outcomes).
+  // Derived from providerType, can be overridden per-provider.
+  reliabilityProfile: SettlementReliabilityProfile;
   // Tracked economics (aggregate totals)
   totalVolume: number;
   totalEarnings: number;
@@ -41,6 +47,11 @@ export interface SimProvider {
   totalSlashing: number;
   executionsCompleted: number;
   executionsFailed: number;
+  // Settlement outcome tracking (stochastic)
+  settlementsFast: number;
+  settlementsDelayed: number;
+  settlementsRetried: number;
+  settlementsFailed: number;
   utilization: number; // instantaneous reserved / available (observed during step)
   peakUtilization: number; // highest utilization seen over the simulation
   utilizationTimeSteps: number; // Σ (utilization per step) — for time-weighted average
@@ -56,6 +67,23 @@ export interface SimProvider {
   executionHistory: SimExecutionRecord[];
 }
 
+// Liquidity inventory: a provider's actual cash balances, separate from
+// collateral. A provider can have $1M collateral but only ₦10M local fiat —
+// the collateral secures the network, but the fiat is needed to complete payouts.
+//
+// This is the most important economic distinction in cross-border payments:
+//   collateral = risk security (locked, slashable)
+//   source liquidity = cash the provider has to receive incoming transfers
+//   destination liquidity = cash the provider has to pay out
+export interface SimLiquidityInventory {
+  // Per-asset balances. Keyed by asset symbol (e.g. "USD", "NGN", "USDC").
+  // These are the provider's actual operating balances, NOT collateral.
+  balances: Map<string, number>;
+  // When a payout is made, destination liquidity decreases.
+  // When a receipt is settled, source liquidity increases.
+  // Providers replenish inventory periodically (configurable).
+}
+
 // Active reservation: capacity held for a multi-step settlement period.
 // Created when an execution starts, released when the settlement duration
 // elapses. This makes utilization real across steps.
@@ -67,6 +95,34 @@ export interface SimActiveReservation {
   startStep: number;
   releaseStep: number; // startStep + settlementDurationSteps
 }
+
+// Settlement reliability profile: per-provider-type probability distribution
+// for settlement outcomes. This makes settlement stochastic and gives
+// reputation genuine economic meaning — reliable providers settle faster.
+export interface SettlementReliabilityProfile {
+  // Probability of fast settlement (settlementDurationSteps as advertised)
+  fastRate: number;      // 0..1, e.g. 0.95
+  // Probability of delayed settlement (2× advertised duration)
+  delayedRate: number;   // 0..1, e.g. 0.03
+  // Probability of retry (3× advertised duration, capital held longer)
+  retryRate: number;     // 0..1, e.g. 0.01
+  // Probability of failure (capital released, intent fails)
+  failureRate: number;   // 0..1, e.g. 0.01
+}
+
+// Default reliability profiles by provider type.
+export const DEFAULT_RELIABILITY_PROFILES: Record<string, SettlementReliabilityProfile> = {
+  BANK: { fastRate: 0.98, delayedRate: 0.015, retryRate: 0.003, failureRate: 0.002 },
+  PSP: { fastRate: 0.95, delayedRate: 0.03, retryRate: 0.01, failureRate: 0.01 },
+  CEX: { fastRate: 0.93, delayedRate: 0.04, retryRate: 0.015, failureRate: 0.015 },
+  DEX: { fastRate: 0.90, delayedRate: 0.05, retryRate: 0.02, failureRate: 0.03 },
+  STABLECOIN_LP: { fastRate: 0.96, delayedRate: 0.025, retryRate: 0.008, failureRate: 0.007 },
+  LOCAL_FIAT_AGENT: { fastRate: 0.85, delayedRate: 0.08, retryRate: 0.03, failureRate: 0.04 },
+  MARKET_MAKER: { fastRate: 0.94, delayedRate: 0.035, retryRate: 0.012, failureRate: 0.013 },
+  TREASURY: { fastRate: 0.97, delayedRate: 0.02, retryRate: 0.005, failureRate: 0.005 },
+  SETTLEMENT_ASSET_SPONSOR: { fastRate: 0.92, delayedRate: 0.05, retryRate: 0.015, failureRate: 0.015 },
+  HYBRID: { fastRate: 0.91, delayedRate: 0.05, retryRate: 0.02, failureRate: 0.02 },
+};
 
 export interface SimOffer {
   id: string;
@@ -121,7 +177,10 @@ export interface SimIntent {
   riskTolerance: string;
   executionPolicy: string;
   maxWaitSeconds: number;
-  status: string; // SEARCHING | EXECUTING | COMPLETED | FAILED | CANCELLED | EXPIRED
+  // Demand patience (Prompt 4.5): customers abandon if price/latency exceeds limits.
+  maxAcceptablePriceBps: number;     // max total cost in bps; abandon if route exceeds this
+  maxAcceptableLatencySteps: number; // max wait in steps before abandonment
+  status: string; // SEARCHING | EXECUTING | COMPLETED | FAILED | CANCELLED | EXPIRED | ABANDONED
   createdAtStep: number;
   completedAtStep: number | null;
   selectedRouteId: string | null;
@@ -188,6 +247,8 @@ export interface SimMetrics {
   failedIntents: number;
   cancelledIntents: number;
   expiredIntents: number;
+  abandonedIntents: number;       // Prompt 4.5: customer abandonment (price/latency)
+  liquidityConstrainedFailures: number; // Prompt 4.5: failures due to insufficient destination liquidity
   avgCostBps: number;
   avgWaitSteps: number;
   p50ExecutionSteps: number;
@@ -263,6 +324,17 @@ export interface SimConfig {
   shockStep: number;
   shockMagnitude: number;
   baselineCostBps: number; // conventional remittance baseline for comparison
+  // ---- Prompt 4.5: Liquidity & Settlement Realism ----
+  // All new assumptions are EXPLICITLY exposed here — no silent defaults.
+  // Setting enableLiquidityInventory=false reverts to P4.4 behavior (capacity-only).
+  enableLiquidityInventory: boolean;  // if true, routing checks destination liquidity
+  enableStochasticSettlement: boolean; // if true, settlement outcomes are probabilistic
+  enableDemandPatience: boolean;       // if true, customers abandon on price/latency
+  // Demand patience defaults (per-intent values sampled from these).
+  defaultMaxAcceptablePriceBps: number;   // e.g. 400 = 4% max cost
+  defaultMaxAcceptableLatencySteps: number; // e.g. 30 = 30 min max wait
+  // Liquidity replenishment: providers top up inventory every N steps.
+  liquidityReplenishSteps: number;
 }
 
 export function createDefaultConfig(): SimConfig {
@@ -284,6 +356,13 @@ export function createDefaultConfig(): SimConfig {
     shockStep: 50,
     shockMagnitude: 0.5,
     baselineCostBps: 300, // 3% baseline
+    // Prompt 4.5: Liquidity & Settlement Realism (all explicit, versioned)
+    enableLiquidityInventory: true,
+    enableStochasticSettlement: true,
+    enableDemandPatience: true,
+    defaultMaxAcceptablePriceBps: 400,   // 4% max cost
+    defaultMaxAcceptableLatencySteps: 30, // 30 min max wait
+    liquidityReplenishSteps: 10,
   };
 }
 
@@ -316,6 +395,13 @@ export function createStableNetworkConfig(): SimConfig {
     shockStep: 50,
     shockMagnitude: 0.5,
     baselineCostBps: 300,
+    // Prompt 4.5: Liquidity & Settlement Realism (all explicit, versioned)
+    enableLiquidityInventory: true,
+    enableStochasticSettlement: true,
+    enableDemandPatience: true,
+    defaultMaxAcceptablePriceBps: 400,
+    defaultMaxAcceptableLatencySteps: 30,
+    liquidityReplenishSteps: 10,
   };
 }
 

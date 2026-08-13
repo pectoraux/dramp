@@ -78,6 +78,7 @@ export function simulateStep(world: SimWorld, rng: SeededRNG): void {
   // not after. Prices are set based on current deployment, then demand sees
   // those prices.
   releaseExpiredReservations(world);
+  replenishLiquidity(world, rng);
   updateProviderOffers(world, rng);
   generateDemand(world, rng);
   matchAndExecute(world, rng);
@@ -121,12 +122,24 @@ function generateDemand(world: SimWorld, rng: SeededRNG): void {
     const user = rng.pick(activeUsers);
     if (!rng.chance(user.frequency)) continue;
     const amount = Math.max(10, rng.gaussian(user.typicalAmount, user.amountStdDev));
+    // Demand patience: sample max acceptable price and latency per intent.
+    // Customers vary in price sensitivity and patience — some will pay more
+    // for speed, others will wait for a better price.
+    const maxPriceBps = world.config.enableDemandPatience
+      ? Math.round(world.config.defaultMaxAcceptablePriceBps * rng.float(0.7, 1.5))
+      : 999999; // effectively unlimited if patience disabled
+    const maxLatencySteps = world.config.enableDemandPatience
+      ? Math.round(world.config.defaultMaxAcceptableLatencySteps * rng.float(0.5, 2.0))
+      : 999999;
     world.intents.push({
       id: `intent_${++intentCounter}`, userId: user.id, sourceAmount: amount,
       sourceAsset: user.sourceAsset, sourceCountry: user.sourceCountry,
       destinationAsset: user.destinationAsset, destinationCountry: user.destinationCountry,
       riskTolerance: user.riskTolerance, executionPolicy: user.executionPolicy,
-      maxWaitSeconds: user.maxWaitSeconds, status: "SEARCHING",
+      maxWaitSeconds: user.maxWaitSeconds,
+      maxAcceptablePriceBps: maxPriceBps,
+      maxAcceptableLatencySteps: maxLatencySteps,
+      status: "SEARCHING",
       createdAtStep: world.step, completedAtStep: null, selectedRouteId: null,
       routeTag: null, effectiveCost: 0, netOutput: 0, waitedSteps: 0, failureReason: null,
     });
@@ -206,6 +219,15 @@ function matchAndExecute(world: SimWorld, rng: SeededRNG): void {
   for (const intent of world.intents) {
     if (intent.status !== "SEARCHING") continue;
 
+    // Demand patience: check if intent has waited too long — abandon.
+    if (world.config.enableDemandPatience) {
+      if (intent.waitedSteps >= intent.maxAcceptableLatencySteps) {
+        intent.status = "ABANDONED";
+        intent.failureReason = "customer abandoned (latency exceeded patience)";
+        continue;
+      }
+    }
+
     const routes = findRoutesFaithful(world, intent);
     if (routes.length === 0) {
       intent.waitedSteps++;
@@ -223,6 +245,21 @@ function matchAndExecute(world: SimWorld, rng: SeededRNG): void {
     const routeInfos = routes.map(r => simCandidateToRouteInfo(r));
     const ranked: RankedRoute[] = rankRoutes(routeInfos, scoreCtx);
     const best = routes[routeInfos.indexOf(ranked[0].route)];
+
+    // Demand patience: check if best route exceeds price limit — abandon.
+    if (world.config.enableDemandPatience) {
+      const routeCostBps = best.effectiveCost / intent.sourceAmount * 10000;
+      if (routeCostBps > intent.maxAcceptablePriceBps) {
+        intent.waitedSteps++;
+        // Don't abandon immediately — wait to see if a cheaper route appears.
+        const maxWaitSteps = Math.ceil(intent.maxWaitSeconds / (world.config.stepDurationMs / 1000));
+        if (intent.waitedSteps > maxWaitSteps || intent.waitedSteps >= intent.maxAcceptableLatencySteps) {
+          intent.status = "ABANDONED";
+          intent.failureReason = `customer abandoned (price ${routeCostBps.toFixed(0)}bps > ${intent.maxAcceptablePriceBps}bps limit)`;
+        }
+        continue;
+      }
+    }
 
     // Patient execution: WAIT_FOR_BETTER doesn't immediately execute.
     if (intent.executionPolicy === "WAIT_FOR_BETTER") {
@@ -329,6 +366,15 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent): SimCandidateRou
     if (!provider || provider.status !== "ACTIVE") continue;
     if (offer.availableCapacity - offer.reservedCapacity < intent.sourceAmount) continue;
 
+    // Liquidity inventory check: provider must have enough destination-asset
+    // liquidity to complete the payout. This is separate from capacity —
+    // a provider can have capacity (collateral) but insufficient local fiat.
+    if (world.config.enableLiquidityInventory) {
+      const payoutAmount = intent.sourceAmount * offer.rate; // approx destination amount
+      const dstLiquidity = provider.liquidity.balances.get(offer.destinationAsset) ?? 0;
+      if (dstLiquidity < payoutAmount) continue; // insufficient destination liquidity
+    }
+
     const providerRisk: ProviderRiskInfo = {
       trustModel: provider.trustModel,
       providerType: provider.providerType,
@@ -433,6 +479,17 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent): SimCandidateRou
         const midAmount = afterFee1 * o1.rate;
         // Capacity check for hop 2 (midAmount may differ from sourceAmount).
         if (o2.availableCapacity - o2.reservedCapacity < midAmount) continue;
+
+        // Liquidity inventory checks for multi-hop:
+        // p1 needs settlement-asset liquidity (to pay out the mid-asset).
+        // p2 needs destination-asset liquidity (to pay out the final destination).
+        if (world.config.enableLiquidityInventory) {
+          const p1MidLiquidity = p1.liquidity.balances.get(o1.destinationAsset) ?? 0;
+          if (p1MidLiquidity < midAmount) continue;
+          const finalAmount = midAmount * o2.rate; // approx
+          const p2DstLiquidity = p2.liquidity.balances.get(o2.destinationAsset) ?? 0;
+          if (p2DstLiquidity < finalAmount) continue;
+        }
         const fee2 = midAmount * o2.feeBps / 10000;
         const afterFee2 = midAmount - fee2;
         const finalAmount = afterFee2 * o2.rate;
@@ -510,6 +567,39 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent): SimCandidateRou
 
 let reservationCounter = 0;
 
+// Sample a stochastic settlement outcome from a provider's reliability profile.
+// Returns FAST (advertised duration), DELAYED (2×), RETRY (3×), or FAILURE.
+function sampleSettlementOutcome(
+  rng: SeededRNG,
+  profile: { fastRate: number; delayedRate: number; retryRate: number; failureRate: number },
+): "FAST" | "DELAYED" | "RETRY" | "FAILURE" {
+  const roll = rng.next();
+  if (roll < profile.fastRate) return "FAST";
+  if (roll < profile.fastRate + profile.delayedRate) return "DELAYED";
+  if (roll < profile.fastRate + profile.delayedRate + profile.retryRate) return "RETRY";
+  return "FAILURE";
+}
+
+// Replenish liquidity inventory: providers periodically top up their cash
+// balances. This models the real-world process of providers depositing fiat
+// or converting between currencies to maintain operating balances.
+function replenishLiquidity(world: SimWorld, rng: SeededRNG): void {
+  if (!world.config.enableLiquidityInventory) return;
+  if (world.step % world.config.liquidityReplenishSteps !== 0) return;
+  for (const provider of world.providers.values()) {
+    if (provider.status !== "ACTIVE") continue;
+    // Replenish each asset balance toward a target (50% of collateral value).
+    for (const [asset, balance] of provider.liquidity.balances) {
+      const target = provider.collateral * 0.3; // target 30% of collateral per asset
+      if (balance < target) {
+        // Top up toward target (with small random variation).
+        const topUp = (target - balance) * rng.float(0.5, 1.0);
+        provider.liquidity.balances.set(asset, balance + topUp);
+      }
+    }
+  }
+}
+
 function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRoute & { id: string }, rng: SeededRNG): void {
   const provider = world.providers.get(route.legs[0].providerId);
   if (!provider) { intent.status = "FAILED"; intent.failureReason = "provider not found"; return; }
@@ -529,8 +619,50 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
       intent.failureReason = "insufficient capacity";
       return;
     }
+    // Liquidity inventory check (double-check at execution time — may have
+    // changed since route discovery if another execution consumed it).
+    if (world.config.enableLiquidityInventory) {
+      const p = world.providers.get(leg.providerId);
+      if (p) {
+        const payoutAmount = leg.amount * offer.rate;
+        const dstLiquidity = p.liquidity.balances.get(leg.destinationAsset) ?? 0;
+        if (dstLiquidity < payoutAmount) {
+          intent.status = "FAILED";
+          intent.failureReason = "insufficient destination liquidity";
+          return;
+        }
+      }
+    }
     // Settlement duration for this leg (from the offer's expectedExecutionSeconds).
-    const durationSteps = offer.settlementDurationSteps;
+    let durationSteps = offer.settlementDurationSteps;
+    // Stochastic settlement: sample outcome from provider's reliability profile.
+    if (world.config.enableStochasticSettlement) {
+      const p = world.providers.get(leg.providerId);
+      if (p) {
+        const outcome = sampleSettlementOutcome(rng, p.reliabilityProfile);
+        if (outcome === "FAILURE") {
+          // Settlement failure — release reservation, mark intent failed.
+          intent.status = "FAILED";
+          intent.failureReason = "settlement failure (stochastic)";
+          p.executionsFailed++;
+          p.settlementsFailed++;
+          p.totalPenalties += leg.amount * 0.001;
+          recordExecution(p, intent, route, "FAILED", 0, world);
+          return;
+        }
+        // Adjust duration based on outcome.
+        if (outcome === "FAST") {
+          p.settlementsFast++;
+          // durationSteps stays as advertised.
+        } else if (outcome === "DELAYED") {
+          p.settlementsDelayed++;
+          durationSteps *= 2; // delayed = 2× advertised
+        } else if (outcome === "RETRY") {
+          p.settlementsRetried++;
+          durationSteps *= 3; // retry = 3× advertised
+        }
+      }
+    }
     reservations.push({ offer, amount: leg.amount, durationSteps });
   }
 
@@ -540,7 +672,7 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
     r.offer.version++;
   }
 
-  // ---- Step 2: Failure model ----
+  // ---- Step 2: Execution failure model (counterparty risk-based) ----
   const cpRisk = providerCounterpartyRisk({
     trustModel: provider.trustModel, providerType: provider.providerType,
     reputationScore: provider.reputationScore, status: provider.status,
@@ -555,11 +687,20 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
     for (const r of reservations) {
       r.offer.reservedCapacity -= r.amount;
     }
+    // Restore liquidity (execution didn't complete).
+    if (world.config.enableLiquidityInventory) {
+      for (const r of reservations) {
+        const p = world.providers.get(r.offer.providerId);
+        if (p) {
+          // No liquidity was consumed yet (failure before settlement).
+        }
+      }
+    }
     recordExecution(provider, intent, route, "FAILED", 0, world);
     return;
   }
 
-  // ---- Step 3: Success — create PERSISTENT reservations ----
+  // ---- Step 3: Success — consume liquidity + create PERSISTENT reservations ----
   intent.status = "COMPLETED";
   intent.completedAtStep = world.step;
   intent.effectiveCost = route.effectiveCost;
@@ -570,7 +711,7 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
 
   const durationSec = route.expectedExecutionSeconds;
 
-  // Update provider economics + create persistent reservations.
+  // Update provider economics + create persistent reservations + consume liquidity.
   for (let i = 0; i < route.legs.length; i++) {
     const leg = route.legs[i];
     const r = reservations[i];
@@ -584,6 +725,19 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
     // Track deployed capital: amount × duration (capital-time product).
     p.totalDeployedCapitalSteps += leg.amount * r.durationSteps;
     p.currentDeployedCapital += leg.amount;
+
+    // Consume liquidity inventory: provider pays out destination asset,
+    // receives source asset. This is the key economic constraint — providers
+    // can run out of payout currency even with ample collateral.
+    if (world.config.enableLiquidityInventory) {
+      const payoutAmount = leg.amount * leg.rate; // destination-asset amount
+      const srcBalance = p.liquidity.balances.get(leg.sourceAsset) ?? 0;
+      const dstBalance = p.liquidity.balances.get(leg.destinationAsset) ?? 0;
+      // Source balance increases (provider receives incoming transfer).
+      p.liquidity.balances.set(leg.sourceAsset, srcBalance + leg.amount);
+      // Destination balance decreases (provider pays out).
+      p.liquidity.balances.set(leg.destinationAsset, Math.max(0, dstBalance - payoutAmount));
+    }
 
     // Create a persistent reservation that will be released after durationSteps.
     const reservation: SimActiveReservation = {
@@ -944,6 +1098,8 @@ function collectMetrics(world: SimWorld): SimMetrics {
   const completed = intents.filter(i => i.status === "COMPLETED");
   const failed = intents.filter(i => i.status === "FAILED");
   const expired = intents.filter(i => i.status === "EXPIRED");
+  const abandoned = intents.filter(i => i.status === "ABANDONED");
+  const liquidityConstrained = intents.filter(i => i.failureReason === "insufficient destination liquidity");
   const activeProviders = [...world.providers.values()].filter(p => p.status === "ACTIVE");
   const exitedProviders = [...world.providers.values()].filter(p => p.status === "EXITED");
   const suspendedProviders = [...world.providers.values()].filter(p => p.status === "SUSPENDED");
@@ -1044,6 +1200,8 @@ function collectMetrics(world: SimWorld): SimMetrics {
   return {
     totalIntents: intents.length, completedIntents: completed.length,
     failedIntents: failed.length, cancelledIntents: 0, expiredIntents: expired.length,
+    abandonedIntents: abandoned.length,
+    liquidityConstrainedFailures: liquidityConstrained.length,
     avgCostBps: Math.round(avgCostBps * 100) / 100, avgWaitSteps: Math.round(avgWaitSteps * 100) / 100,
     p50ExecutionSteps: p50, p95ExecutionSteps: p95,
     completionRate: intents.length > 0 ? Math.round((completed.length / intents.length) * 10000) / 100 : 0,

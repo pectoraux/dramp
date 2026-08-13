@@ -6,7 +6,8 @@
 import { SeededRNG } from "./rng";
 import {
   SimWorld, SimConfig, SimProvider, SimOffer, SimUser,
-  SimSettlementAsset, SimCampaign,
+  SimSettlementAsset, SimCampaign, SimLiquidityInventory,
+  SettlementReliabilityProfile, DEFAULT_RELIABILITY_PROFILES,
 } from "./world";
 
 const COUNTRIES = ["US", "EU", "NG", "PH", "KE", "GB", "SG", "JP", "IN", "BR"];
@@ -19,6 +20,51 @@ const PROVIDER_NAMES = ["Northbridge", "SwiftPay", "Meridian", "Atlas", "OpenSwa
 let idCounter = 0;
 function nextId(prefix: string): string {
   return `${prefix}_${++idCounter}`;
+}
+
+// Create a liquidity inventory for a provider. Each provider gets cash balances
+// in the assets it serves. The balances are separate from collateral — a
+// provider can be well-collateralized but low on destination liquidity.
+function createLiquidityInventory(
+  rng: SeededRNG,
+  corridors: string[],
+  collateral: number,
+): SimLiquidityInventory {
+  const balances = new Map<string, number>();
+  // For each corridor, give the provider some source and destination liquidity.
+  // Destination liquidity is typically smaller than source (providers hold less
+  // foreign currency). This creates the key economic constraint.
+  for (const corridor of corridors) {
+    const parts = corridor.split(":");
+    if (parts.length < 4) continue;
+    const srcAsset = parts[0];
+    const dstAsset = parts[2];
+    // Source liquidity: 20-60% of collateral value (providers hold home currency).
+    const srcBalance = collateral * rng.float(0.2, 0.6);
+    // Destination liquidity: 5-25% of collateral value (providers hold less foreign currency).
+    // This is the constraint that matters — providers can run out of payout currency.
+    const dstBalance = collateral * rng.float(0.05, 0.25);
+    balances.set(srcAsset, (balances.get(srcAsset) ?? 0) + srcBalance);
+    balances.set(dstAsset, (balances.get(dstAsset) ?? 0) + dstBalance);
+  }
+  return { balances };
+}
+
+// Get the reliability profile for a provider type, with small per-provider
+// variation so providers of the same type aren't identical.
+function getReliabilityProfile(
+  rng: SeededRNG,
+  providerType: string,
+): SettlementReliabilityProfile {
+  const base = DEFAULT_RELIABILITY_PROFILES[providerType] ?? DEFAULT_RELIABILITY_PROFILES.HYBRID;
+  // Add ±2% variation to each rate (keeping them summing to ~1.0).
+  const variation = rng.float(-0.02, 0.02);
+  return {
+    fastRate: Math.max(0.5, Math.min(0.999, base.fastRate + variation)),
+    delayedRate: Math.max(0, base.delayedRate - variation * 0.5),
+    retryRate: Math.max(0, base.retryRate - variation * 0.3),
+    failureRate: Math.max(0, base.failureRate - variation * 0.2),
+  };
 }
 
 export function generateWorld(world: SimWorld, rng: SeededRNG): void {
@@ -117,10 +163,14 @@ function generateProvider(
     strategy, collateral, usableCollateral, lockedCollateral: 0, maxExposure,
     corridors: [], totalVolume: 0, totalEarnings: 0, totalIncentives: 0,
     totalPenalties: 0, totalSlashing: 0, executionsCompleted: 0, executionsFailed: 0,
+    settlementsFast: 0, settlementsDelayed: 0, settlementsRetried: 0, settlementsFailed: 0,
     utilization: 0, peakUtilization: 0, utilizationTimeSteps: 0,
     entryStep: 0, exitStep: null,
     totalDeployedCapitalSteps: 0, currentDeployedCapital: 0,
     executionHistory: [],
+    // Initialized after corridors are built (below).
+    liquidity: { balances: new Map() },
+    reliabilityProfile: getReliabilityProfile(rng, providerType),
   };
   world.providers.set(provider.id, provider);
 
@@ -173,6 +223,9 @@ function generateProvider(
     };
     world.offers.set(offer.id, offer);
   }
+
+  // Now that corridors are built, initialize liquidity inventory.
+  provider.liquidity = createLiquidityInventory(rng, provider.corridors, provider.collateral);
 }
 
 function generateUser(world: SimWorld, rng: SeededRNG, config: SimConfig): void {
@@ -236,10 +289,13 @@ export function generateNewProvider(
     strategy, collateral, usableCollateral, lockedCollateral: 0, maxExposure,
     corridors: [], totalVolume: 0, totalEarnings: 0, totalIncentives: 0,
     totalPenalties: 0, totalSlashing: 0, executionsCompleted: 0, executionsFailed: 0,
+    settlementsFast: 0, settlementsDelayed: 0, settlementsRetried: 0, settlementsFailed: 0,
     utilization: 0, peakUtilization: 0, utilizationTimeSteps: 0,
     entryStep: step, exitStep: null,
     totalDeployedCapitalSteps: 0, currentDeployedCapital: 0,
     executionHistory: [],
+    liquidity: { balances: new Map() },
+    reliabilityProfile: getReliabilityProfile(rng, providerType),
   };
   world.providers.set(provider.id, provider);
 
@@ -277,6 +333,9 @@ export function generateNewProvider(
 
   // Compute settlement durations for the new provider's offers.
   computeSettlementDurations(world);
+
+  // Initialize liquidity inventory for the new provider.
+  provider.liquidity = createLiquidityInventory(rng, provider.corridors, provider.collateral);
 
   return provider;
 }
