@@ -24,6 +24,7 @@ import { SeededRNG } from "./rng";
 import {
   SimWorld, SimIntent, SimMetrics, SimProvider, SimOffer,
   SimCampaign, SimRoute, SimExecutionRecord, SimActiveReservation,
+  SimInFlightExecution,
 } from "./world";
 import { generateNewProvider } from "./generator";
 import {
@@ -68,16 +69,15 @@ export function simulateStep(world: SimWorld, rng: SeededRNG): void {
 
   // Step ordering (market microstructure):
   //   1. Release expired reservations (settlements that completed free capacity)
-  //   2. Update utilization from active reservations (providers see current load)
-  //   3. Providers adjust prices based on observed utilization
-  //   4. Generate new demand
-  //   5. Match + execute (routes against updated prices, creates new reservations)
-  //   6. Provider entry/exit, campaign updates, shocks
-  //
-  // This ensures providers react to utilization BEFORE new demand routes,
-  // not after. Prices are set based on current deployment, then demand sees
-  // those prices.
+  //   2. Process in-flight executions (complete settlements whose time is up)
+  //   3. Replenish liquidity from treasury (conservation: treasury → operating)
+  //   4. Update utilization from active reservations (providers see current load)
+  //   5. Providers adjust prices based on observed utilization
+  //   6. Generate new demand
+  //   7. Match + execute (routes against updated prices, creates new reservations)
+  //   8. Provider entry/exit, campaign updates, shocks
   releaseExpiredReservations(world);
+  processInFlightExecutions(world);
   replenishLiquidity(world, rng);
   updateProviderOffers(world, rng);
   generateDemand(world, rng);
@@ -88,6 +88,109 @@ export function simulateStep(world: SimWorld, rng: SeededRNG): void {
   if (world.step % 5 === 0 || world.step === world.config.totalSteps) {
     world.metricsHistory.push(collectMetrics(world));
   }
+}
+
+// Process in-flight executions: complete settlements whose completionStep
+// has arrived. At completion:
+//   - destination liquidity decreases (payout happens)
+//   - source liquidity increases (receipt happens)
+//   - provider earnings are recognized
+//   - reservation is released
+//   - execution history is recorded (for reputation)
+// This makes settlement delay affect BOTH user latency AND provider capital.
+function processInFlightExecutions(world: SimWorld): void {
+  const remaining: SimInFlightExecution[] = [];
+  for (const exec of world.inFlightExecutions) {
+    if (world.step >= exec.completionStep) {
+      // Settlement completes NOW.
+      completeSettlement(world, exec);
+    } else {
+      remaining.push(exec);
+    }
+  }
+  world.inFlightExecutions = remaining;
+}
+
+// Complete a settlement: consume liquidity, credit provider, release reservation.
+function completeSettlement(world: SimWorld, exec: SimInFlightExecution): void {
+  const intent = world.intents.find(i => i.id === exec.intentId);
+  if (!intent) return;
+
+  // Mark intent COMPLETED (user sees settlement complete NOW, not at start).
+  intent.status = "COMPLETED";
+  intent.completedAtStep = world.step;
+  intent.effectiveCost = exec.effectiveCost;
+  intent.netOutput = exec.netOutput;
+  intent.waitedSteps = world.step - intent.createdAtStep;
+
+  const durationSec = (world.step - exec.startStep) * (world.config.stepDurationMs / 1000);
+
+  // For each leg: consume liquidity, credit provider, release reservation.
+  for (const leg of exec.legs) {
+    const p = world.providers.get(leg.providerId);
+    if (!p) continue;
+
+    const fee = leg.amount * leg.feeBps / 10000;
+    p.totalVolume += leg.amount;
+    p.totalEarnings += fee;
+    p.executionsCompleted++;
+
+    // Consume liquidity NOW (at settlement, not at start).
+    if (world.config.enableLiquidityInventory) {
+      const srcBalance = p.liquidity.balances.get(leg.sourceAsset) ?? 0;
+      const dstBalance = p.liquidity.balances.get(leg.destinationAsset) ?? 0;
+      // Source balance increases (provider receives incoming transfer).
+      p.liquidity.balances.set(leg.sourceAsset, srcBalance + leg.amount);
+      // Destination balance decreases (provider pays out).
+      p.liquidity.balances.set(leg.destinationAsset, Math.max(0, dstBalance - leg.payoutAmount));
+    }
+
+    // Release the reservation for this leg.
+    const offer = world.offers.get(leg.offerId);
+    if (offer) {
+      offer.reservedCapacity = Math.max(0, offer.reservedCapacity - leg.amount);
+    }
+    p.currentDeployedCapital = Math.max(0, p.currentDeployedCapital - leg.amount);
+
+    // Record execution in history (for reputation recalculation).
+    const corridorKey = `${p.id}:${leg.sourceAsset}:${leg.destinationAsset}::`;
+    const record: SimExecutionRecord = {
+      providerId: p.id,
+      amount: leg.amount,
+      outcome: "COMPLETED",
+      durationSeconds: durationSec,
+      step: world.step,
+      timeMs: world.timeMs,
+      feeBps: leg.feeBps,
+      corridorKey,
+    };
+    p.executionHistory.push(record);
+    if (p.executionHistory.length > 500) {
+      p.executionHistory = p.executionHistory.slice(-500);
+    }
+  }
+
+  // Accrue incentives (leg/campaign-aware) — only at settlement.
+  for (const campaign of world.campaigns.values()) {
+    if (campaign.status !== "ACTIVE") continue;
+    for (const leg of exec.legs) {
+      const offer = world.offers.get(leg.offerId);
+      if (offer && offer.settlementAssetId === campaign.settlementAssetId) {
+        const inc = leg.amount * campaign.incentiveBps / 10000;
+        const remainingBudget = campaign.totalBudget - campaign.accrued;
+        if (remainingBudget > 0) {
+          const actualInc = Math.min(inc, remainingBudget);
+          campaign.accrued += actualInc;
+          world.totalIncentives += actualInc;
+          const p = world.providers.get(leg.providerId);
+          if (p) p.totalIncentives += actualInc;
+        }
+      }
+    }
+  }
+
+  world.totalVolume += intent.sourceAmount;
+  world.totalFees += exec.effectiveCost;
 }
 
 // Release reservations whose settlement duration has elapsed.
@@ -580,21 +683,27 @@ function sampleSettlementOutcome(
   return "FAILURE";
 }
 
-// Replenish liquidity inventory: providers periodically top up their cash
-// balances. This models the real-world process of providers depositing fiat
-// or converting between currencies to maintain operating balances.
+// Replenish liquidity inventory from treasury: transfers from treasury →
+// operating balance. This CONSERVES money — no balances are created from nowhere.
+// The treasury is a finite source; when it's depleted, the provider can't
+// replenish and must wait for settlement receipts to restore operating liquidity.
 function replenishLiquidity(world: SimWorld, rng: SeededRNG): void {
   if (!world.config.enableLiquidityInventory) return;
   if (world.step % world.config.liquidityReplenishSteps !== 0) return;
   for (const provider of world.providers.values()) {
     if (provider.status !== "ACTIVE") continue;
-    // Replenish each asset balance toward a target (50% of collateral value).
-    for (const [asset, balance] of provider.liquidity.balances) {
+    // For each asset, if operating balance is below target, transfer from treasury.
+    for (const [asset, operatingBalance] of provider.liquidity.balances) {
       const target = provider.collateral * 0.3; // target 30% of collateral per asset
-      if (balance < target) {
-        // Top up toward target (with small random variation).
-        const topUp = (target - balance) * rng.float(0.5, 1.0);
-        provider.liquidity.balances.set(asset, balance + topUp);
+      if (operatingBalance < target) {
+        const needed = target - operatingBalance;
+        const treasuryBalance = provider.treasury.balances.get(asset) ?? 0;
+        if (treasuryBalance <= 0) continue; // treasury depleted — can't replenish
+        // Transfer min(needed, treasuryBalance) from treasury → operating.
+        const transfer = Math.min(needed * rng.float(0.5, 1.0), treasuryBalance);
+        provider.liquidity.balances.set(asset, operatingBalance + transfer);
+        provider.treasury.balances.set(asset, treasuryBalance - transfer);
+        provider.totalReplenished += transfer;
       }
     }
   }
@@ -687,98 +796,91 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
     for (const r of reservations) {
       r.offer.reservedCapacity -= r.amount;
     }
-    // Restore liquidity (execution didn't complete).
-    if (world.config.enableLiquidityInventory) {
-      for (const r of reservations) {
-        const p = world.providers.get(r.offer.providerId);
-        if (p) {
-          // No liquidity was consumed yet (failure before settlement).
-        }
-      }
-    }
+    // NO liquidity was consumed (failure before settlement) — nothing to restore.
     recordExecution(provider, intent, route, "FAILED", 0, world);
     return;
   }
 
-  // ---- Step 3: Success — consume liquidity + create PERSISTENT reservations ----
-  intent.status = "COMPLETED";
-  intent.completedAtStep = world.step;
-  intent.effectiveCost = route.effectiveCost;
-  intent.netOutput = route.netOutput;
-  intent.waitedSteps = world.step - intent.createdAtStep;
+  // ---- Step 3: Success — create IN-FLIGHT execution (not COMPLETED yet) ----
+  //
+  // The intent is EXECUTING (not COMPLETED) until the settlement duration
+  // elapses. Liquidity is NOT consumed at start — only at settlement completion.
+  // This makes settlement delay affect BOTH user latency AND provider capital.
+  //
+  // Capital IS reserved immediately (so capacity is constrained), but the
+  // payout/receipt happens at settlement.
+  intent.status = "EXECUTING";
   intent.selectedRouteId = route.id;
   intent.routeTag = route.tag;
+  intent.effectiveCost = route.effectiveCost;
+  intent.netOutput = route.netOutput;
 
-  const durationSec = route.expectedExecutionSeconds;
+  // Find the max duration across all legs (the route completes when the
+  // slowest leg settles).
+  let maxDurationSteps = 1;
+  let settlementOutcome: "FAST" | "DELAYED" | "RETRY" = "FAST";
+  for (const r of reservations) {
+    if (r.durationSteps > maxDurationSteps) {
+      maxDurationSteps = r.durationSteps;
+    }
+  }
+  // Track the outcome for the in-flight record (use the first leg's outcome).
+  if (world.config.enableStochasticSettlement && reservations.length > 0) {
+    // We already sampled per-leg above; use the max-duration leg's outcome.
+    // For simplicity, derive from maxDurationSteps vs base.
+    const baseDuration = Math.max(...reservations.map(r => r.offer.settlementDurationSteps));
+    if (maxDurationSteps >= baseDuration * 3) settlementOutcome = "RETRY";
+    else if (maxDurationSteps >= baseDuration * 2) settlementOutcome = "DELAYED";
+    else settlementOutcome = "FAST";
+  }
 
-  // Update provider economics + create persistent reservations + consume liquidity.
+  // Build the in-flight execution record.
+  const inFlightLegs = route.legs.map((leg, i) => {
+    const r = reservations[i];
+    const p = world.providers.get(leg.providerId);
+    return {
+      providerId: leg.providerId,
+      offerId: r.offer.id,
+      sourceAsset: leg.sourceAsset,
+      destinationAsset: leg.destinationAsset,
+      amount: leg.amount,
+      rate: leg.rate,
+      feeBps: leg.feeBps,
+      payoutAmount: leg.amount * leg.rate,
+      providerName: p?.name ?? "Unknown",
+    };
+  });
+
+  const inFlight: SimInFlightExecution = {
+    id: `exec_${++reservationCounter}`,
+    intentId: intent.id,
+    routeId: route.id,
+    legs: inFlightLegs,
+    effectiveCost: route.effectiveCost,
+    netOutput: route.netOutput,
+    startStep: world.step,
+    completionStep: world.step + maxDurationSteps,
+    settlementOutcome,
+    reservations: reservations.map(r => ({
+      offerId: r.offer.id,
+      providerId: r.offer.providerId,
+      amount: r.amount,
+    })),
+  };
+  world.inFlightExecutions.push(inFlight);
+
+  // Track deployed capital (capital-time product) — reserved NOW.
   for (let i = 0; i < route.legs.length; i++) {
     const leg = route.legs[i];
     const r = reservations[i];
     const p = world.providers.get(leg.providerId);
     if (!p) continue;
-
-    const fee = leg.amount * leg.feeBps / 10000;
-    p.totalVolume += leg.amount;
-    p.totalEarnings += fee;
-    p.executionsCompleted++;
-    // Track deployed capital: amount × duration (capital-time product).
     p.totalDeployedCapitalSteps += leg.amount * r.durationSteps;
     p.currentDeployedCapital += leg.amount;
-
-    // Consume liquidity inventory: provider pays out destination asset,
-    // receives source asset. This is the key economic constraint — providers
-    // can run out of payout currency even with ample collateral.
-    if (world.config.enableLiquidityInventory) {
-      const payoutAmount = leg.amount * leg.rate; // destination-asset amount
-      const srcBalance = p.liquidity.balances.get(leg.sourceAsset) ?? 0;
-      const dstBalance = p.liquidity.balances.get(leg.destinationAsset) ?? 0;
-      // Source balance increases (provider receives incoming transfer).
-      p.liquidity.balances.set(leg.sourceAsset, srcBalance + leg.amount);
-      // Destination balance decreases (provider pays out).
-      p.liquidity.balances.set(leg.destinationAsset, Math.max(0, dstBalance - payoutAmount));
-    }
-
-    // Create a persistent reservation that will be released after durationSteps.
-    const reservation: SimActiveReservation = {
-      id: `res_${++reservationCounter}`,
-      offerId: r.offer.id,
-      providerId: p.id,
-      amount: leg.amount,
-      startStep: world.step,
-      releaseStep: world.step + r.durationSteps,
-    };
-    world.activeReservations.push(reservation);
-
-    recordExecution(p, intent, route, "COMPLETED", durationSec, world, leg);
   }
 
-  // ---- Step 4: Accrue incentives (leg/campaign-aware) ----
-  // Only legs whose offer uses the campaign's settlement asset qualify for
-  // the incentive. The incentive is paid on the qualifying leg's volume,
-  // not the full route netOutput, and only to the qualifying provider(s).
-  for (const campaign of world.campaigns.values()) {
-    if (campaign.status !== "ACTIVE") continue;
-    for (let i = 0; i < route.legs.length; i++) {
-      const leg = route.legs[i];
-      const r = reservations[i];
-      if (r.offer.settlementAssetId === campaign.settlementAssetId) {
-        // This leg qualifies. Incentive = leg amount × campaign bps.
-        const inc = leg.amount * campaign.incentiveBps / 10000;
-        const remaining = campaign.totalBudget - campaign.accrued;
-        if (remaining > 0) {
-          const actualInc = Math.min(inc, remaining);
-          campaign.accrued += actualInc;
-          world.totalIncentives += actualInc;
-          const p = world.providers.get(leg.providerId);
-          if (p) p.totalIncentives += actualInc;
-        }
-      }
-    }
-  }
-
-  world.totalVolume += intent.sourceAmount;
-  world.totalFees += route.effectiveCost;
+  // Note: liquidity is NOT consumed here. It will be consumed at settlement
+  // completion in completeSettlement(). Incentives are also NOT accrued here.
 }
 
 // Find the offer corresponding to a route leg. Matches by provider + corridor.
@@ -835,11 +937,18 @@ function recordExecution(
 //   - utilizationTimeSteps: Σ utilization per step — for time-weighted average
 
 function updateProviderOffers(world: SimWorld, rng: SeededRNG): void {
-  // Compute per-provider instantaneous utilization from active reservations.
-  // Active reservations are still in world.activeReservations (not yet released).
+  // Compute per-provider instantaneous utilization from:
+  //   1. activeReservations (legacy, for backward compat)
+  //   2. inFlightExecutions (P4.6 — reservations held during settlement)
+  // Both persist across steps, so updateProviderOffers sees actual deployment.
   const providerReserved = new Map<string, number>();
   for (const res of world.activeReservations) {
     providerReserved.set(res.providerId, (providerReserved.get(res.providerId) ?? 0) + res.amount);
+  }
+  for (const exec of world.inFlightExecutions) {
+    for (const leg of exec.legs) {
+      providerReserved.set(leg.providerId, (providerReserved.get(leg.providerId) ?? 0) + leg.amount);
+    }
   }
 
   for (const provider of world.providers.values()) {
@@ -1217,6 +1326,16 @@ function collectMetrics(world: SimWorld): SimMetrics {
     totalProviderVolume: Math.round(world.totalVolume * 100) / 100,
     totalProtocolRevenue: Math.round(world.totalFees * 100) / 100,
     totalIncentiveSpend: Math.round(world.totalIncentives * 100) / 100,
+    // Settlement lifecycle metrics (P4.6).
+    inFlightExecutions: world.inFlightExecutions.length,
+    avgSettlementLatencySteps: (() => {
+      const latencies = completed.map(i => i.completedAtStep! - i.createdAtStep);
+      return latencies.length > 0 ? Math.round(latencies.reduce((s, l) => s + l, 0) / latencies.length * 100) / 100 : 0;
+    })(),
+    p50SettlementLatencySteps: p50,
+    p95SettlementLatencySteps: p95,
+    totalLiquidityReplenished: Math.round(activeProviders.reduce((s, p) => s + p.totalReplenished, 0) * 100) / 100,
+    totalExternalLiquidityInjected: 0,
     // Simulation-period economics (primary).
     medianNetProfit: Math.round(medianNetProfit * 100) / 100,
     avgNetProfit: Math.round(avgNetProfit * 100) / 100,

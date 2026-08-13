@@ -50,6 +50,30 @@ function createLiquidityInventory(
   return { balances };
 }
 
+// Create a treasury inventory: a FINITE source for liquidity replenishment.
+// The treasury holds larger balances than operating liquidity — it's the
+// provider's reserve that can be converted to operating cash when needed.
+// Replenishment transfers from treasury → operating, conserving total money.
+function createTreasury(
+  rng: SeededRNG,
+  corridors: string[],
+  collateral: number,
+): SimLiquidityInventory {
+  const balances = new Map<string, number>();
+  for (const corridor of corridors) {
+    const parts = corridor.split(":");
+    if (parts.length < 4) continue;
+    const srcAsset = parts[0];
+    const dstAsset = parts[2];
+    // Treasury holds 2-4× the operating balance (it's the reserve).
+    const srcTreasury = collateral * rng.float(0.4, 1.2);
+    const dstTreasury = collateral * rng.float(0.1, 0.5);
+    balances.set(srcAsset, (balances.get(srcAsset) ?? 0) + srcTreasury);
+    balances.set(dstAsset, (balances.get(dstAsset) ?? 0) + dstTreasury);
+  }
+  return { balances };
+}
+
 // Get the reliability profile for a provider type, with small per-provider
 // variation so providers of the same type aren't identical.
 function getReliabilityProfile(
@@ -170,6 +194,8 @@ function generateProvider(
     executionHistory: [],
     // Initialized after corridors are built (below).
     liquidity: { balances: new Map() },
+    treasury: { balances: new Map() },
+    totalReplenished: 0,
     reliabilityProfile: getReliabilityProfile(rng, providerType),
   };
   world.providers.set(provider.id, provider);
@@ -224,8 +250,9 @@ function generateProvider(
     world.offers.set(offer.id, offer);
   }
 
-  // Now that corridors are built, initialize liquidity inventory.
+  // Now that corridors are built, initialize liquidity inventory + treasury.
   provider.liquidity = createLiquidityInventory(rng, provider.corridors, provider.collateral);
+  provider.treasury = createTreasury(rng, provider.corridors, provider.collateral);
 }
 
 function generateUser(world: SimWorld, rng: SeededRNG, config: SimConfig): void {
@@ -295,6 +322,8 @@ export function generateNewProvider(
     totalDeployedCapitalSteps: 0, currentDeployedCapital: 0,
     executionHistory: [],
     liquidity: { balances: new Map() },
+    treasury: { balances: new Map() },
+    totalReplenished: 0,
     reliabilityProfile: getReliabilityProfile(rng, providerType),
   };
   world.providers.set(provider.id, provider);
@@ -334,8 +363,9 @@ export function generateNewProvider(
   // Compute settlement durations for the new provider's offers.
   computeSettlementDurations(world);
 
-  // Initialize liquidity inventory for the new provider.
+  // Initialize liquidity inventory + treasury for the new provider.
   provider.liquidity = createLiquidityInventory(rng, provider.corridors, provider.collateral);
+  provider.treasury = createTreasury(rng, provider.corridors, provider.collateral);
 
   return provider;
 }

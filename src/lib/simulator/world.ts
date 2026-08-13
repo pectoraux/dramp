@@ -5,6 +5,35 @@
 
 import { Decimal } from "@/lib/engine/money";
 
+// FX valuation matrix: deterministic reference rates to USD for every asset.
+// Used for cross-asset liquidity valuation, treasury accounting, and capital
+// efficiency calculations. NOT a live FX market — just a static valuation layer.
+//
+// Rates are approximate real-world values (as of 2024). 1 unit of asset = rate USD.
+export const FX_REFERENCE_RATES: Record<string, number> = {
+  USD: 1.0,
+  EUR: 1.08,
+  GBP: 1.27,
+  NGN: 0.00065,   // 1 NGN ≈ $0.00065 (~1500 NGN/USD)
+  PHP: 0.017,     // 1 PHP ≈ $0.017 (~58 PHP/USD)
+  KES: 0.0075,    // 1 KES ≈ $0.0075 (~133 KES/USD)
+  SGD: 0.74,
+  JPY: 0.0067,    // 1 JPY ≈ $0.0067 (~150 JPY/USD)
+  INR: 0.012,     // 1 INR ≈ $0.012 (~83 INR/USD)
+  BRL: 0.20,      // 1 BRL ≈ $0.20 (~5 BRL/USD)
+  USDC: 1.0,
+  EURC: 1.08,
+  SC: 1.0,        // internal settlement unit, pegged to USD
+  WETH: 2500.0,   // 1 WETH ≈ $2500
+};
+
+// Convert an asset amount to USD-equivalent value using the reference rates.
+export function toUsdValue(asset: string, amount: number): number {
+  const rate = FX_REFERENCE_RATES[asset];
+  if (rate === undefined) return amount; // unknown asset: treat as 1:1
+  return amount * rate;
+}
+
 export interface SimSettlementAsset {
   id: string;
   symbol: string;
@@ -36,6 +65,12 @@ export interface SimProvider {
   // Liquidity inventory: actual cash balances per asset, SEPARATE from collateral.
   // A provider can be well-collateralized but lack destination liquidity.
   liquidity: SimLiquidityInventory;
+  // Treasury: finite source for liquidity replenishment. When a provider needs
+  // more operating liquidity, it transfers from treasury → operating balance.
+  // This CONSERVES money — no balances are created from nowhere.
+  treasury: SimLiquidityInventory;
+  // Total liquidity replenished from treasury (for metrics/auditing).
+  totalReplenished: number;
   // Settlement reliability profile (stochastic settlement outcomes).
   // Derived from providerType, can be overridden per-provider.
   reliabilityProfile: SettlementReliabilityProfile;
@@ -94,6 +129,34 @@ export interface SimActiveReservation {
   amount: number;
   startStep: number;
   releaseStep: number; // startStep + settlementDurationSteps
+}
+
+// In-flight execution: an execution that has started but not yet settled.
+// The intent is EXECUTING (not COMPLETED) until the settlement duration elapses.
+// Liquidity is NOT consumed at start — only at settlement completion.
+// This makes settlement delay affect BOTH user latency AND provider capital.
+export interface SimInFlightExecution {
+  id: string;
+  intentId: string;
+  routeId: string;
+  legs: Array<{
+    providerId: string;
+    offerId: string;
+    sourceAsset: string;
+    destinationAsset: string;
+    amount: number;
+    rate: number;
+    feeBps: number;
+    payoutAmount: number;     // destination-asset amount to be paid at settlement
+    providerName: string;
+  }>;
+  effectiveCost: number;
+  netOutput: number;
+  startStep: number;
+  completionStep: number;     // startStep + max(leg durationSteps)
+  settlementOutcome: "FAST" | "DELAYED" | "RETRY";
+  // Reservations to release at completion.
+  reservations: Array<{ offerId: string; providerId: string; amount: number }>;
 }
 
 // Settlement reliability profile: per-provider-type probability distribution
@@ -267,6 +330,13 @@ export interface SimMetrics {
   totalProviderVolume: number;
   totalProtocolRevenue: number;
   totalIncentiveSpend: number;
+  // Settlement lifecycle metrics (P4.6)
+  inFlightExecutions: number;          // currently executing (not yet settled)
+  avgSettlementLatencySteps: number;   // average settlement duration
+  p50SettlementLatencySteps: number;
+  p95SettlementLatencySteps: number;
+  totalLiquidityReplenished: number;   // treasury → operating transfers
+  totalExternalLiquidityInjected: number; // external injections (scenario events)
   // Provider economics (simulation-period, NOT annualized)
   medianNetProfit: number;           // $ net earnings (sim period)
   avgNetProfit: number;              // $ net earnings (sim period)
@@ -297,6 +367,10 @@ export interface SimWorld {
   // Active reservations: capacity held for multi-step settlement periods.
   // These persist across steps until releaseStep, making utilization real.
   activeReservations: SimActiveReservation[];
+  // In-flight executions: executions that have started but not yet settled.
+  // The intent is EXECUTING (not COMPLETED) until settlement completes.
+  // Liquidity is NOT consumed at start — only at settlement completion.
+  inFlightExecutions: SimInFlightExecution[];
   metricsHistory: SimMetrics[];
   // Running tallies
   totalVolume: number;
@@ -418,6 +492,7 @@ export function createWorld(config: SimConfig): SimWorld {
     routes: new Map(),
     campaigns: new Map(),
     activeReservations: [],
+    inFlightExecutions: [],
     metricsHistory: [],
     totalVolume: 0,
     totalFees: 0,

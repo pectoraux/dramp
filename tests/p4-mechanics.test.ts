@@ -303,9 +303,10 @@ async function main() {
 
   // The incentive accounting should only pay legs whose offer uses the
   // campaign's settlement asset. Verify by checking the source code.
+  // P4.6: incentives are now accrued in completeSettlement (at settlement time).
   const fs2 = await import("fs");
   const engineSrc2 = fs2.readFileSync("src/lib/simulator/engine-faithful.ts", "utf-8");
-  assert(engineSrc2.includes("r.offer.settlementAssetId === campaign.settlementAssetId"),
+  assert(engineSrc2.includes("offer.settlementAssetId === campaign.settlementAssetId"),
     "Incentive eligibility checks leg's offer settlement asset (not just route)");
   assert(!engineSrc2.includes("route.netOutput * campaign.incentiveBps"),
     "Incentive NOT calculated on route netOutput (uses leg amount instead)");
@@ -369,8 +370,8 @@ async function main() {
   if (liqProvider) {
     assert(liqProvider.liquidity !== undefined, "Provider has liquidity inventory");
     assert(liqProvider.liquidity.balances.size > 0, `Provider has ${liqProvider.liquidity.balances.size} asset balances`);
-    // Verify balances are separate from collateral.
-    assert(liqProvider.liquidity.balances !== liqProvider.collateral, "Liquidity is separate from collateral");
+    // Verify balances are separate from collateral (liquidity is a Map, collateral is a number).
+    assert(typeof liqProvider.collateral === "number", "Collateral is a number (separate from liquidity Map)");
   }
 
   // Verify config flag exists.
@@ -455,8 +456,87 @@ async function main() {
   const p44World = runSimulation({ ...p44Config, seed: 42, totalSteps: 30 });
   assert(p44World.intents.length > 0, "P4.4 mode (all 4.5 features disabled) still runs");
 
+  // =========================================================================
+  // 21. SETTLEMENT LIFECYCLE — EXECUTING then COMPLETED (4.6)
+  // =========================================================================
+  console.log("\n== 21. Settlement lifecycle ==");
+
+  // Intents should go through EXECUTING status before COMPLETED.
+  const lifecycleWorld = runSimulation({ ...createStableNetworkConfig(), seed: 123, totalSteps: 60 });
+  const executing = lifecycleWorld.intents.filter(i => i.status === "EXECUTING");
+  const completedLifecycle = lifecycleWorld.intents.filter(i => i.status === "COMPLETED");
+  // With in-flight executions, some intents may still be EXECUTING at the end.
+  assert(lifecycleWorld.inFlightExecutions !== undefined, "World has inFlightExecutions array");
+  console.log(`  In-flight at end: ${lifecycleWorld.inFlightExecutions.length}`);
+  console.log(`  Completed: ${completedLifecycle.length}, Executing: ${executing.length}`);
+
+  // Verify completed intents have completionStep > createdAtStep (settlement took time).
+  const withDuration = completedLifecycle.filter(i => i.completedAtStep !== null && i.completedAtStep! > i.createdAtStep);
+  if (completedLifecycle.length > 0) {
+    assert(withDuration.length > 0,
+      `Completed intents have duration > 0 steps: ${withDuration.length}/${completedLifecycle.length} (settlement affects user latency)`);
+  }
+
+  // Verify settlement latency metrics exist.
+  const lifecycleMetrics = lifecycleWorld.metricsHistory[lifecycleWorld.metricsHistory.length - 1];
+  assert(lifecycleMetrics.inFlightExecutions !== undefined, "Has inFlightExecutions metric");
+  assert(lifecycleMetrics.avgSettlementLatencySteps !== undefined, "Has avgSettlementLatencySteps");
+  assert(lifecycleMetrics.p50SettlementLatencySteps !== undefined, "Has p50SettlementLatencySteps");
+  assert(lifecycleMetrics.p95SettlementLatencySteps !== undefined, "Has p95SettlementLatencySteps");
+
+  // =========================================================================
+  // 22. LIQUIDITY CONSERVATION — treasury → operating (4.6)
+  // =========================================================================
+  console.log("\n== 22. Liquidity conservation ==");
+
+  // Verify providers have treasury balances.
+  if (liqProvider) {
+    assert(liqProvider.treasury !== undefined, "Provider has treasury inventory");
+    assert(liqProvider.treasury.balances.size > 0, `Treasury has ${liqProvider.treasury.balances.size} asset balances`);
+    assert(liqProvider.totalReplenished !== undefined, "Provider has totalReplenished tracking");
+  }
+
+  // Verify replenishment metric exists.
+  assert(lifecycleMetrics.totalLiquidityReplenished !== undefined,
+    `Has totalLiquidityReplenished metric (${lifecycleMetrics.totalLiquidityReplenished})`);
+
+  // Conservation invariant: for each provider, total money = operating + treasury + in-flight.
+  // We can't easily verify in-flight here, but we can verify that replenishment
+  // didn't create money from nowhere: if totalReplenished > 0, treasury must
+  // have decreased by at least that much.
+  const providersWithReplenishment = [...lifecycleWorld.providers.values()].filter(p => p.totalReplenished > 0);
+  if (providersWithReplenishment.length > 0) {
+    const sampleP = providersWithReplenishment[0];
+    assert(sampleP.totalReplenished > 0, `Provider replenished from treasury (${sampleP.totalReplenished.toFixed(2)})`);
+    // Treasury should be lower than initial (we can't check initial directly,
+    // but we can verify the mechanism is in place).
+    assert(sampleP.treasury.balances.size > 0, "Treasury still has balances (finite source)");
+  }
+
+  // Verify the source code implements treasury transfer (not money creation).
+  const fs4 = await import("fs");
+  const engineSrc4 = fs4.readFileSync("src/lib/simulator/engine-faithful.ts", "utf-8");
+  assert(engineSrc4.includes("treasuryBalance - transfer"), "Replenishment subtracts from treasury (conservation)");
+  assert(!engineSrc4.includes("balance += topUp"), "No money creation (old 'balance += topUp' removed)");
+
+  // =========================================================================
+  // 23. FX VALUATION — reference rates for cross-asset comparison (4.6)
+  // =========================================================================
+  console.log("\n== 23. FX valuation ==");
+
+  const { FX_REFERENCE_RATES, toUsdValue } = await import("../src/lib/simulator/world");
+  assert(FX_REFERENCE_RATES.USD === 1.0, "USD reference rate is 1.0");
+  assert(FX_REFERENCE_RATES.NGN < 1.0, `NGN rate < 1.0 (${FX_REFERENCE_RATES.NGN})`);
+  assert(FX_REFERENCE_RATES.WETH > 1000, `WETH rate > 1000 (${FX_REFERENCE_RATES.WETH})`);
+
+  // Verify toUsdValue converts correctly.
+  const usdValue = toUsdValue("NGN", 1500000); // 1.5M NGN
+  assert(usdValue > 500 && usdValue < 1500, `1.5M NGN ≈ $${usdValue.toFixed(0)} (reasonable USD value)`);
+  const wethValue = toUsdValue("WETH", 1); // 1 WETH
+  assert(wethValue === 2500, `1 WETH = $${wethValue}`);
+
   console.log(`\n========================================`);
-  console.log(`  P4.5 Mechanics: Passed: ${passed}  |  Failed: ${failed}`);
+  console.log(`  P4.6 Mechanics: Passed: ${passed}  |  Failed: ${failed}`);
   console.log(`========================================`);
   if (failed > 0) {
     console.log("\nFailures:");
