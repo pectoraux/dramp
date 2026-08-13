@@ -1,12 +1,28 @@
 // ProviderEconomicsService — earnings, capital efficiency, statements.
 //
-// ARCHITECTURE RULE: all earnings data is derived from the existing ledger.
-// No shadow balances. The provider statement reconciles against ledger entries.
+// ARCHITECTURE: the pure P&L calculation (gross earnings − settlement costs −
+// operating costs − capital cost − expected loss − penalties − slashing = net,
+// plus risk-adjusted return) lives in src/lib/economics/shared.ts
+// (calculateProviderEconomics). This module is the DB orchestration layer: it
+// reads ledger entries + offer capital from the database, builds a
+// ProviderEconomicsInput with the configured cost rates, and calls the shared
+// pure function.
+//
+// No formula is duplicated here.
 
 import { db } from "@/lib/db";
-import { Decimal } from "@/lib/engine/money";
 
-// Get a provider's economic summary (earnings from ledger entries).
+// Configurable economic parameters. These could live in a NetworkFeeConfig
+// table; for now they are constants shared by production and simulation.
+const CAPITAL_COST_RATE_ANNUAL = 0.05;   // 5% annual opportunity cost
+const EXPECTED_LOSS_RATE = 0.001;         // 10 bps expected loss per unit of deployed capital
+const SETTLEMENT_COST_BPS = 1;            // 1 bps settlement cost per unit volume
+const OPERATING_COST_BPS = 2;             // 2 bps operating cost per unit volume
+// Production "steps per year" — the ledger is continuous, so we annualize
+// using a 365-day year. The simulator uses its own stepDurationMs-based rate.
+const STEPS_PER_YEAR_PRODUCTION = 365;
+
+// Get a provider's economic summary using the shared pure calculation.
 export async function getProviderEconomics(providerId: string): Promise<any> {
   // Fetch all ledger entries that credit or debit the provider's accounts.
   const entries = await db.ledgerEntry.findMany({
@@ -20,7 +36,7 @@ export async function getProviderEconomics(providerId: string): Promise<any> {
     orderBy: { timestamp: "desc" },
   });
 
-  // Categorize earnings.
+  // Categorize earnings from ledger entries.
   let executionFees = 0;
   let incentives = 0;
   let rebates = 0;
@@ -66,17 +82,30 @@ export async function getProviderEconomics(providerId: string): Promise<any> {
   const totalExecutions = legs.length;
   const completed = legs.filter((l) => l.execution?.status === "COMPLETED").length;
 
-  // Capital efficiency: earnings per unit of deployed capital.
-  // netEarnings = gross earnings (fees + incentives + rebates)
-  //               - gross costs (penalties + slashing)
-  // compensation and refunds are categorized separately (they are not
-  // deductions from earnings — they are separate economic events).
-  const grossEarnings = executionFees + incentives + rebates;
-  const grossCosts = penalties + slashing;
-  const netEarnings = grossEarnings - grossCosts;
-  const earningsPerLiquidity = committedCapital > 0 ? netEarnings / committedCapital : 0;
+  // Total volume for cost calculations.
+  const totalVolume = legs.reduce((s, l) => s + Number(l.amount.toString()), 0);
+
+  // Build the shared ProviderEconomicsInput and call the canonical calculation.
+  const { calculateProviderEconomics } = await import("@/lib/economics/shared");
+  const econ = calculateProviderEconomics({
+    grossFees: executionFees,
+    incentives,
+    rebates,
+    settlementCosts: totalVolume * SETTLEMENT_COST_BPS / 10000,
+    operatingCosts: totalVolume * OPERATING_COST_BPS / 10000,
+    capitalCostRate: CAPITAL_COST_RATE_ANNUAL,
+    averageDeployedCapital: deployedCapital,
+    expectedLossRate: EXPECTED_LOSS_RATE,
+    penalties,
+    slashing,
+    stepsPerYear: STEPS_PER_YEAR_PRODUCTION,
+  });
+
+  // Legacy earningsPerLiquidity for backward compatibility (uses committed
+  // capital as denominator, matching the previous behavior).
+  const earningsPerLiquidity = committedCapital > 0 ? econ.netEarnings / committedCapital : 0;
   const capitalTurnover = committedCapital > 0
-    ? legs.reduce((s, l) => s + Number(l.amount.toString()), 0) / committedCapital
+    ? totalVolume / committedCapital
     : 0;
 
   return {
@@ -87,9 +116,19 @@ export async function getProviderEconomics(providerId: string): Promise<any> {
       penalties: penalties.toFixed(2),
       slashing: slashing.toFixed(2),
       compensation: compensation.toFixed(2),
-      grossEarnings: grossEarnings.toFixed(2),
-      grossCosts: grossCosts.toFixed(2),
-      netEarnings: netEarnings.toFixed(2),
+      grossEarnings: econ.grossEarnings.toFixed(2),
+      // Legacy grossCosts = penalties + slashing (backward compat with P3 tests).
+      grossCosts: (penalties + slashing).toFixed(2),
+      // Full totalCosts from shared calculation (includes settlement + operating
+      // + capital + expected loss + penalties + slashing).
+      totalCosts: econ.totalCosts.toFixed(2),
+      netEarnings: econ.netEarnings.toFixed(2),
+      // Full cost breakdown (from shared calculation).
+      settlementCosts: (totalVolume * SETTLEMENT_COST_BPS / 10000).toFixed(2),
+      operatingCosts: (totalVolume * OPERATING_COST_BPS / 10000).toFixed(2),
+      capitalCost: econ.capitalCost.toFixed(2),
+      expectedLoss: econ.expectedLoss.toFixed(2),
+      riskAdjustedReturn: (econ.riskAdjustedReturn * 100).toFixed(2) + "%",
     },
     capital: {
       committed: committedCapital.toFixed(2),
@@ -108,7 +147,8 @@ export async function getProviderEconomics(providerId: string): Promise<any> {
     efficiency: {
       earningsPerLiquidity: earningsPerLiquidity.toFixed(6),
       capitalTurnover: Math.round(capitalTurnover * 100) / 100,
-      netEarnings: netEarnings.toFixed(2),
+      netEarnings: econ.netEarnings.toFixed(2),
+      riskAdjustedReturn: (econ.riskAdjustedReturn * 100).toFixed(2) + "%",
       note: "Prototype analytics — based on simulated valuations.",
     },
   };

@@ -103,6 +103,7 @@ function generateProvider(
     corridors: [], totalVolume: 0, totalEarnings: 0, totalIncentives: 0,
     totalPenalties: 0, totalSlashing: 0, executionsCompleted: 0, executionsFailed: 0,
     utilization: 0, entryStep: 0, exitStep: null,
+    executionHistory: [],
   };
   world.providers.set(provider.id, provider);
 
@@ -217,6 +218,7 @@ export function generateNewProvider(
     corridors: [], totalVolume: 0, totalEarnings: 0, totalIncentives: 0,
     totalPenalties: 0, totalSlashing: 0, executionsCompleted: 0, executionsFailed: 0,
     utilization: 0, entryStep: step, exitStep: null,
+    executionHistory: [],
   };
   world.providers.set(provider.id, provider);
 

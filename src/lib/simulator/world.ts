@@ -32,7 +32,7 @@ export interface SimProvider {
   lockedCollateral: number;
   maxExposure: number;
   corridors: string[]; // ["USD:US:EUR:EU", ...]
-  // Tracked economics
+  // Tracked economics (aggregate totals)
   totalVolume: number;
   totalEarnings: number;
   totalIncentives: number;
@@ -43,6 +43,10 @@ export interface SimProvider {
   utilization: number; // reserved / available
   entryStep: number;
   exitStep: number | null;
+  // Per-execution history for faithful reputation recalculation.
+  // Each record captures the amount, outcome, duration, and sim-time so the
+  // shared calculateReputation function can apply recency + value weighting.
+  executionHistory: SimExecutionRecord[];
 }
 
 export interface SimOffer {
@@ -126,6 +130,19 @@ export interface SimRouteLeg {
   rate: number;
   channelType: string;
   amount: number;
+}
+
+// Per-execution record for faithful reputation recalculation.
+// Mirrors what production stores in the Leg + Execution tables.
+export interface SimExecutionRecord {
+  providerId: string;
+  amount: number;
+  outcome: "COMPLETED" | "FAILED" | "CANCELLED";
+  durationSeconds: number;
+  step: number;
+  timeMs: number;
+  feeBps: number;
+  corridorKey: string; // providerId:srcAsset:dstAsset:srcCountry:dstCountry
 }
 
 export interface SimCampaign {

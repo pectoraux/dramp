@@ -24,7 +24,7 @@ function assert(cond: boolean, label: string) {
 async function main() {
   console.log("dRamp P4 simulator tests");
 
-  const { runSimulation } = await import("../src/lib/simulator/engine");
+  const { runSimulation } = await import("../src/lib/simulator/engine-faithful");
   const { createDefaultConfig } = await import("../src/lib/simulator/world");
 
   // =========================================================================

@@ -1,32 +1,74 @@
-// dRamp Network Simulator — Faithful Engine (Prompt 4.1)
+// dRamp Network Simulator — Faithful Engine (Prompt 4.2)
 //
-// Uses shared pure economics from src/lib/economics/shared.ts.
-// No simplified second routing engine — route eligibility, scoring, risk,
-// reputation, and economics all use the SAME functions as production.
+// Uses the SAME canonical pure economic functions as production
+// (src/lib/economics/shared.ts). No second economic engine.
 //
-// The simulation world remains entirely in-memory.
+// Key faithfulness guarantees:
+//   1. Initial route selection uses shared.rankRoutes (candidate-set-relative),
+//      matching production's rankAndTag semantics — NOT calculateAbsoluteRouteQuality.
+//   2. Cross-time route replacement (WAIT_FOR_BETTER) uses shared.shouldReplaceRoute
+//      (absolute quality), matching production's advanceSearching.
+//   3. Route risk uses shared.computeRouteRisk (5 dimensions + composite).
+//   4. Counterparty risk uses shared.providerCounterpartyRisk.
+//   5. Settlement-asset risk uses shared.settlementAssetRisk + assetRiskCeiling.
+//   6. Reputation is RECALCULATED from per-execution history using
+//      shared.calculateReputation (7 components, recency + value weighting,
+//      anti-gaming) — NOT reputationScore += 0.001.
+//   7. Provider P&L uses shared.calculateProviderEconomics (fees + incentives
+//      + rebates − settlement costs − operating costs − capital cost − expected
+//      loss − penalties − slashing = net; risk-adjusted return).
+//   8. Provider exit uses shared risk-adjusted return (negative → exit).
+//   9. Equilibrium uses shared.detectEquilibrium (economic thresholds).
 
 import { SeededRNG } from "./rng";
 import {
   SimWorld, SimIntent, SimMetrics, SimProvider, SimOffer,
-  SimCampaign, SimRoute,
+  SimCampaign, SimRoute, SimExecutionRecord,
 } from "./world";
 import { generateNewProvider } from "./generator";
 import {
-  weightFor, settlementAssetRisk, assetRiskCeiling, counterpartyRiskCeiling,
-  isCollateralEligible, calculateAbsoluteRouteQuality, computeRouteReputation,
-  computeRouteCommitment, shouldReplaceRoute, calculateReputation, deriveTier,
-  calculateProviderEconomics, detectEquilibrium,
-  type RouteInfo, type RouteScoreContext, type ReputationInput,
+  weightFor,
+  settlementAssetRisk,
+  providerCounterpartyRisk,
+  computeRouteRisk,
+  assetRiskCeiling,
+  counterpartyRiskCeiling,
+  isCollateralEligible,
+  calculateAbsoluteRouteQuality,
+  computeRouteReputation,
+  computeRouteCommitment,
+  shouldReplaceRoute,
+  rankRoutes,
+  applyHardFilters,
+  calculateReputation,
+  deriveTier,
+  calculateProviderEconomics,
+  detectEquilibrium,
+  decayWeight,
+  valueWeight,
+  MEANINGFUL_THRESHOLD,
+  ROUTE_REPLACEMENT_THRESHOLD,
+  type RouteInfo,
+  type RouteLegInfo,
+  type RouteScoreContext,
+  type ReputationInput,
   type ProviderEconomicsInput,
+  type ProviderRiskInfo,
+  type SettlementAssetRiskInput,
+  type HardFilterContext,
+  type RankedRoute,
 } from "../economics/shared";
 
 let intentCounter = 0;
 let routeCounter = 0;
 
-const MEANINGFUL_THRESHOLD = 50;
-const VALUE_BASE = 100;
 const DAY_MS = 86400000;
+
+// Economic parameters — shared with production (see provider-economics.ts).
+const CAPITAL_COST_RATE_ANNUAL = 0.05;
+const EXPECTED_LOSS_RATE = 0.001;
+const SETTLEMENT_COST_BPS = 1;
+const OPERATING_COST_BPS = 2;
 
 export function simulateStep(world: SimWorld, rng: SeededRNG): void {
   world.step++;
@@ -64,22 +106,71 @@ function generateDemand(world: SimWorld, rng: SeededRNG): void {
   }
 }
 
+// ---- Candidate route type (enriched with risk inputs for shared functions) --
+
 interface SimCandidateRoute {
-  legs: Array<{ providerId: string; providerName: string; sourceAsset: string; destinationAsset: string;
-    feeBps: number; rate: number; channelType: string; amount: number; role: string;
-    sourceCountry: string; destinationCountry: string; }>;
-  effectiveCost: number; netOutput: number; expectedExecutionSeconds: number;
-  riskComposite: number; tag: string; explanation: string;
+  legs: Array<{
+    providerId: string;
+    providerName: string;
+    sourceAsset: string;
+    destinationAsset: string;
+    sourceCountry: string;
+    destinationCountry: string;
+    feeBps: number;
+    rate: number;
+    channelType: string;
+    amount: number;
+    role: string;
+    expectedExecutionSeconds: number;
+    offerCapacity: number;
+    settlementAssetId: string | null;
+    providerRisk: ProviderRiskInfo;
+    settlementAssetRisk: SettlementAssetRiskInput | null;
+  }>;
+  effectiveCost: number;
+  netOutput: number;
+  expectedExecutionSeconds: number;
+  riskComposite: number;
+  tag: string;
+  explanation: string;
   settlementAssetIds: string[];
 }
 
+// ---- SimCandidateRoute → shared RouteInfo conversion -----------------------
+
+function simCandidateToRouteInfo(route: SimCandidateRoute): RouteInfo {
+  return {
+    legs: route.legs.map((l): RouteLegInfo => ({
+      providerId: l.providerId,
+      sourceAsset: l.sourceAsset,
+      destinationAsset: l.destinationAsset,
+      sourceCountry: l.sourceCountry,
+      destinationCountry: l.destinationCountry,
+      role: l.role,
+      amount: l.amount,
+      feeBps: l.feeBps,
+      channelType: l.channelType,
+      offerCapacity: l.offerCapacity,
+      expectedExecutionSeconds: l.expectedExecutionSeconds,
+      settlementAssetId: l.settlementAssetId,
+      provider: l.providerRisk,
+      settlementAsset: l.settlementAssetRisk ?? undefined,
+    })),
+    effectiveCost: route.effectiveCost,
+    expectedExecutionSeconds: route.expectedExecutionSeconds,
+    riskComposite: route.riskComposite,
+  };
+}
+
+// ---- Match + execute ------------------------------------------------------
+
 function matchAndExecute(world: SimWorld, rng: SeededRNG): void {
-  // Build reputation map from sim providers (using shared reputation calculation).
+  // Build reputation + corridor + commitment maps using shared calculations.
   const reputationMap = buildReputationMap(world);
   const corridorScoreMap = buildCorridorScoreMap(world);
   const commitmentReliabilityMap = buildCommitmentReliabilityMap(world);
-  const scoreCtx: RouteScoreContext = {
-    riskTolerance: "BALANCED", // will be overridden per-intent
+  const baseScoreCtx: RouteScoreContext = {
+    riskTolerance: "BALANCED", // overridden per-intent
     reputationMap: world.config.enableReputation ? reputationMap : undefined,
     corridorScores: world.config.enableReputation ? corridorScoreMap : undefined,
     commitmentReliability: world.config.enableCommitments ? commitmentReliabilityMap : undefined,
@@ -88,7 +179,7 @@ function matchAndExecute(world: SimWorld, rng: SeededRNG): void {
   for (const intent of world.intents) {
     if (intent.status !== "SEARCHING") continue;
 
-    const routes = findRoutesFaithful(world, intent, rng);
+    const routes = findRoutesFaithful(world, intent);
     if (routes.length === 0) {
       intent.waitedSteps++;
       const maxWaitSteps = Math.ceil(intent.maxWaitSeconds / (world.config.stepDurationMs / 1000));
@@ -99,59 +190,29 @@ function matchAndExecute(world: SimWorld, rng: SeededRNG): void {
       continue;
     }
 
-    // Score routes using SHARED calculateAbsoluteRouteQuality.
-    scoreCtx.riskTolerance = intent.riskTolerance;
-    const scored = routes.map(r => {
-      const routeInfo: RouteInfo = {
-        legs: r.legs.map(l => ({
-          providerId: l.providerId, sourceAsset: l.sourceAsset, destinationAsset: l.destinationAsset,
-          sourceCountry: l.sourceCountry, destinationCountry: l.destinationCountry,
-          role: l.role, amount: l.amount,
-        })),
-        effectiveCost: r.effectiveCost,
-        expectedExecutionSeconds: r.expectedExecutionSeconds,
-        riskComposite: r.riskComposite,
-      };
-      return { route: r, quality: calculateAbsoluteRouteQuality(routeInfo, scoreCtx) };
-    });
-    scored.sort((a, b) => a.quality - b.quality); // lower = better
-    const best = scored[0].route;
+    // INITIAL SELECTION: use shared.rankRoutes (candidate-set-relative),
+    // matching production's rankAndTag semantics.
+    const scoreCtx: RouteScoreContext = { ...baseScoreCtx, riskTolerance: intent.riskTolerance };
+    const routeInfos = routes.map(r => simCandidateToRouteInfo(r));
+    const ranked: RankedRoute[] = rankRoutes(routeInfos, scoreCtx);
+    const best = routes[routeInfos.indexOf(ranked[0].route)];
 
     // Patient execution: WAIT_FOR_BETTER doesn't immediately execute.
     if (intent.executionPolicy === "WAIT_FOR_BETTER") {
-      // Check if we already have a reference route.
       if (intent.selectedRouteId) {
         const refRoute = world.routes.get(intent.selectedRouteId);
         if (refRoute) {
-          const refInfo: RouteInfo = {
-            legs: refRoute.legs.map(l => ({
-              providerId: l.providerId, sourceAsset: l.sourceAsset, destinationAsset: l.destinationAsset,
-              sourceCountry: "", destinationCountry: "", role: "SOURCE", amount: intent.sourceAmount,
-            })),
-            effectiveCost: intent.effectiveCost,
-            expectedExecutionSeconds: refRoute.expectedExecutionSeconds,
-            riskComposite: refRoute.riskComposite,
-          };
-          const bestInfo: RouteInfo = {
-            legs: best.legs.map(l => ({
-              providerId: l.providerId, sourceAsset: l.sourceAsset, destinationAsset: l.destinationAsset,
-              sourceCountry: l.sourceCountry, destinationCountry: l.destinationCountry,
-              role: l.role, amount: l.amount,
-            })),
-            effectiveCost: best.effectiveCost,
-            expectedExecutionSeconds: best.expectedExecutionSeconds,
-            riskComposite: best.riskComposite,
-          };
+          // CROSS-TIME REPLACEMENT: use shared.shouldReplaceRoute (absolute quality).
+          const refInfo = reconstructRefRouteInfo(intent, refRoute, scoreCtx);
+          const bestInfo = simCandidateToRouteInfo(best);
           const replacement = shouldReplaceRoute(bestInfo, refInfo, scoreCtx);
           if (replacement.replace) {
-            // Replace reference with the better route and execute.
             executeIntent(world, intent, { ...best, id: `route_${++routeCounter}` }, rng);
           } else {
-            // Keep waiting.
             intent.waitedSteps++;
             const maxWaitSteps = Math.ceil(intent.maxWaitSeconds / (world.config.stepDurationMs / 1000));
             if (intent.waitedSteps > maxWaitSteps) {
-              // Timeout — execute the current reference.
+              // Timeout — execute the current reference route.
               executeIntent(world, intent, { ...best, id: intent.selectedRouteId }, rng);
             }
           }
@@ -162,7 +223,12 @@ function matchAndExecute(world: SimWorld, rng: SeededRNG): void {
       const routeId = `route_${++routeCounter}`;
       world.routes.set(routeId, {
         id: routeId, intentId: intent.id, tag: best.tag,
-        legs: best.legs, effectiveCost: best.effectiveCost, netOutput: best.netOutput,
+        legs: best.legs.map(l => ({
+          providerId: l.providerId, providerName: l.providerName,
+          sourceAsset: l.sourceAsset, destinationAsset: l.destinationAsset,
+          feeBps: l.feeBps, rate: l.rate, channelType: l.channelType, amount: l.amount,
+        })),
+        effectiveCost: best.effectiveCost, netOutput: best.netOutput,
         expectedExecutionSeconds: best.expectedExecutionSeconds, riskComposite: best.riskComposite,
         explanation: best.explanation,
       });
@@ -179,7 +245,40 @@ function matchAndExecute(world: SimWorld, rng: SeededRNG): void {
   }
 }
 
-function findRoutesFaithful(world: SimWorld, intent: SimIntent, rng: SeededRNG): SimCandidateRoute[] {
+// Reconstruct a RouteInfo for a persisted reference route (for WAIT_FOR_BETTER
+// comparison). Uses the intent's source amount and the ref route's economics.
+function reconstructRefRouteInfo(
+  intent: SimIntent,
+  refRoute: SimRoute,
+  ctx: RouteScoreContext,
+): RouteInfo {
+  // Build leg info from the persisted SimRoute. We don't have full risk inputs
+  // for historical legs, so we use the route's composite risk directly.
+  const legs: RouteLegInfo[] = refRoute.legs.map(l => ({
+    providerId: l.providerId,
+    sourceAsset: l.sourceAsset,
+    destinationAsset: l.destinationAsset,
+    sourceCountry: "",
+    destinationCountry: "",
+    role: "SOURCE",
+    amount: l.amount,
+    feeBps: l.feeBps,
+    channelType: l.channelType,
+    offerCapacity: 0,
+    expectedExecutionSeconds: refRoute.expectedExecutionSeconds,
+    provider: { trustModel: "NON_CUSTODIAL", providerType: "HYBRID", reputationScore: 0.5, status: "ACTIVE" },
+  }));
+  return {
+    legs,
+    effectiveCost: intent.effectiveCost,
+    expectedExecutionSeconds: refRoute.expectedExecutionSeconds,
+    riskComposite: refRoute.riskComposite,
+  };
+}
+
+// ---- Route discovery (direct + multi-hop via ALL settlement assets) --------
+
+function findRoutesFaithful(world: SimWorld, intent: SimIntent): SimCandidateRoute[] {
   const routes: SimCandidateRoute[] = [];
   const providers = world.providers;
   const assets = world.assets;
@@ -194,22 +293,40 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent, rng: SeededRNG):
     if (!provider || provider.status !== "ACTIVE") continue;
     if (offer.availableCapacity - offer.reservedCapacity < intent.sourceAmount) continue;
 
-    // Check settlement asset risk against user's ceiling.
+    const providerRisk: ProviderRiskInfo = {
+      trustModel: provider.trustModel,
+      providerType: provider.providerType,
+      reputationScore: provider.reputationScore,
+      status: provider.status,
+    };
+
+    let saRiskInput: SettlementAssetRiskInput | null = null;
     if (offer.settlementAssetId) {
       const sa = assets.get(offer.settlementAssetId);
       if (sa) {
-        const saRisk = settlementAssetRisk({
+        saRiskInput = {
           assetType: sa.assetType, volatilityScore: sa.volatilityScore,
           liquidityScore: sa.liquidityScore, pegQuality: sa.pegQuality,
           status: sa.status, incentiveRate: sa.incentiveRate,
-        });
+        };
+        const saRisk = settlementAssetRisk(saRiskInput);
         if (saRisk > riskCeiling) continue; // hard filter
       }
     }
 
-    // Check counterparty risk.
-    const cpRisk = 1 - provider.reputationScore;
+    // Counterparty risk using shared function.
+    const cpRisk = providerCounterpartyRisk(providerRisk);
     if (cpRisk > cpRiskCeiling) continue; // hard filter
+
+    // Compute route risk using shared computeRouteRisk.
+    const routeRisk = computeRouteRisk([{
+      provider: providerRisk,
+      channelType: offer.channelType,
+      offerCapacity: offer.availableCapacity,
+      legAmount: intent.sourceAmount,
+      settlementAsset: saRiskInput ?? undefined,
+      expectedExecutionSeconds: offer.expectedExecutionSeconds,
+    }]);
 
     const fee = intent.sourceAmount * offer.feeBps / 10000;
     const afterFee = intent.sourceAmount - fee;
@@ -217,25 +334,35 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent, rng: SeededRNG):
     const incentive = converted * offer.incentiveBps / 10000;
     const netOutput = converted + incentive;
     routes.push({
-      legs: [{ providerId: provider.id, providerName: provider.name, sourceAsset: offer.sourceAsset,
-        destinationAsset: offer.destinationAsset, feeBps: offer.feeBps, rate: offer.rate,
-        channelType: offer.channelType, amount: intent.sourceAmount, role: "SOURCE",
-        sourceCountry: offer.sourceCountry, destinationCountry: offer.destinationCountry }],
-      effectiveCost: fee, netOutput, expectedExecutionSeconds: offer.expectedExecutionSeconds,
-      riskComposite: cpRisk, tag: "DIRECT", explanation: `Direct via ${provider.name}`,
+      legs: [{
+        providerId: provider.id, providerName: provider.name,
+        sourceAsset: offer.sourceAsset, destinationAsset: offer.destinationAsset,
+        sourceCountry: offer.sourceCountry, destinationCountry: offer.destinationCountry,
+        feeBps: offer.feeBps, rate: offer.rate, channelType: offer.channelType,
+        amount: intent.sourceAmount, role: "SOURCE",
+        expectedExecutionSeconds: offer.expectedExecutionSeconds,
+        offerCapacity: offer.availableCapacity,
+        settlementAssetId: offer.settlementAssetId,
+        providerRisk, settlementAssetRisk: saRiskInput,
+      }],
+      effectiveCost: fee, netOutput,
+      expectedExecutionSeconds: offer.expectedExecutionSeconds,
+      riskComposite: routeRisk.composite, tag: "DIRECT",
+      explanation: `Direct via ${provider.name}`,
       settlementAssetIds: offer.settlementAssetId ? [offer.settlementAssetId] : [],
     });
   }
 
   // Multi-hop routes via ALL settlement assets (INCLUDING volatile tokens).
+  // The risk ceiling determines eligibility — volatile tokens are NOT banned.
   for (const sa of assets.values()) {
     if (sa.status !== "ACTIVE") continue;
-    // NO exclusion of VOLATILE_TOKEN — the risk ceiling handles eligibility.
-    const saRisk = settlementAssetRisk({
+    const saRiskInput: SettlementAssetRiskInput = {
       assetType: sa.assetType, volatilityScore: sa.volatilityScore,
       liquidityScore: sa.liquidityScore, pegQuality: sa.pegQuality,
       status: sa.status, incentiveRate: sa.incentiveRate,
-    });
+    };
+    const saRisk = settlementAssetRisk(saRiskInput);
     if (saRisk > riskCeiling) continue; // hard filter on the settlement asset
 
     const hop1Offers = [...world.offers.values()].filter(o =>
@@ -248,14 +375,20 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent, rng: SeededRNG):
     for (const o1 of hop1Offers) {
       const p1 = providers.get(o1.providerId);
       if (!p1 || p1.status !== "ACTIVE") continue;
-      const cpRisk1 = 1 - p1.reputationScore;
-      if (cpRisk1 > cpRiskCeiling) continue;
+      const p1Risk: ProviderRiskInfo = {
+        trustModel: p1.trustModel, providerType: p1.providerType,
+        reputationScore: p1.reputationScore, status: p1.status,
+      };
+      if (providerCounterpartyRisk(p1Risk) > cpRiskCeiling) continue;
 
       for (const o2 of hop2Offers) {
         const p2 = providers.get(o2.providerId);
         if (!p2 || p2.status !== "ACTIVE") continue;
-        const cpRisk2 = 1 - p2.reputationScore;
-        if (cpRisk2 > cpRiskCeiling) continue;
+        const p2Risk: ProviderRiskInfo = {
+          trustModel: p2.trustModel, providerType: p2.providerType,
+          reputationScore: p2.reputationScore, status: p2.status,
+        };
+        if (providerCounterpartyRisk(p2Risk) > cpRiskCeiling) continue;
 
         const fee1 = intent.sourceAmount * o1.feeBps / 10000;
         const afterFee1 = intent.sourceAmount - fee1;
@@ -266,22 +399,49 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent, rng: SeededRNG):
         const incentive = finalAmount * (o1.incentiveBps + o2.incentiveBps) / 10000;
         const netOutput = finalAmount + incentive;
         const effectiveCost = fee1 + fee2;
-        const avgRisk = (cpRisk1 + cpRisk2) / 2;
-        const minRisk = Math.min(cpRisk1, cpRisk2);
-        const routeRisk = avgRisk * 0.7 + minRisk * 0.3; // weakest-leg penalty
+
+        // Compute route risk using shared computeRouteRisk (5 dimensions).
+        const routeRisk = computeRouteRisk([
+          {
+            provider: p1Risk, channelType: o1.channelType,
+            offerCapacity: o1.availableCapacity, legAmount: intent.sourceAmount,
+            settlementAsset: saRiskInput, expectedExecutionSeconds: o1.expectedExecutionSeconds,
+          },
+          {
+            provider: p2Risk, channelType: o2.channelType,
+            offerCapacity: o2.availableCapacity, legAmount: midAmount,
+            settlementAsset: saRiskInput, expectedExecutionSeconds: o2.expectedExecutionSeconds,
+          },
+        ]);
 
         routes.push({
           legs: [
-            { providerId: p1.id, providerName: p1.name, sourceAsset: o1.sourceAsset, destinationAsset: o1.destinationAsset,
-              feeBps: o1.feeBps, rate: o1.rate, channelType: o1.channelType, amount: intent.sourceAmount, role: "SOURCE",
-              sourceCountry: o1.sourceCountry, destinationCountry: o1.destinationCountry },
-            { providerId: p2.id, providerName: p2.name, sourceAsset: o2.sourceAsset, destinationAsset: o2.destinationAsset,
-              feeBps: o2.feeBps, rate: o2.rate, channelType: o2.channelType, amount: midAmount, role: "DESTINATION",
-              sourceCountry: o2.sourceCountry, destinationCountry: o2.destinationCountry },
+            {
+              providerId: p1.id, providerName: p1.name,
+              sourceAsset: o1.sourceAsset, destinationAsset: o1.destinationAsset,
+              sourceCountry: o1.sourceCountry, destinationCountry: o1.destinationCountry,
+              feeBps: o1.feeBps, rate: o1.rate, channelType: o1.channelType,
+              amount: intent.sourceAmount, role: "SOURCE",
+              expectedExecutionSeconds: o1.expectedExecutionSeconds,
+              offerCapacity: o1.availableCapacity,
+              settlementAssetId: o1.settlementAssetId,
+              providerRisk: p1Risk, settlementAssetRisk: saRiskInput,
+            },
+            {
+              providerId: p2.id, providerName: p2.name,
+              sourceAsset: o2.sourceAsset, destinationAsset: o2.destinationAsset,
+              sourceCountry: o2.sourceCountry, destinationCountry: o2.destinationCountry,
+              feeBps: o2.feeBps, rate: o2.rate, channelType: o2.channelType,
+              amount: midAmount, role: "DESTINATION",
+              expectedExecutionSeconds: o2.expectedExecutionSeconds,
+              offerCapacity: o2.availableCapacity,
+              settlementAssetId: o2.settlementAssetId,
+              providerRisk: p2Risk, settlementAssetRisk: saRiskInput,
+            },
           ],
           effectiveCost, netOutput,
           expectedExecutionSeconds: Math.max(o1.expectedExecutionSeconds, o2.expectedExecutionSeconds),
-          riskComposite: routeRisk, tag: "MULTI_HOP",
+          riskComposite: routeRisk.composite, tag: "MULTI_HOP",
           explanation: `Multi-hop via ${sa.symbol}: ${p1.name} → ${p2.name}`,
           settlementAssetIds: [sa.id],
         });
@@ -292,17 +452,26 @@ function findRoutesFaithful(world: SimWorld, intent: SimIntent, rng: SeededRNG):
   return routes;
 }
 
+// ---- Execute intent (tracks history for reputation, no += 0.001) -----------
+
 function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRoute & { id: string }, rng: SeededRNG): void {
   const provider = world.providers.get(route.legs[0].providerId);
   if (!provider) { intent.status = "FAILED"; intent.failureReason = "provider not found"; return; }
 
-  // Failure model based on reputation.
-  const failureRate = (1 - provider.reputationScore) * 0.1;
+  // Failure model based on provider reliability (shared counterparty risk).
+  const cpRisk = providerCounterpartyRisk({
+    trustModel: provider.trustModel, providerType: provider.providerType,
+    reputationScore: provider.reputationScore, status: provider.status,
+  });
+  const failureRate = cpRisk * 0.1;
   if (rng.chance(failureRate)) {
     intent.status = "FAILED";
     intent.failureReason = "provider execution failure";
     provider.executionsFailed++;
     provider.totalPenalties += intent.sourceAmount * 0.001;
+
+    // Record failed execution in history (for reputation recalculation).
+    recordExecution(provider, intent, route, "FAILED", 0, world);
     return;
   }
 
@@ -314,16 +483,22 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
   intent.selectedRouteId = route.id;
   intent.routeTag = route.tag;
 
-  // Update provider economics using shared calculateProviderEconomics.
+  const durationSec = route.expectedExecutionSeconds;
+
+  // Update provider economics (aggregate totals).
   for (const leg of route.legs) {
     const p = world.providers.get(leg.providerId);
     if (!p) continue;
     const fee = leg.amount * leg.feeBps / 10000;
-    const incentive = route.netOutput * (route.legs.length > 0 ? 0 : 0); // incentive is embedded in netOutput
     p.totalVolume += leg.amount;
     p.totalEarnings += fee;
     p.executionsCompleted++;
-    p.reputationScore = Math.min(1.0, p.reputationScore + 0.001);
+
+    // Record completed execution in history (for reputation recalculation).
+    // Only meaningful transactions (>= $50) affect reputation — the shared
+    // calculateReputation function handles the threshold internally via
+    // valueWeight, but we record all so the history is complete.
+    recordExecution(p, intent, route, "COMPLETED", durationSec, world, leg);
   }
 
   // Accrue incentives on completed executions.
@@ -337,7 +512,6 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
           const actualInc = Math.min(inc, remaining);
           campaign.accrued += actualInc;
           world.totalIncentives += actualInc;
-          // Distribute to providers.
           for (const leg of route.legs) {
             const p = world.providers.get(leg.providerId);
             if (p) p.totalIncentives += actualInc / route.legs.length;
@@ -351,17 +525,42 @@ function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRo
   world.totalFees += route.effectiveCost;
 }
 
+function recordExecution(
+  provider: SimProvider,
+  intent: SimIntent,
+  route: SimCandidateRoute & { id: string },
+  outcome: "COMPLETED" | "FAILED" | "CANCELLED",
+  durationSeconds: number,
+  world: SimWorld,
+  leg?: SimCandidateRoute["legs"][0],
+): void {
+  const legInfo = leg ?? route.legs[0];
+  const corridorKey = `${provider.id}:${legInfo.sourceAsset}:${legInfo.destinationAsset}::`;
+  const record: SimExecutionRecord = {
+    providerId: provider.id,
+    amount: legInfo.amount,
+    outcome,
+    durationSeconds,
+    step: world.step,
+    timeMs: world.timeMs,
+    feeBps: legInfo.feeBps,
+    corridorKey,
+  };
+  provider.executionHistory.push(record);
+  // Cap history to prevent unbounded growth (keep last 500 records).
+  if (provider.executionHistory.length > 500) {
+    provider.executionHistory = provider.executionHistory.slice(-500);
+  }
+}
+
+// ---- Provider offer updates (strategy-based pricing) ----------------------
+
 function updateProviderOffers(world: SimWorld, rng: SeededRNG): void {
   for (const offer of world.offers.values()) {
     const provider = world.providers.get(offer.providerId);
     if (!provider || provider.status !== "ACTIVE" || !offer.active) continue;
     const utilization = offer.availableCapacity > 0 ? offer.reservedCapacity / offer.availableCapacity : 0;
     provider.utilization = utilization;
-
-    // Strategy-based pricing (same as before, but now economics-aware).
-    const netEarningsPerStep = provider.totalEarnings / Math.max(1, world.step - provider.entryStep);
-    const capitalEfficiency = netEarningsPerStep / Math.max(1, provider.usableCollateral);
-    const isProfitable = capitalEfficiency > world.config.providerExitThreshold;
 
     switch (provider.strategy) {
       case "AGGRESSIVE":
@@ -405,33 +604,24 @@ function updateProviderOffers(world: SimWorld, rng: SeededRNG): void {
   }
 }
 
+// ---- Provider entry/exit (using shared risk-adjusted return) --------------
+
 function handleProviderEntryExit(world: SimWorld, rng: SeededRNG): void {
   // Entry.
   if (rng.chance(world.config.providerGrowthRate)) {
     generateNewProvider(world, rng, world.step);
   }
 
-  // Exit based on risk-adjusted return (not just raw earnings).
   const networkMedianFee = calculateNetworkMedianFee(world);
+  const stepsPerYear = (365 * 24 * 3600 * 1000) / world.config.stepDurationMs;
+
+  // Exit based on risk-adjusted return (shared calculateProviderEconomics).
   for (const provider of world.providers.values()) {
     if (provider.status !== "ACTIVE") continue;
     const steps = world.step - provider.entryStep;
     if (steps < 10) continue;
 
-    // Calculate provider economics using shared function.
-    const econ = calculateProviderEconomics({
-      grossFees: provider.totalEarnings,
-      incentives: provider.totalIncentives,
-      rebates: 0,
-      settlementCosts: provider.totalVolume * 0.0001, // 1 bps settlement cost
-      operatingCosts: provider.totalVolume * 0.0002,  // 2 bps operating cost
-      capitalCostRate: 0.05, // 5% annual
-      averageDeployedCapital: provider.usableCollateral,
-      expectedLossRate: 0.001, // 10 bps
-      penalties: provider.totalPenalties,
-      slashing: provider.totalSlashing,
-      stepsPerYear: (365 * 24 * 3600 * 1000) / world.config.stepDurationMs,
-    });
+    const econ = computeProviderEconomicsForProvider(provider, world, stepsPerYear);
 
     // Exit if risk-adjusted return is negative.
     if (econ.riskAdjustedReturn < 0 && rng.chance(0.1)) {
@@ -452,17 +642,42 @@ function handleProviderEntryExit(world: SimWorld, rng: SeededRNG): void {
     }
   }
 
-  // Update tiers using shared deriveTier.
+  // Recompute reputation + tier using shared calculateReputation from history.
   for (const provider of world.providers.values()) {
     if (provider.status !== "ACTIVE") continue;
     const steps = world.step - provider.entryStep;
     const ageDays = (steps * world.config.stepDurationMs) / DAY_MS;
-    const repInput = buildReputationInput(provider, ageDays, networkMedianFee);
+    const repInput = buildReputationInput(provider, world, ageDays, networkMedianFee);
     const rep = calculateReputation(repInput);
     provider.reputationScore = rep.overall / 100;
-    provider.tier = deriveTier(rep.overall, rep.sampleSize, ageDays, 0);
+    provider.tier = deriveTier(rep.overall, rep.sampleSize, ageDays, repInput.weightedSlashes);
   }
 }
+
+// ---- Provider economics helper (shared calculateProviderEconomics) --------
+
+function computeProviderEconomicsForProvider(
+  provider: SimProvider,
+  world: SimWorld,
+  stepsPerYear: number,
+) {
+  const input: ProviderEconomicsInput = {
+    grossFees: provider.totalEarnings,
+    incentives: provider.totalIncentives,
+    rebates: 0,
+    settlementCosts: provider.totalVolume * SETTLEMENT_COST_BPS / 10000,
+    operatingCosts: provider.totalVolume * OPERATING_COST_BPS / 10000,
+    capitalCostRate: CAPITAL_COST_RATE_ANNUAL,
+    averageDeployedCapital: provider.usableCollateral,
+    expectedLossRate: EXPECTED_LOSS_RATE,
+    penalties: provider.totalPenalties,
+    slashing: provider.totalSlashing,
+    stepsPerYear,
+  };
+  return calculateProviderEconomics(input);
+}
+
+// ---- Campaign updates -----------------------------------------------------
 
 function updateCampaigns(world: SimWorld): void {
   for (const campaign of world.campaigns.values()) {
@@ -487,6 +702,8 @@ function updateCampaigns(world: SimWorld): void {
     }
   }
 }
+
+// ---- Shocks ---------------------------------------------------------------
 
 function applyShocks(world: SimWorld, rng: SeededRNG): void {
   const config = world.config;
@@ -550,6 +767,8 @@ function applyShocks(world: SimWorld, rng: SeededRNG): void {
   }
 }
 
+// ---- Metrics collection (uses shared detectEquilibrium) -------------------
+
 function collectMetrics(world: SimWorld): SimMetrics {
   const intents = world.intents;
   const completed = intents.filter(i => i.status === "COMPLETED");
@@ -568,16 +787,9 @@ function collectMetrics(world: SimWorld): SimMetrics {
   const p50 = executionSteps.length > 0 ? executionSteps[Math.floor(executionSteps.length * 0.5)] : 0;
   const p95 = executionSteps.length > 0 ? executionSteps[Math.floor(executionSteps.length * 0.95)] : 0;
 
-  // Provider economics using shared function.
-  const providerEcons = activeProviders.map(p => {
-    return calculateProviderEconomics({
-      grossFees: p.totalEarnings, incentives: p.totalIncentives, rebates: 0,
-      settlementCosts: p.totalVolume * 0.0001, operatingCosts: p.totalVolume * 0.0002,
-      capitalCostRate: 0.05, averageDeployedCapital: p.usableCollateral,
-      expectedLossRate: 0.001, penalties: p.totalPenalties, slashing: p.totalSlashing,
-      stepsPerYear: (365 * 24 * 3600 * 1000) / world.config.stepDurationMs,
-    });
-  });
+  // Provider economics using shared calculateProviderEconomics.
+  const stepsPerYear = (365 * 24 * 3600 * 1000) / world.config.stepDurationMs;
+  const providerEcons = activeProviders.map(p => computeProviderEconomicsForProvider(p, world, stepsPerYear));
   const returns = providerEcons.map(e => e.riskAdjustedReturn).sort((a, b) => a - b);
   const medianReturn = returns.length > 0 ? returns[Math.floor(returns.length / 2)] : 0;
   const avgEarnings = providerEcons.length > 0 ? providerEcons.reduce((s, e) => s + e.netEarnings, 0) / providerEcons.length : 0;
@@ -634,7 +846,11 @@ function collectMetrics(world: SimWorld): SimMetrics {
   };
 }
 
-// ---- Helpers ----
+// ---- Reputation helpers (faithful recalculation from history) -------------
+//
+// These build a ReputationInput from the provider's execution history using
+// the shared decayWeight + valueWeight functions (same as production's
+// getProviderReputation), then call shared.calculateReputation.
 
 function buildReputationMap(world: SimWorld): Map<string, number> {
   const map = new Map<string, number>();
@@ -642,43 +858,102 @@ function buildReputationMap(world: SimWorld): Map<string, number> {
   for (const p of world.providers.values()) {
     if (p.status !== "ACTIVE") continue;
     const ageDays = ((world.step - p.entryStep) * world.config.stepDurationMs) / DAY_MS;
-    const repInput = buildReputationInput(p, ageDays, networkMedianFee);
+    const repInput = buildReputationInput(p, world, ageDays, networkMedianFee);
     const rep = calculateReputation(repInput);
     map.set(p.id, rep.overall / 100);
   }
   return map;
 }
 
-function buildReputationInput(p: SimProvider, ageDays: number, networkMedianFee: number): ReputationInput {
-  // Simplified weighting for the simulator (no per-leg recency tracking).
-  const total = p.executionsCompleted + p.executionsFailed;
+function buildReputationInput(
+  p: SimProvider,
+  world: SimWorld,
+  ageDays: number,
+  networkMedianFee: number,
+): ReputationInput {
+  // Iterate execution history, applying recency + value weighting using the
+  // shared decayWeight + valueWeight functions (same as production).
+  let weightedCompleted = 0;
+  let weightedFailed = 0;
+  let weightedCancelled = 0;
+  let weightedDurationSum = 0;
+  let weightedDurationCount = 0;
+  let meaningfulExecutions = 0;
+  let totalFeeWeight = 0;
+  let feeWeightCount = 0;
+
+  for (const rec of p.executionHistory) {
+    // Anti-gaming: skip sub-threshold transactions.
+    if (rec.amount < MEANINGFUL_THRESHOLD) continue;
+
+    meaningfulExecutions++;
+    const ageMs = world.timeMs - rec.timeMs;
+    const recency = decayWeight(ageMs);
+    const vw = valueWeight(rec.amount);
+    const weight = vw * recency;
+
+    if (rec.outcome === "COMPLETED") {
+      weightedCompleted += weight;
+      weightedDurationSum += rec.durationSeconds * weight;
+      weightedDurationCount += weight;
+      totalFeeWeight += rec.feeBps * weight;
+      feeWeightCount += weight;
+    } else if (rec.outcome === "FAILED") {
+      weightedFailed += weight;
+    } else if (rec.outcome === "CANCELLED") {
+      weightedCancelled += weight;
+    }
+  }
+
+  const avgDuration = weightedDurationCount > 0 ? weightedDurationSum / weightedDurationCount : 0;
+  const medianFeeBps = feeWeightCount > 0 ? totalFeeWeight / feeWeightCount : networkMedianFee;
+
   return {
-    completed: p.executionsCompleted,
-    failed: p.executionsFailed,
-    cancelled: 0,
-    disputes: 0,
-    slashes: 0,
-    avgDurationSeconds: 60, // default
+    completed: 0, failed: 0, cancelled: 0, disputes: 0, slashes: 0,
+    avgDurationSeconds: avgDuration,
     utilization: p.utilization,
-    medianFeeBps: 20, // approximate
+    medianFeeBps,
     networkMedianFeeBps: networkMedianFee,
     ageDays,
-    weightedCompleted: p.executionsCompleted,
-    weightedFailed: p.executionsFailed,
-    weightedCancelled: 0,
+    weightedCompleted,
+    weightedFailed,
+    weightedCancelled,
     weightedDisputes: 0,
     weightedSlashes: 0,
-    meaningfulExecutions: p.executionsCompleted,
+    meaningfulExecutions,
   };
 }
 
 function buildCorridorScoreMap(world: SimWorld): Map<string, number> {
-  // Simplified: use provider reputation as corridor score for now.
-  return new Map();
+  // Build corridor scores from execution history (completion rate + speed).
+  const corridorStats = new Map<string, { completed: number; failed: number; totalDuration: number; count: number }>();
+  for (const p of world.providers.values()) {
+    for (const rec of p.executionHistory) {
+      const cur = corridorStats.get(rec.corridorKey) ?? { completed: 0, failed: 0, totalDuration: 0, count: 0 };
+      if (rec.outcome === "COMPLETED") {
+        cur.completed++;
+        cur.totalDuration += rec.durationSeconds;
+      } else if (rec.outcome === "FAILED") {
+        cur.failed++;
+      }
+      cur.count++;
+      corridorStats.set(rec.corridorKey, cur);
+    }
+  }
+  const map = new Map<string, number>();
+  for (const [key, stats] of corridorStats) {
+    const completionRate = stats.count > 0 ? stats.completed / stats.count : 0.5;
+    const avgDuration = stats.completed > 0 ? stats.totalDuration / stats.completed : 300;
+    const speedFactor = Math.max(0, 1 - avgDuration / 600);
+    map.set(key, completionRate * 0.7 + speedFactor * 0.3);
+  }
+  return map;
 }
 
-function buildCommitmentReliabilityMap(world: SimWorld): Map<string, number> {
-  // Simplified: return empty (no commitment simulation yet).
+function buildCommitmentReliabilityMap(_world: SimWorld): Map<string, number> {
+  // Commitments are not simulated in the current simulator. Return empty map
+  // (providers get no commitment boost — matching production when no
+  // commitments exist).
   return new Map();
 }
 
@@ -687,7 +962,8 @@ function calculateNetworkMedianFee(world: SimWorld): number {
   return fees.length > 0 ? fees[Math.floor(fees.length / 2)] : 20;
 }
 
-// Main simulation runner.
+// ---- Main simulation runner ------------------------------------------------
+
 import { createWorld } from "./world";
 import { generateWorld } from "./generator";
 

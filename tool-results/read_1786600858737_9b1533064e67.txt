@@ -1,0 +1,708 @@
+     1→// dRamp Network Simulator — Faithful Engine (Prompt 4.1)
+     2→//
+     3→// Uses shared pure economics from src/lib/economics/shared.ts.
+     4→// No simplified second routing engine — route eligibility, scoring, risk,
+     5→// reputation, and economics all use the SAME functions as production.
+     6→//
+     7→// The simulation world remains entirely in-memory.
+     8→
+     9→import { SeededRNG } from "./rng";
+    10→import {
+    11→  SimWorld, SimIntent, SimMetrics, SimProvider, SimOffer,
+    12→  SimCampaign, SimRoute,
+    13→} from "./world";
+    14→import { generateNewProvider } from "./generator";
+    15→import {
+    16→  weightFor, settlementAssetRisk, assetRiskCeiling, counterpartyRiskCeiling,
+    17→  isCollateralEligible, calculateAbsoluteRouteQuality, computeRouteReputation,
+    18→  computeRouteCommitment, shouldReplaceRoute, calculateReputation, deriveTier,
+    19→  calculateProviderEconomics, detectEquilibrium,
+    20→  type RouteInfo, type RouteScoreContext, type ReputationInput,
+    21→  type ProviderEconomicsInput,
+    22→} from "../economics/shared";
+    23→
+    24→let intentCounter = 0;
+    25→let routeCounter = 0;
+    26→
+    27→const MEANINGFUL_THRESHOLD = 50;
+    28→const VALUE_BASE = 100;
+    29→const DAY_MS = 86400000;
+    30→
+    31→export function simulateStep(world: SimWorld, rng: SeededRNG): void {
+    32→  world.step++;
+    33→  world.timeMs += world.config.stepDurationMs;
+    34→
+    35→  generateDemand(world, rng);
+    36→  matchAndExecute(world, rng);
+    37→  updateProviderOffers(world, rng);
+    38→  handleProviderEntryExit(world, rng);
+    39→  updateCampaigns(world);
+    40→  applyShocks(world, rng);
+    41→  if (world.step % 5 === 0 || world.step === world.config.totalSteps) {
+    42→    world.metricsHistory.push(collectMetrics(world));
+    43→  }
+    44→}
+    45→
+    46→function generateDemand(world: SimWorld, rng: SeededRNG): void {
+    47→  const baseDemand = world.config.demandVolume * (1 + world.config.demandGrowth * world.step);
+    48→  const numIntents = Math.max(1, Math.round(baseDemand * rng.float(0.7, 1.3)));
+    49→  for (let i = 0; i < numIntents; i++) {
+    50→    const activeUsers = [...world.users.values()];
+    51→    if (activeUsers.length === 0) break;
+    52→    const user = rng.pick(activeUsers);
+    53→    if (!rng.chance(user.frequency)) continue;
+    54→    const amount = Math.max(10, rng.gaussian(user.typicalAmount, user.amountStdDev));
+    55→    world.intents.push({
+    56→      id: `intent_${++intentCounter}`, userId: user.id, sourceAmount: amount,
+    57→      sourceAsset: user.sourceAsset, sourceCountry: user.sourceCountry,
+    58→      destinationAsset: user.destinationAsset, destinationCountry: user.destinationCountry,
+    59→      riskTolerance: user.riskTolerance, executionPolicy: user.executionPolicy,
+    60→      maxWaitSeconds: user.maxWaitSeconds, status: "SEARCHING",
+    61→      createdAtStep: world.step, completedAtStep: null, selectedRouteId: null,
+    62→      routeTag: null, effectiveCost: 0, netOutput: 0, waitedSteps: 0, failureReason: null,
+    63→    });
+    64→  }
+    65→}
+    66→
+    67→interface SimCandidateRoute {
+    68→  legs: Array<{ providerId: string; providerName: string; sourceAsset: string; destinationAsset: string;
+    69→    feeBps: number; rate: number; channelType: string; amount: number; role: string;
+    70→    sourceCountry: string; destinationCountry: string; }>;
+    71→  effectiveCost: number; netOutput: number; expectedExecutionSeconds: number;
+    72→  riskComposite: number; tag: string; explanation: string;
+    73→  settlementAssetIds: string[];
+    74→}
+    75→
+    76→function matchAndExecute(world: SimWorld, rng: SeededRNG): void {
+    77→  // Build reputation map from sim providers (using shared reputation calculation).
+    78→  const reputationMap = buildReputationMap(world);
+    79→  const corridorScoreMap = buildCorridorScoreMap(world);
+    80→  const commitmentReliabilityMap = buildCommitmentReliabilityMap(world);
+    81→  const scoreCtx: RouteScoreContext = {
+    82→    riskTolerance: "BALANCED", // will be overridden per-intent
+    83→    reputationMap: world.config.enableReputation ? reputationMap : undefined,
+    84→    corridorScores: world.config.enableReputation ? corridorScoreMap : undefined,
+    85→    commitmentReliability: world.config.enableCommitments ? commitmentReliabilityMap : undefined,
+    86→  };
+    87→
+    88→  for (const intent of world.intents) {
+    89→    if (intent.status !== "SEARCHING") continue;
+    90→
+    91→    const routes = findRoutesFaithful(world, intent, rng);
+    92→    if (routes.length === 0) {
+    93→      intent.waitedSteps++;
+    94→      const maxWaitSteps = Math.ceil(intent.maxWaitSeconds / (world.config.stepDurationMs / 1000));
+    95→      if (intent.waitedSteps > maxWaitSteps) {
+    96→        intent.status = "EXPIRED";
+    97→        intent.failureReason = "no route found within max wait";
+    98→      }
+    99→      continue;
+   100→    }
+   101→
+   102→    // Score routes using SHARED calculateAbsoluteRouteQuality.
+   103→    scoreCtx.riskTolerance = intent.riskTolerance;
+   104→    const scored = routes.map(r => {
+   105→      const routeInfo: RouteInfo = {
+   106→        legs: r.legs.map(l => ({
+   107→          providerId: l.providerId, sourceAsset: l.sourceAsset, destinationAsset: l.destinationAsset,
+   108→          sourceCountry: l.sourceCountry, destinationCountry: l.destinationCountry,
+   109→          role: l.role, amount: l.amount,
+   110→        })),
+   111→        effectiveCost: r.effectiveCost,
+   112→        expectedExecutionSeconds: r.expectedExecutionSeconds,
+   113→        riskComposite: r.riskComposite,
+   114→      };
+   115→      return { route: r, quality: calculateAbsoluteRouteQuality(routeInfo, scoreCtx) };
+   116→    });
+   117→    scored.sort((a, b) => a.quality - b.quality); // lower = better
+   118→    const best = scored[0].route;
+   119→
+   120→    // Patient execution: WAIT_FOR_BETTER doesn't immediately execute.
+   121→    if (intent.executionPolicy === "WAIT_FOR_BETTER") {
+   122→      // Check if we already have a reference route.
+   123→      if (intent.selectedRouteId) {
+   124→        const refRoute = world.routes.get(intent.selectedRouteId);
+   125→        if (refRoute) {
+   126→          const refInfo: RouteInfo = {
+   127→            legs: refRoute.legs.map(l => ({
+   128→              providerId: l.providerId, sourceAsset: l.sourceAsset, destinationAsset: l.destinationAsset,
+   129→              sourceCountry: "", destinationCountry: "", role: "SOURCE", amount: intent.sourceAmount,
+   130→            })),
+   131→            effectiveCost: intent.effectiveCost,
+   132→            expectedExecutionSeconds: refRoute.expectedExecutionSeconds,
+   133→            riskComposite: refRoute.riskComposite,
+   134→          };
+   135→          const bestInfo: RouteInfo = {
+   136→            legs: best.legs.map(l => ({
+   137→              providerId: l.providerId, sourceAsset: l.sourceAsset, destinationAsset: l.destinationAsset,
+   138→              sourceCountry: l.sourceCountry, destinationCountry: l.destinationCountry,
+   139→              role: l.role, amount: l.amount,
+   140→            })),
+   141→            effectiveCost: best.effectiveCost,
+   142→            expectedExecutionSeconds: best.expectedExecutionSeconds,
+   143→            riskComposite: best.riskComposite,
+   144→          };
+   145→          const replacement = shouldReplaceRoute(bestInfo, refInfo, scoreCtx);
+   146→          if (replacement.replace) {
+   147→            // Replace reference with the better route and execute.
+   148→            executeIntent(world, intent, { ...best, id: `route_${++routeCounter}` }, rng);
+   149→          } else {
+   150→            // Keep waiting.
+   151→            intent.waitedSteps++;
+   152→            const maxWaitSteps = Math.ceil(intent.maxWaitSeconds / (world.config.stepDurationMs / 1000));
+   153→            if (intent.waitedSteps > maxWaitSteps) {
+   154→              // Timeout — execute the current reference.
+   155→              executeIntent(world, intent, { ...best, id: intent.selectedRouteId }, rng);
+   156→            }
+   157→          }
+   158→          continue;
+   159→        }
+   160→      }
+   161→      // No reference yet — set initial reference (don't execute yet).
+   162→      const routeId = `route_${++routeCounter}`;
+   163→      world.routes.set(routeId, {
+   164→        id: routeId, intentId: intent.id, tag: best.tag,
+   165→        legs: best.legs, effectiveCost: best.effectiveCost, netOutput: best.netOutput,
+   166→        expectedExecutionSeconds: best.expectedExecutionSeconds, riskComposite: best.riskComposite,
+   167→        explanation: best.explanation,
+   168→      });
+   169→      intent.selectedRouteId = routeId;
+   170→      intent.routeTag = best.tag;
+   171→      intent.effectiveCost = best.effectiveCost;
+   172→      intent.netOutput = best.netOutput;
+   173→      intent.waitedSteps++;
+   174→      continue;
+   175→    }
+   176→
+   177→    // NOW policy — execute immediately.
+   178→    executeIntent(world, intent, { ...best, id: `route_${++routeCounter}` }, rng);
+   179→  }
+   180→}
+   181→
+   182→function findRoutesFaithful(world: SimWorld, intent: SimIntent, rng: SeededRNG): SimCandidateRoute[] {
+   183→  const routes: SimCandidateRoute[] = [];
+   184→  const providers = world.providers;
+   185→  const assets = world.assets;
+   186→  const riskCeiling = assetRiskCeiling(intent.riskTolerance);
+   187→  const cpRiskCeiling = counterpartyRiskCeiling(intent.riskTolerance);
+   188→
+   189→  // Direct routes.
+   190→  for (const offer of world.offers.values()) {
+   191→    if (!offer.active) continue;
+   192→    if (offer.sourceAsset !== intent.sourceAsset || offer.destinationAsset !== intent.destinationAsset) continue;
+   193→    const provider = providers.get(offer.providerId);
+   194→    if (!provider || provider.status !== "ACTIVE") continue;
+   195→    if (offer.availableCapacity - offer.reservedCapacity < intent.sourceAmount) continue;
+   196→
+   197→    // Check settlement asset risk against user's ceiling.
+   198→    if (offer.settlementAssetId) {
+   199→      const sa = assets.get(offer.settlementAssetId);
+   200→      if (sa) {
+   201→        const saRisk = settlementAssetRisk({
+   202→          assetType: sa.assetType, volatilityScore: sa.volatilityScore,
+   203→          liquidityScore: sa.liquidityScore, pegQuality: sa.pegQuality,
+   204→          status: sa.status, incentiveRate: sa.incentiveRate,
+   205→        });
+   206→        if (saRisk > riskCeiling) continue; // hard filter
+   207→      }
+   208→    }
+   209→
+   210→    // Check counterparty risk.
+   211→    const cpRisk = 1 - provider.reputationScore;
+   212→    if (cpRisk > cpRiskCeiling) continue; // hard filter
+   213→
+   214→    const fee = intent.sourceAmount * offer.feeBps / 10000;
+   215→    const afterFee = intent.sourceAmount - fee;
+   216→    const converted = afterFee * offer.rate;
+   217→    const incentive = converted * offer.incentiveBps / 10000;
+   218→    const netOutput = converted + incentive;
+   219→    routes.push({
+   220→      legs: [{ providerId: provider.id, providerName: provider.name, sourceAsset: offer.sourceAsset,
+   221→        destinationAsset: offer.destinationAsset, feeBps: offer.feeBps, rate: offer.rate,
+   222→        channelType: offer.channelType, amount: intent.sourceAmount, role: "SOURCE",
+   223→        sourceCountry: offer.sourceCountry, destinationCountry: offer.destinationCountry }],
+   224→      effectiveCost: fee, netOutput, expectedExecutionSeconds: offer.expectedExecutionSeconds,
+   225→      riskComposite: cpRisk, tag: "DIRECT", explanation: `Direct via ${provider.name}`,
+   226→      settlementAssetIds: offer.settlementAssetId ? [offer.settlementAssetId] : [],
+   227→    });
+   228→  }
+   229→
+   230→  // Multi-hop routes via ALL settlement assets (INCLUDING volatile tokens).
+   231→  for (const sa of assets.values()) {
+   232→    if (sa.status !== "ACTIVE") continue;
+   233→    // NO exclusion of VOLATILE_TOKEN — the risk ceiling handles eligibility.
+   234→    const saRisk = settlementAssetRisk({
+   235→      assetType: sa.assetType, volatilityScore: sa.volatilityScore,
+   236→      liquidityScore: sa.liquidityScore, pegQuality: sa.pegQuality,
+   237→      status: sa.status, incentiveRate: sa.incentiveRate,
+   238→    });
+   239→    if (saRisk > riskCeiling) continue; // hard filter on the settlement asset
+   240→
+   241→    const hop1Offers = [...world.offers.values()].filter(o =>
+   242→      o.active && o.sourceAsset === intent.sourceAsset && o.destinationAsset === sa.symbol
+   243→    );
+   244→    const hop2Offers = [...world.offers.values()].filter(o =>
+   245→      o.active && o.sourceAsset === sa.symbol && o.destinationAsset === intent.destinationAsset
+   246→    );
+   247→
+   248→    for (const o1 of hop1Offers) {
+   249→      const p1 = providers.get(o1.providerId);
+   250→      if (!p1 || p1.status !== "ACTIVE") continue;
+   251→      const cpRisk1 = 1 - p1.reputationScore;
+   252→      if (cpRisk1 > cpRiskCeiling) continue;
+   253→
+   254→      for (const o2 of hop2Offers) {
+   255→        const p2 = providers.get(o2.providerId);
+   256→        if (!p2 || p2.status !== "ACTIVE") continue;
+   257→        const cpRisk2 = 1 - p2.reputationScore;
+   258→        if (cpRisk2 > cpRiskCeiling) continue;
+   259→
+   260→        const fee1 = intent.sourceAmount * o1.feeBps / 10000;
+   261→        const afterFee1 = intent.sourceAmount - fee1;
+   262→        const midAmount = afterFee1 * o1.rate;
+   263→        const fee2 = midAmount * o2.feeBps / 10000;
+   264→        const afterFee2 = midAmount - fee2;
+   265→        const finalAmount = afterFee2 * o2.rate;
+   266→        const incentive = finalAmount * (o1.incentiveBps + o2.incentiveBps) / 10000;
+   267→        const netOutput = finalAmount + incentive;
+   268→        const effectiveCost = fee1 + fee2;
+   269→        const avgRisk = (cpRisk1 + cpRisk2) / 2;
+   270→        const minRisk = Math.min(cpRisk1, cpRisk2);
+   271→        const routeRisk = avgRisk * 0.7 + minRisk * 0.3; // weakest-leg penalty
+   272→
+   273→        routes.push({
+   274→          legs: [
+   275→            { providerId: p1.id, providerName: p1.name, sourceAsset: o1.sourceAsset, destinationAsset: o1.destinationAsset,
+   276→              feeBps: o1.feeBps, rate: o1.rate, channelType: o1.channelType, amount: intent.sourceAmount, role: "SOURCE",
+   277→              sourceCountry: o1.sourceCountry, destinationCountry: o1.destinationCountry },
+   278→            { providerId: p2.id, providerName: p2.name, sourceAsset: o2.sourceAsset, destinationAsset: o2.destinationAsset,
+   279→              feeBps: o2.feeBps, rate: o2.rate, channelType: o2.channelType, amount: midAmount, role: "DESTINATION",
+   280→              sourceCountry: o2.sourceCountry, destinationCountry: o2.destinationCountry },
+   281→          ],
+   282→          effectiveCost, netOutput,
+   283→          expectedExecutionSeconds: Math.max(o1.expectedExecutionSeconds, o2.expectedExecutionSeconds),
+   284→          riskComposite: routeRisk, tag: "MULTI_HOP",
+   285→          explanation: `Multi-hop via ${sa.symbol}: ${p1.name} → ${p2.name}`,
+   286→          settlementAssetIds: [sa.id],
+   287→        });
+   288→      }
+   289→    }
+   290→  }
+   291→
+   292→  return routes;
+   293→}
+   294→
+   295→function executeIntent(world: SimWorld, intent: SimIntent, route: SimCandidateRoute & { id: string }, rng: SeededRNG): void {
+   296→  const provider = world.providers.get(route.legs[0].providerId);
+   297→  if (!provider) { intent.status = "FAILED"; intent.failureReason = "provider not found"; return; }
+   298→
+   299→  // Failure model based on reputation.
+   300→  const failureRate = (1 - provider.reputationScore) * 0.1;
+   301→  if (rng.chance(failureRate)) {
+   302→    intent.status = "FAILED";
+   303→    intent.failureReason = "provider execution failure";
+   304→    provider.executionsFailed++;
+   305→    provider.totalPenalties += intent.sourceAmount * 0.001;
+   306→    return;
+   307→  }
+   308→
+   309→  intent.status = "COMPLETED";
+   310→  intent.completedAtStep = world.step;
+   311→  intent.effectiveCost = route.effectiveCost;
+   312→  intent.netOutput = route.netOutput;
+   313→  intent.waitedSteps = world.step - intent.createdAtStep;
+   314→  intent.selectedRouteId = route.id;
+   315→  intent.routeTag = route.tag;
+   316→
+   317→  // Update provider economics using shared calculateProviderEconomics.
+   318→  for (const leg of route.legs) {
+   319→    const p = world.providers.get(leg.providerId);
+   320→    if (!p) continue;
+   321→    const fee = leg.amount * leg.feeBps / 10000;
+   322→    const incentive = route.netOutput * (route.legs.length > 0 ? 0 : 0); // incentive is embedded in netOutput
+   323→    p.totalVolume += leg.amount;
+   324→    p.totalEarnings += fee;
+   325→    p.executionsCompleted++;
+   326→    p.reputationScore = Math.min(1.0, p.reputationScore + 0.001);
+   327→  }
+   328→
+   329→  // Accrue incentives on completed executions.
+   330→  for (const saId of route.settlementAssetIds) {
+   331→    for (const campaign of world.campaigns.values()) {
+   332→      if (campaign.status !== "ACTIVE") continue;
+   333→      if (campaign.settlementAssetId === saId) {
+   334→        const inc = route.netOutput * campaign.incentiveBps / 10000;
+   335→        const remaining = campaign.totalBudget - campaign.accrued;
+   336→        if (remaining > 0) {
+   337→          const actualInc = Math.min(inc, remaining);
+   338→          campaign.accrued += actualInc;
+   339→          world.totalIncentives += actualInc;
+   340→          // Distribute to providers.
+   341→          for (const leg of route.legs) {
+   342→            const p = world.providers.get(leg.providerId);
+   343→            if (p) p.totalIncentives += actualInc / route.legs.length;
+   344→          }
+   345→        }
+   346→      }
+   347→    }
+   348→  }
+   349→
+   350→  world.totalVolume += intent.sourceAmount;
+   351→  world.totalFees += route.effectiveCost;
+   352→}
+   353→
+   354→function updateProviderOffers(world: SimWorld, rng: SeededRNG): void {
+   355→  for (const offer of world.offers.values()) {
+   356→    const provider = world.providers.get(offer.providerId);
+   357→    if (!provider || provider.status !== "ACTIVE" || !offer.active) continue;
+   358→    const utilization = offer.availableCapacity > 0 ? offer.reservedCapacity / offer.availableCapacity : 0;
+   359→    provider.utilization = utilization;
+   360→
+   361→    // Strategy-based pricing (same as before, but now economics-aware).
+   362→    const netEarningsPerStep = provider.totalEarnings / Math.max(1, world.step - provider.entryStep);
+   363→    const capitalEfficiency = netEarningsPerStep / Math.max(1, provider.usableCollateral);
+   364→    const isProfitable = capitalEfficiency > world.config.providerExitThreshold;
+   365→
+   366→    switch (provider.strategy) {
+   367→      case "AGGRESSIVE":
+   368→        if (utilization < 0.3 && rng.chance(0.1)) offer.feeBps = Math.max(3, offer.feeBps - 1);
+   369→        if (utilization > 0.7 && rng.chance(0.1)) offer.feeBps += 1;
+   370→        break;
+   371→      case "PREMIUM":
+   372→        if (utilization > 0.8 && rng.chance(0.05)) offer.availableCapacity *= 1.1;
+   373→        break;
+   374→      case "LIQUIDITY_MAXIMIZER":
+   375→        if (utilization < 0.2 && rng.chance(0.15)) offer.feeBps = Math.max(5, offer.feeBps - 2);
+   376→        break;
+   377→      case "MARKET_MAKER":
+   378→        if (rng.chance(0.1)) offer.rate *= rng.float(0.99, 1.01);
+   379→        break;
+   380→      case "INCENTIVE_SEEKER":
+   381→        if (offer.incentiveBps === 0 && rng.chance(0.05)) {
+   382→          const activeCampaignAssets = new Set(
+   383→            [...world.campaigns.values()].filter(c => c.status === "ACTIVE").map(c => c.settlementAssetId)
+   384→          );
+   385→          const incentivizedAssets = [...world.assets.values()].filter(a => activeCampaignAssets.has(a.id));
+   386→          if (incentivizedAssets.length > 0) {
+   387→            const sa = rng.pick(incentivizedAssets);
+   388→            offer.settlementAssetId = sa.id;
+   389→            offer.incentiveBps = sa.incentiveRate;
+   390→            offer.version++;
+   391→          }
+   392→        }
+   393→        break;
+   394→      case "CONSERVATIVE":
+   395→        if (provider.reputationScore < 0.6 && rng.chance(0.1)) offer.availableCapacity *= 0.9;
+   396→        break;
+   397→      case "OPPORTUNISTIC":
+   398→        if (utilization > 0.6 && rng.chance(0.1)) offer.feeBps += 2;
+   399→        if (utilization < 0.2 && rng.chance(0.1)) offer.feeBps = Math.max(5, offer.feeBps - 2);
+   400→        break;
+   401→    }
+   402→
+   403→    if (rng.chance(0.05)) offer.rate *= rng.float(0.995, 1.005);
+   404→    offer.version++;
+   405→  }
+   406→}
+   407→
+   408→function handleProviderEntryExit(world: SimWorld, rng: SeededRNG): void {
+   409→  // Entry.
+   410→  if (rng.chance(world.config.providerGrowthRate)) {
+   411→    generateNewProvider(world, rng, world.step);
+   412→  }
+   413→
+   414→  // Exit based on risk-adjusted return (not just raw earnings).
+   415→  const networkMedianFee = calculateNetworkMedianFee(world);
+   416→  for (const provider of world.providers.values()) {
+   417→    if (provider.status !== "ACTIVE") continue;
+   418→    const steps = world.step - provider.entryStep;
+   419→    if (steps < 10) continue;
+   420→
+   421→    // Calculate provider economics using shared function.
+   422→    const econ = calculateProviderEconomics({
+   423→      grossFees: provider.totalEarnings,
+   424→      incentives: provider.totalIncentives,
+   425→      rebates: 0,
+   426→      settlementCosts: provider.totalVolume * 0.0001, // 1 bps settlement cost
+   427→      operatingCosts: provider.totalVolume * 0.0002,  // 2 bps operating cost
+   428→      capitalCostRate: 0.05, // 5% annual
+   429→      averageDeployedCapital: provider.usableCollateral,
+   430→      expectedLossRate: 0.001, // 10 bps
+   431→      penalties: provider.totalPenalties,
+   432→      slashing: provider.totalSlashing,
+   433→      stepsPerYear: (365 * 24 * 3600 * 1000) / world.config.stepDurationMs,
+   434→    });
+   435→
+   436→    // Exit if risk-adjusted return is negative.
+   437→    if (econ.riskAdjustedReturn < 0 && rng.chance(0.1)) {
+   438→      provider.status = "EXITED";
+   439→      provider.exitStep = world.step;
+   440→      for (const offer of world.offers.values()) {
+   441→        if (offer.providerId === provider.id) offer.active = false;
+   442→      }
+   443→    }
+   444→
+   445→    // Exit if too many failures.
+   446→    if (provider.executionsFailed > 5 && provider.executionsFailed / Math.max(1, provider.executionsCompleted + provider.executionsFailed) > 0.3) {
+   447→      provider.status = "EXITED";
+   448→      provider.exitStep = world.step;
+   449→      for (const offer of world.offers.values()) {
+   450→        if (offer.providerId === provider.id) offer.active = false;
+   451→      }
+   452→    }
+   453→  }
+   454→
+   455→  // Update tiers using shared deriveTier.
+   456→  for (const provider of world.providers.values()) {
+   457→    if (provider.status !== "ACTIVE") continue;
+   458→    const steps = world.step - provider.entryStep;
+   459→    const ageDays = (steps * world.config.stepDurationMs) / DAY_MS;
+   460→    const repInput = buildReputationInput(provider, ageDays, networkMedianFee);
+   461→    const rep = calculateReputation(repInput);
+   462→    provider.reputationScore = rep.overall / 100;
+   463→    provider.tier = deriveTier(rep.overall, rep.sampleSize, ageDays, 0);
+   464→  }
+   465→}
+   466→
+   467→function updateCampaigns(world: SimWorld): void {
+   468→  for (const campaign of world.campaigns.values()) {
+   469→    if (campaign.status !== "ACTIVE") continue;
+   470→    if (world.step >= campaign.endStep) {
+   471→      campaign.status = "EXPIRED";
+   472→      for (const offer of world.offers.values()) {
+   473→        if (offer.settlementAssetId === campaign.settlementAssetId) {
+   474→          offer.incentiveBps = 0;
+   475→          offer.version++;
+   476→        }
+   477→      }
+   478→    }
+   479→    if (campaign.accrued >= campaign.totalBudget) {
+   480→      campaign.status = "EXHAUSTED";
+   481→      for (const offer of world.offers.values()) {
+   482→        if (offer.settlementAssetId === campaign.settlementAssetId) {
+   483→          offer.incentiveBps = 0;
+   484→          offer.version++;
+   485→        }
+   486→      }
+   487→    }
+   488→  }
+   489→}
+   490→
+   491→function applyShocks(world: SimWorld, rng: SeededRNG): void {
+   492→  const config = world.config;
+   493→  if (!config.shockType || world.step !== config.shockStep) return;
+   494→
+   495→  switch (config.shockType) {
+   496→    case "LIQUIDITY":
+   497→      for (const offer of world.offers.values()) {
+   498→        offer.availableCapacity *= (1 - config.shockMagnitude);
+   499→        offer.version++;
+   500→      }
+   501→      break;
+   502→    case "PROVIDER_EXIT": {
+   503→      const activeProviders = [...world.providers.values()].filter(p => p.status === "ACTIVE");
+   504→      if (activeProviders.length > 0) {
+   505→        const largest = activeProviders.reduce((max, p) => p.totalVolume > max.totalVolume ? p : max, activeProviders[0]);
+   506→        largest.status = "EXITED";
+   507→        largest.exitStep = world.step;
+   508→        for (const offer of world.offers.values()) {
+   509→          if (offer.providerId === largest.id) offer.active = false;
+   510→        }
+   511→      }
+   512→      break;
+   513→    }
+   514→    case "ASSET_DEPEG":
+   515→      for (const asset of world.assets.values()) {
+   516→        if (asset.assetType === "STABLECOIN" && asset.pegQuality !== null) {
+   517→          asset.pegQuality *= (1 - config.shockMagnitude);
+   518→          asset.volatilityScore = Math.min(1, asset.volatilityScore + config.shockMagnitude * 0.3);
+   519→        }
+   520→      }
+   521→      break;
+   522→    case "INCENTIVE_END":
+   523→      for (const campaign of world.campaigns.values()) {
+   524→        if (campaign.status === "ACTIVE") {
+   525→          campaign.status = "EXPIRED";
+   526→          for (const offer of world.offers.values()) {
+   527→            if (offer.settlementAssetId === campaign.settlementAssetId) {
+   528→              offer.incentiveBps = 0;
+   529→              offer.version++;
+   530→            }
+   531→          }
+   532→        }
+   533→      }
+   534→      break;
+   535→    case "DEMAND_SURGE":
+   536→      world.config.demandVolume *= (1 + config.shockMagnitude);
+   537→      break;
+   538→    case "REGULATORY": {
+   539→      const suspendedType = rng.pick(["LOCAL_FIAT_AGENT", "PSP", "CEX", "DEX"]);
+   540→      for (const provider of world.providers.values()) {
+   541→        if (provider.providerType === suspendedType && provider.status === "ACTIVE") {
+   542→          provider.status = "SUSPENDED";
+   543→          for (const offer of world.offers.values()) {
+   544→            if (offer.providerId === provider.id) offer.active = false;
+   545→          }
+   546→        }
+   547→      }
+   548→      break;
+   549→    }
+   550→  }
+   551→}
+   552→
+   553→function collectMetrics(world: SimWorld): SimMetrics {
+   554→  const intents = world.intents;
+   555→  const completed = intents.filter(i => i.status === "COMPLETED");
+   556→  const failed = intents.filter(i => i.status === "FAILED");
+   557→  const expired = intents.filter(i => i.status === "EXPIRED");
+   558→  const activeProviders = [...world.providers.values()].filter(p => p.status === "ACTIVE");
+   559→  const exitedProviders = [...world.providers.values()].filter(p => p.status === "EXITED");
+   560→
+   561→  const costs = completed.map(i => i.effectiveCost / i.sourceAmount * 10000);
+   562→  const avgCostBps = costs.length > 0 ? costs.reduce((s, c) => s + c, 0) / costs.length : 0;
+   563→  const waits = completed.map(i => i.waitedSteps);
+   564→  const avgWaitSteps = waits.length > 0 ? waits.reduce((s, w) => s + w, 0) / waits.length : 0;
+   565→
+   566→  const executionSteps = completed.map(i => i.completedAtStep! - i.createdAtStep);
+   567→  executionSteps.sort((a, b) => a - b);
+   568→  const p50 = executionSteps.length > 0 ? executionSteps[Math.floor(executionSteps.length * 0.5)] : 0;
+   569→  const p95 = executionSteps.length > 0 ? executionSteps[Math.floor(executionSteps.length * 0.95)] : 0;
+   570→
+   571→  // Provider economics using shared function.
+   572→  const providerEcons = activeProviders.map(p => {
+   573→    return calculateProviderEconomics({
+   574→      grossFees: p.totalEarnings, incentives: p.totalIncentives, rebates: 0,
+   575→      settlementCosts: p.totalVolume * 0.0001, operatingCosts: p.totalVolume * 0.0002,
+   576→      capitalCostRate: 0.05, averageDeployedCapital: p.usableCollateral,
+   577→      expectedLossRate: 0.001, penalties: p.totalPenalties, slashing: p.totalSlashing,
+   578→      stepsPerYear: (365 * 24 * 3600 * 1000) / world.config.stepDurationMs,
+   579→    });
+   580→  });
+   581→  const returns = providerEcons.map(e => e.riskAdjustedReturn).sort((a, b) => a - b);
+   582→  const medianReturn = returns.length > 0 ? returns[Math.floor(returns.length / 2)] : 0;
+   583→  const avgEarnings = providerEcons.length > 0 ? providerEcons.reduce((s, e) => s + e.netEarnings, 0) / providerEcons.length : 0;
+   584→
+   585→  const totalLiquidity = [...world.offers.values()].filter(o => o.active).reduce((s, o) => s + o.availableCapacity, 0);
+   586→  const providerVolumes = activeProviders.map(p => p.totalVolume);
+   587→  const totalVol = providerVolumes.reduce((s, v) => s + v, 0);
+   588→  const hhi = totalVol > 0 ? providerVolumes.map(v => (v / totalVol) ** 2).reduce((s, h) => s + h, 0) : 1;
+   589→
+   590→  // Route coverage: fraction of intents that found a route.
+   591→  const routeCoverage = intents.length > 0 ? (completed.length + intents.filter(i => i.status === "EXECUTING").length) / intents.length : 0;
+   592→
+   593→  // Equilibrium using shared detectEquilibrium.
+   594→  const recentExits = exitedProviders.filter(p => p.exitStep !== null && p.exitStep > world.step - 20).length;
+   595→  const recentEntries = activeProviders.filter(p => p.entryStep > world.step - 20).length;
+   596→  const activeIncentives = [...world.campaigns.values()].filter(c => c.status === "ACTIVE").length;
+   597→  const incentiveDependent = activeIncentives > 0 && world.totalIncentives > world.totalFees * 0.1;
+   598→
+   599→  // Check stability: compare last 3 metrics points.
+   600→  const stable = world.metricsHistory.length >= 3
+   601→    ? Math.abs((world.metricsHistory[world.metricsHistory.length - 1].avgCostBps - world.metricsHistory[world.metricsHistory.length - 3].avgCostBps)) < 50
+   602→    : false;
+   603→
+   604→  const eqResult = detectEquilibrium({
+   605→    medianRiskAdjustedReturn: medianReturn,
+   606→    providerEntryRate: recentEntries / 20,
+   607→    providerExitRate: recentExits / 20,
+   608→    routeCoverage,
+   609→    avgCostBps,
+   610→    baselineCostBps: world.config.baselineCostBps,
+   611→    marketConcentration: hhi,
+   612→    incentiveDependent,
+   613→    recentSteps: world.step,
+   614→    stableReturns: stable,
+   615→  });
+   616→
+   617→  return {
+   618→    totalIntents: intents.length, completedIntents: completed.length,
+   619→    failedIntents: failed.length, cancelledIntents: 0, expiredIntents: expired.length,
+   620→    avgCostBps: Math.round(avgCostBps * 100) / 100, avgWaitSteps: Math.round(avgWaitSteps * 100) / 100,
+   621→    p50ExecutionSteps: p50, p95ExecutionSteps: p95,
+   622→    completionRate: intents.length > 0 ? Math.round((completed.length / intents.length) * 10000) / 100 : 0,
+   623→    activeProviders: activeProviders.length, exitedProviders: exitedProviders.length,
+   624→    avgProviderEarnings: Math.round(avgEarnings * 100) / 100,
+   625→    medianProviderEarnings: providerEcons.length > 0 ? Math.round(providerEcons[Math.floor(providerEcons.length / 2)].netEarnings * 100) / 100 : 0,
+   626→    avgUtilization: activeProviders.length > 0 ? Math.round((activeProviders.reduce((s, p) => s + p.utilization, 0) / activeProviders.length) * 10000) / 100 : 0,
+   627→    totalProviderVolume: Math.round(world.totalVolume * 100) / 100,
+   628→    totalProtocolRevenue: Math.round(world.totalFees * 100) / 100,
+   629→    totalIncentiveSpend: Math.round(world.totalIncentives * 100) / 100,
+   630→    totalLiquidity: Math.round(totalLiquidity * 100) / 100,
+   631→    avgRoutesPerCorridor: 0, corridorCoverage: 0,
+   632→    marketConcentration: Math.round(hhi * 10000) / 10000,
+   633→    equilibriumStatus: eqResult.status,
+   634→  };
+   635→}
+   636→
+   637→// ---- Helpers ----
+   638→
+   639→function buildReputationMap(world: SimWorld): Map<string, number> {
+   640→  const map = new Map<string, number>();
+   641→  const networkMedianFee = calculateNetworkMedianFee(world);
+   642→  for (const p of world.providers.values()) {
+   643→    if (p.status !== "ACTIVE") continue;
+   644→    const ageDays = ((world.step - p.entryStep) * world.config.stepDurationMs) / DAY_MS;
+   645→    const repInput = buildReputationInput(p, ageDays, networkMedianFee);
+   646→    const rep = calculateReputation(repInput);
+   647→    map.set(p.id, rep.overall / 100);
+   648→  }
+   649→  return map;
+   650→}
+   651→
+   652→function buildReputationInput(p: SimProvider, ageDays: number, networkMedianFee: number): ReputationInput {
+   653→  // Simplified weighting for the simulator (no per-leg recency tracking).
+   654→  const total = p.executionsCompleted + p.executionsFailed;
+   655→  return {
+   656→    completed: p.executionsCompleted,
+   657→    failed: p.executionsFailed,
+   658→    cancelled: 0,
+   659→    disputes: 0,
+   660→    slashes: 0,
+   661→    avgDurationSeconds: 60, // default
+   662→    utilization: p.utilization,
+   663→    medianFeeBps: 20, // approximate
+   664→    networkMedianFeeBps: networkMedianFee,
+   665→    ageDays,
+   666→    weightedCompleted: p.executionsCompleted,
+   667→    weightedFailed: p.executionsFailed,
+   668→    weightedCancelled: 0,
+   669→    weightedDisputes: 0,
+   670→    weightedSlashes: 0,
+   671→    meaningfulExecutions: p.executionsCompleted,
+   672→  };
+   673→}
+   674→
+   675→function buildCorridorScoreMap(world: SimWorld): Map<string, number> {
+   676→  // Simplified: use provider reputation as corridor score for now.
+   677→  return new Map();
+   678→}
+   679→
+   680→function buildCommitmentReliabilityMap(world: SimWorld): Map<string, number> {
+   681→  // Simplified: return empty (no commitment simulation yet).
+   682→  return new Map();
+   683→}
+   684→
+   685→function calculateNetworkMedianFee(world: SimWorld): number {
+   686→  const fees = [...world.offers.values()].filter(o => o.active).map(o => o.feeBps).sort((a, b) => a - b);
+   687→  return fees.length > 0 ? fees[Math.floor(fees.length / 2)] : 20;
+   688→}
+   689→
+   690→// Main simulation runner.
+   691→import { createWorld } from "./world";
+   692→import { generateWorld } from "./generator";
+   693→
+   694→export function runSimulation(config: SimWorld["config"]): SimWorld {
+   695→  intentCounter = 0;
+   696→  routeCounter = 0;
+   697→  const rng = new SeededRNG(config.seed);
+   698→  const world = createWorld(config);
+   699→  generateWorld(world, rng);
+   700→  for (let step = 0; step < config.totalSteps; step++) {
+   701→    simulateStep(world, rng);
+   702→  }
+   703→  if (world.metricsHistory.length === 0) {
+   704→    world.metricsHistory.push(collectMetrics(world));
+   705→  }
+   706→  return world;
+   707→}
+   708→

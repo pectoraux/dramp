@@ -1,0 +1,931 @@
+     1→// Routing engine — the core of dRamp.
+     2→//
+     3→// The marketplace is a graph:
+     4→//   - nodes are (asset, country) pairs (fiat) or (asset, GLOBAL) for on-chain
+     5→//   - edges are active LiquidityOffers published by providers
+     6→//
+     7→// The engine:
+     8→//   1. enumerates simple paths source -> destination up to maxHops
+     9→//   2. computes economics along each path (fees, FX, incentives, net output)
+    10→//   3. applies HARD filters (provider suspension, capacity, collateral,
+    11→//      prohibited assets, asset-risk ceiling, unsupported corridor)
+    12→//   4. computes the five separate risk dimensions
+    13→//   5. ranks by the user's risk tolerance and tags BEST/CHEAPEST/FASTEST/SAFEST
+    14→//   6. supports split routes when no single offer covers the amount
+    15→//
+    16→// Hard filters NEVER optimize — a route that violates one is invalid.
+    17→
+    18→import { db } from "@/lib/db";
+    19→import { Decimal, moneyAdd, moneySub, moneyMul, moneyGte, moneyLte, moneyGt, moneyLt, moneyMin, moneyMax, bpsToFactor, feeForAmount, incentiveForAmount } from "./money";
+    20→import {
+    21→  computeRouteRisk,
+    22→  providerCounterpartyRisk,
+    23→  settlementAssetRisk,
+    24→  providerRiskFromRecord,
+    25→  settlementAssetRiskFromRecord,
+    26→  assetRiskCeiling,
+    27→  counterpartyRiskCeiling,
+    28→  type RouteRiskResult,
+    29→} from "./risk";
+    30→import {
+    31→  CAPABILITY,
+    32→  CHANNEL_TYPE,
+    33→  LEG_ROLE,
+    34→  ROUTE_TAG,
+    35→  SETTLEMENT_ASSET_TYPE,
+    36→} from "./types";
+    37→
+    38→// ---- Graph node helpers --------------------------------------------------
+    39→
+    40→function nodeKey(asset: string, country: string): string {
+    41→  return `${asset}:${country}`;
+    42→}
+    43→
+    44→export interface GraphNode {
+    45→  asset: string;
+    46→  country: string;
+    47→}
+    48→
+    49→// ---- Leg (candidate, pre-DB) --------------------------------------------
+    50→
+    51→export interface CandidateLeg {
+    52→  providerId: string;
+    53→  offerId: string;
+    54→  offerVersion: number; // observed offer version for optimistic concurrency
+    55→  sequence: number; // hop index; parallel legs share a sequence
+    56→  role: string; // SOURCE | SETTLEMENT_HOP | DESTINATION
+    57→  amount: Decimal; // input amount in this leg's source asset
+    58→  sourceAsset: string;
+    59→  destinationAsset: string;
+    60→  sourceCountry: string;
+    61→  destinationCountry: string;
+    62→  settlementAssetId: string | null;
+    63→  channelType: string;
+    64→  feeBps: number;
+    65→  incentiveBps: number;
+    66→  rate: Decimal;
+    67→  expectedExecutionSeconds: number;
+    68→  // risk inputs
+    69→  providerRisk: ReturnType<typeof providerRiskFromRecord>;
+    70→  offerCapacity: Decimal;
+    71→  settlementAssetRisk: ReturnType<typeof settlementAssetRiskFromRecord> | null;
+    72→}
+    73→
+    74→export interface CandidateRoute {
+    75→  legs: CandidateLeg[];
+    76→  hopCount: number;
+    77→  split: boolean;
+    78→  totalCost: Decimal; // source-asset terms (approx)
+    79→  effectiveCost: Decimal; // source-asset terms (approx, net of incentives)
+    80→  grossOutput: Decimal; // notional output ignoring fees
+    81→  netOutput: Decimal; // actual destination amount
+    82→  incentiveBps: number;
+    83→  risk: RouteRiskResult;
+    84→  expectedExecutionSeconds: number;
+    85→  explanation: string;
+    86→  tag: string;
+    87→  hardFilterRejection?: string;
+    88→}
+    89→
+    90→// ---- Path enumeration ----------------------------------------------------
+    91→
+    92→interface AdjEdge {
+    93→  to: string; // node key
+    94→  offer: {
+    95→    id: string;
+    96→    providerId: string;
+    97→    capability: string;
+    98→    sourceAsset: string;
+    99→    destinationAsset: string;
+   100→    sourceCountry: string;
+   101→    destinationCountry: string;
+   102→    rate: Decimal;
+   103→    feeBps: number;
+   104→    minimumAmount: Decimal;
+   105→    maximumAmount: Decimal;
+   106→    availableCapacity: Decimal;
+   107→    reservedCapacity: Decimal;
+   108→    settlementAssetId: string | null;
+   109→    channelType: string;
+   110→    expectedExecutionSeconds: number;
+   111→    incentiveBps: number;
+   112→    active: boolean;
+   113→    expiresAt: Date | null;
+   114→    version: number;
+   115→  };
+   116→  provider: {
+   117→    id: string;
+   118→    name: string;
+   119→    providerType: string;
+   120→    trustModel: string;
+   121→    capabilities: string;
+   122→    countries: string;
+   123→    reputationScore: number;
+   124→    status: string;
+   125→    vaultId: string | null;
+   126→  };
+   127→}
+   128→
+   129→async function buildGraph(): Promise<Map<string, AdjEdge[]>> {
+   130→  const offers = await db.liquidityOffer.findMany({
+   131→    where: { active: true },
+   132→    include: { provider: true },
+   133→  });
+   134→  // Enrich offers with active settlement-incentive campaigns. The offer's own
+   135→  // incentiveBps is the base; the campaign incentive is added if the campaign
+   136→  // is active, within its date window, and has remaining budget. This reuses
+   137→  // the existing incentive integration in computeHopOutput — no parallel
+   138→  // pricing system.
+   139→  const { getApplicableIncentiveBps } = await import("@/lib/provider-api/incentives");
+   140→  const adj = new Map<string, AdjEdge[]>();
+   141→  const now = new Date();
+   142→  for (const o of offers) {
+   143→    if (o.expiresAt && o.expiresAt < now) continue;
+   144→    if (o.provider.status !== "ACTIVE") continue;
+   145→    // Compute the effective incentive: base offer incentive + active campaign.
+   146→    let effectiveIncentiveBps = o.incentiveBps;
+   147→    if (o.settlementAssetId) {
+   148→      const { bps } = await getApplicableIncentiveBps(o.settlementAssetId, {
+   149→        sourceAsset: o.sourceAsset,
+   150→        destinationAsset: o.destinationAsset,
+   151→        riskTolerance: "", // campaigns don't filter by risk at graph-build time
+   152→        providerType: o.provider.providerType,
+   153→      });
+   154→      effectiveIncentiveBps += bps;
+   155→    }
+   156→    const from = nodeKey(o.sourceAsset, o.sourceCountry);
+   157→    const to = nodeKey(o.destinationAsset, o.destinationCountry);
+   158→    const edge: AdjEdge = {
+   159→      to,
+   160→      offer: {
+   161→        id: o.id,
+   162→        providerId: o.providerId,
+   163→        capability: o.capability,
+   164→        sourceAsset: o.sourceAsset,
+   165→        destinationAsset: o.destinationAsset,
+   166→        sourceCountry: o.sourceCountry,
+   167→        destinationCountry: o.destinationCountry,
+   168→        rate: o.rate,
+   169→        feeBps: o.feeBps,
+   170→        minimumAmount: o.minimumAmount,
+   171→        maximumAmount: o.maximumAmount,
+   172→        availableCapacity: o.availableCapacity,
+   173→        reservedCapacity: o.reservedCapacity,
+   174→        settlementAssetId: o.settlementAssetId,
+   175→        channelType: o.channelType,
+   176→        expectedExecutionSeconds: o.expectedExecutionSeconds,
+   177→        incentiveBps: effectiveIncentiveBps,
+   178→        active: o.active,
+   179→        expiresAt: o.expiresAt,
+   180→        version: o.version,
+   181→      },
+   182→      provider: {
+   183→        id: o.provider.id,
+   184→        name: o.provider.name,
+   185→        providerType: o.provider.providerType,
+   186→        trustModel: o.provider.trustModel,
+   187→        capabilities: o.provider.capabilities,
+   188→        countries: o.provider.countries,
+   189→        reputationScore: o.provider.reputationScore,
+   190→        status: o.provider.status,
+   191→        vaultId: o.provider.vaultId,
+   192→      },
+   193→    };
+   194→    if (!adj.has(from)) adj.set(from, []);
+   195→    adj.get(from)!.push(edge);
+   196→  }
+   197→  return adj;
+   198→}
+   199→
+   200→interface PathStep {
+   201→  fromNode: string;
+   202→  toNode: string;
+   203→  edges: AdjEdge[]; // offers that can serve this hop (parallel candidates)
+   204→}
+   205→
+   206→// Enumerate simple paths (no repeated nodes) up to maxHops.
+   207→function enumeratePaths(adj: Map<string, AdjEdge[]>, source: string, dest: string, maxHops: number): PathStep[][] {
+   208→  const results: PathStep[][] = [];
+   209→  const visited = new Set<string>([source]);
+   210→
+   211→  function dfs(current: string, path: PathStep[]) {
+   212→    if (path.length > 0 && current === dest) {
+   213→      results.push([...path]);
+   214→      return;
+   215→    }
+   216→    if (path.length >= maxHops) return;
+   217→    const edges = adj.get(current) ?? [];
+   218→    for (const e of edges) {
+   219→      if (visited.has(e.to)) continue;
+   220→      // Don't allow arriving at dest with 0 hops; also avoid trivial self-loops.
+   221→      visited.add(e.to);
+   222→      path.push({ fromNode: current, toNode: e.to, edges: edges.filter((x) => x.to === e.to) });
+   223→      dfs(e.to, path);
+   224→      path.pop();
+   225→      visited.delete(e.to);
+   226→    }
+   227→  }
+   228→  dfs(source, []);
+   229→  return results;
+   230→}
+   231→
+   232→// ---- Cover an amount across one hop's offers (split support) -------------
+   233→
+   234→interface LegAssignment {
+   235→  edge: AdjEdge;
+   236→  amount: Decimal; // input amount assigned to this offer
+   237→}
+   238→
+   239→// Assign the input amount across available offers for a hop.
+   240→// Returns a single assignment if one offer can cover it, otherwise a split.
+   241→// Returns null if combined capacity is insufficient (hard filter).
+   242→function coverAmount(edges: AdjEdge[], amount: Decimal): { assignments: LegAssignment[]; split: boolean } | null {
+   243→  // Filter to offers that satisfy min amount (for single) and have capacity.
+   244→  const usable = edges
+   245→    .filter((e) => moneyGt(e.offer.availableCapacity, 0))
+   246→    .sort((a, b) => {
+   247→      // Prefer automatic, lower fee, higher capacity.
+   248→      if (a.offer.channelType !== b.offer.channelType) {
+   249→        return a.offer.channelType === CHANNEL_TYPE.AUTOMATIC ? -1 : 1;
+   250→      }
+   251→      if (a.offer.feeBps !== b.offer.feeBps) return a.offer.feeBps - b.offer.feeBps;
+   252→      return new Decimal(b.offer.availableCapacity).minus(new Decimal(a.offer.availableCapacity)).toNumber();
+   253→    });
+   254→
+   255→  // Try a single offer first.
+   256→  for (const e of usable) {
+   257→    const avail = moneySub(e.offer.availableCapacity, e.offer.reservedCapacity);
+   258→    if (moneyGte(avail, amount) && moneyGte(amount, e.offer.minimumAmount)) {
+   259→      return { assignments: [{ edge: e, amount }], split: false };
+   260→    }
+   261→  }
+   262→  // Otherwise split across multiple offers.
+   263→  const assignments: LegAssignment[] = [];
+   264→  let remaining = amount;
+   265→  for (const e of usable) {
+   266→    if (moneyLte(remaining, 0)) break;
+   267→    const avail = moneySub(e.offer.availableCapacity, e.offer.reservedCapacity);
+   268→    if (moneyLte(avail, 0)) continue;
+   269→    const take = moneyMin(remaining, avail);
+   270→    if (moneyLt(take, e.offer.minimumAmount)) continue;
+   271→    assignments.push({ edge: e, amount: take });
+   272→    remaining = moneySub(remaining, take);
+   273→  }
+   274→  if (moneyGt(remaining, 0)) return null; // insufficient combined capacity
+   275→  return { assignments, split: assignments.length > 1 };
+   276→}
+   277→
+   278→// ---- Economics computation ----------------------------------------------
+   279→
+   280→function computeHopOutput(inputAmount: Decimal, edge: AdjEdge): { output: Decimal; fee: Decimal; incentive: Decimal } {
+   281→  const fee = feeForAmount(inputAmount, edge.offer.feeBps);
+   282→  const afterFee = moneySub(inputAmount, fee);
+   283→  const converted = moneyMul(afterFee, edge.offer.rate);
+   284→  const incentive = incentiveForAmount(converted, edge.offer.incentiveBps);
+   285→  // Incentive is a rebate — it increases the effective output (subsidized).
+   286→  const output = moneyAdd(converted, incentive);
+   287→  return { output, fee, incentive };
+   288→}
+   289→
+   290→// ---- Build a candidate route from a path --------------------------------
+   291→
+   292→async function buildCandidateRoute(
+   293→  path: PathStep[],
+   294→  sourceAmount: Decimal,
+   295→  sourceAsset: string,
+   296→  destAsset: string,
+   297→  settlementAssets: Map<string, Awaited<ReturnType<typeof db.settlementAsset.findMany>>[number]>,
+   298→  providers: Map<string, Awaited<ReturnType<typeof db.liquidityProvider.findMany>>[number]>,
+   299→): Promise<CandidateRoute | null> {
+   300→  const legs: CandidateLeg[] = [];
+   301→  let currentAmount = sourceAmount;
+   302→  let totalFeeBps = 0;
+   303→  let totalIncentiveBps = 0;
+   304→  let split = false;
+   305→  const hopCount = path.length;
+   306→  let expectedSeconds = 0;
+   307→
+   308→  for (let i = 0; i < path.length; i++) {
+   309→    const step = path[i];
+   310→    const cover = coverAmount(step.edges, currentAmount);
+   311→    if (!cover) return null; // hard filter: insufficient capacity
+   312→    if (cover.split) split = true;
+   313→
+   314→    let hopOutput = new Decimal(0);
+   315→    for (const a of cover.assignments) {
+   316→      const e = a.edge;
+   317→      const { output, fee, incentive } = computeHopOutput(a.amount, e);
+   318→      hopOutput = moneyAdd(hopOutput, output);
+   319→      const role =
+   320→        i === 0 && i === hopCount - 1
+   321→          ? LEG_ROLE.SOURCE // single-hop route
+   322→          : i === 0
+   323→            ? LEG_ROLE.SOURCE
+   324→            : i === hopCount - 1
+   325→              ? LEG_ROLE.DESTINATION
+   326→              : LEG_ROLE.SETTLEMENT_HOP;
+   327→
+   328→      const provRec = providers.get(e.offer.providerId) ?? {
+   329→        trustModel: e.provider.trustModel,
+   330→        providerType: e.provider.providerType,
+   331→        reputationScore: e.provider.reputationScore,
+   332→        status: e.provider.status,
+   333→      };
+   334→      const saRec = e.offer.settlementAssetId
+   335→        ? settlementAssets.get(e.offer.settlementAssetId) ?? null
+   336→        : null;
+   337→      // Also consider the destination asset of this hop if it's a settlement asset.
+   338→      const destSa = settlementAssetsBySymbol(step.toNode.split(":")[0], settlementAssets);
+   339→
+   340→      legs.push({
+   341→        providerId: e.offer.providerId,
+   342→        offerId: e.offer.id,
+   343→        sequence: i,
+   344→        role,
+   345→        amount: a.amount,
+   346→        sourceAsset: e.offer.sourceAsset,
+   347→        destinationAsset: e.offer.destinationAsset,
+   348→        sourceCountry: e.offer.sourceCountry,
+   349→        destinationCountry: e.offer.destinationCountry,
+   350→        settlementAssetId: e.offer.settlementAssetId ?? destSa?.id ?? null,
+   351→        channelType: e.offer.channelType,
+   352→        feeBps: e.offer.feeBps,
+   353→        incentiveBps: e.offer.incentiveBps,
+   354→        rate: e.offer.rate,
+   355→        expectedExecutionSeconds: e.offer.expectedExecutionSeconds,
+   356→        offerVersion: e.offer.version,
+   357→        providerRisk: providerRiskFromRecord(provRec),
+   358→        offerCapacity: e.offer.availableCapacity,
+   359→        settlementAssetRisk: saRec
+   360→          ? settlementAssetRiskFromRecord(saRec)
+   361→          : destSa
+   362→            ? settlementAssetRiskFromRecord(destSa)
+   363→            : null,
+   364→      });
+   365→      totalFeeBps += e.offer.feeBps;
+   366→      totalIncentiveBps += e.offer.incentiveBps;
+   367→    }
+   368→    expectedSeconds = Math.max(expectedSeconds, cover.assignments.reduce((s, a) => Math.max(s, a.edge.offer.expectedExecutionSeconds), 0));
+   369→    currentAmount = hopOutput;
+   370→  }
+   371→
+   372→  const netOutput = currentAmount;
+   373→  // Gross output: notional with rate product and no fees.
+   374→  let gross = sourceAmount;
+   375→  for (let i = 0; i < path.length; i++) {
+   376→    // use the first edge's rate as representative for gross calc
+   377→    const edge = path[i].edges[0];
+   378→    if (edge) gross = moneyMul(gross, edge.offer.rate);
+   379→  }
+   380→  const effectiveCostBps = Math.max(0, totalFeeBps - totalIncentiveBps);
+   381→  const totalCost = moneyMul(sourceAmount, bpsToFactor(totalFeeBps));
+   382→  const effectiveCost = moneyMul(sourceAmount, bpsToFactor(effectiveCostBps));
+   383→
+   384→  const risk = computeRouteRisk(
+   385→    legs.map((l) => ({
+   386→      provider: l.providerRisk,
+   387→      channelType: l.channelType,
+   388→      offerCapacity: l.offerCapacity,
+   389→      legAmount: l.amount,
+   390→      settlementAsset: l.settlementAssetRisk ?? undefined,
+   391→      expectedExecutionSeconds: l.expectedExecutionSeconds,
+   392→    })),
+   393→  );
+   394→
+   395→  return {
+   396→    legs,
+   397→    hopCount,
+   398→    split,
+   399→    totalCost,
+   400→    effectiveCost,
+   401→    grossOutput: gross,
+   402→    netOutput,
+   403→    incentiveBps: totalIncentiveBps,
+   404→    risk,
+   405→    expectedExecutionSeconds: expectedSeconds,
+   406→    explanation: "",
+   407→    tag: ROUTE_TAG.CANDIDATE,
+   408→  };
+   409→}
+   410→
+   411→function settlementAssetsBySymbol(
+   412→  symbol: string,
+   413→  map: Map<string, Awaited<ReturnType<typeof db.settlementAsset.findMany>>[number]>,
+   414→) {
+   415→  for (const a of map.values()) {
+   416→    if (a.symbol === symbol) return a;
+   417→  }
+   418→  return null;
+   419→}
+   420→
+   421→// ---- Hard filters --------------------------------------------------------
+   422→
+   423→export interface HardFilterContext {
+   424→  riskTolerance: string;
+   425→  prohibitedSettlementAssets: string[]; // asset ids
+   426→  allowedSettlementAssets: string[]; // asset ids (empty = all eligible)
+   427→  minimumLiquidityUtilization?: number; // reject if any leg utilization above this
+   428→}
+   429→
+   430→function applyHardFilters(route: CandidateRoute, ctx: HardFilterContext): CandidateRoute {
+   431→  for (const leg of route.legs) {
+   432→    // Provider suspension
+   433→    if (leg.providerRisk.status !== "ACTIVE") {
+   434→      route.hardFilterRejection = "Provider suspended";
+   435→      return route;
+   436→    }
+   437→    // Prohibited settlement asset
+   438→    if (leg.settlementAssetId && ctx.prohibitedSettlementAssets.includes(leg.settlementAssetId)) {
+   439→      route.hardFilterRejection = "Uses a prohibited settlement asset";
+   440→      return route;
+   441→    }
+   442→    // Allowed settlement asset whitelist
+   443→    if (
+   444→      leg.settlementAssetId &&
+   445→      ctx.allowedSettlementAssets.length > 0 &&
+   446→      !ctx.allowedSettlementAssets.includes(leg.settlementAssetId)
+   447→    ) {
+   448→      route.hardFilterRejection = "Settlement asset not in allow-list";
+   449→      return route;
+   450→    }
+   451→    // Asset risk ceiling
+   452→    if (leg.settlementAssetRisk) {
+   453→      const ceiling = assetRiskCeiling(ctx.riskTolerance);
+   454→      // Compute the actual risk for this asset
+   455→      const r = settlementAssetRisk(leg.settlementAssetRisk);
+   456→      if (r > ceiling) {
+   457→        route.hardFilterRejection = `Settlement-asset risk ${r.toFixed(2)} exceeds ceiling ${ceiling.toFixed(2)} for ${ctx.riskTolerance}`;
+   458→        return route;
+   459→      }
+   460→    }
+   461→    // Counterparty risk ceiling
+   462→    const cpr = providerCounterpartyRisk(leg.providerRisk);
+   463→    if (cpr > counterpartyRiskCeiling(ctx.riskTolerance)) {
+   464→      route.hardFilterRejection = `Counterparty risk ${cpr.toFixed(2)} exceeds ceiling for ${ctx.riskTolerance}`;
+   465→      return route;
+   466→    }
+   467→    // Minimum capacity (utilization)
+   468→    const util = new Decimal(leg.amount).dividedBy(new Decimal(leg.offerCapacity)).toNumber();
+   469→    if (util > 1) {
+   470→      route.hardFilterRejection = "Insufficient capacity";
+   471→      return route;
+   472→    }
+   473→  }
+   474→  return route;
+   475→}
+   476→
+   477→function requireSettlementAssetRisk(input: ReturnType<typeof settlementAssetRiskFromRecord>): number {
+   478→  return settlementAssetRisk(input);
+   479→}
+   480→
+   481→// ---- Ranking & tagging ---------------------------------------------------
+   482→//
+   483→// Reputation integration (Prompt 3): reputation is a MODEST factor in the
+   484→// composite score. It nudges ranking among already-eligible routes but NEVER
+   485→// overrides hard constraints. A highly reputable provider gets a small
+   486→// ranking advantage; an expensive route does not magically become cheapest.
+   487→
+   488→function rankAndTag(routes: CandidateRoute[], riskTolerance: string, reputationMap?: Map<string, number>, corridorScores?: Map<string, number>, commitmentReliability?: Map<string, number>): CandidateRoute[] {
+   489→  const valid = routes.filter((r) => !r.hardFilterRejection);
+   490→  if (valid.length === 0) return routes;
+   491→
+   492→  const cheapest = [...valid].sort((a, b) => a.effectiveCost.minus(b.effectiveCost).toNumber())[0];
+   493→  const fastest = [...valid].sort((a, b) => a.expectedExecutionSeconds - b.expectedExecutionSeconds)[0];
+   494→  const safest = [...valid].sort((a, b) => a.risk.composite - b.risk.composite)[0];
+   495→
+   496→  // Best: weighted by risk tolerance + reputation + corridor + commitment
+   497→  const weights = weightFor(riskTolerance);
+   498→
+   499→  // Compute route-level reputation across ALL material legs (not just legs[0]).
+   500→  // For each leg, use corridor-specific score when available, falling back to
+   501→  // the provider's global reputation. The route's combined reputation is the
+   502→  // weighted average across legs, but penalized by the weakest leg (a chain is
+   503→  // only as strong as its weakest link for reliability).
+   504→  const repScores = valid.map((r) => {
+   505→    if (r.legs.length === 0) return 0.5;
+   506→    const legScores = r.legs.map((l) => {
+   507→      // Try corridor-specific score first.
+   508→      const corridorKey = `${l.providerId}:${l.sourceAsset}:${l.destinationAsset}:${l.sourceCountry}:${l.destinationCountry}`;
+   509→      const corridorScore = corridorScores?.get(corridorKey);
+   510→      if (corridorScore !== undefined) return corridorScore;
+   511→      // Fall back to global reputation.
+   512→      return reputationMap?.get(l.providerId) ?? 0.5;
+   513→    });
+   514→    // Combined reputation: 70% weighted average + 30% minimum (weakest-leg penalty).
+   515→    // This ensures a multi-leg route with a weak intermediate provider is penalized.
+   516→    const avg = legScores.reduce((s, x) => s + x, 0) / legScores.length;
+   517→    const minScore = Math.min(...legScores);
+   518→    return avg * 0.7 + minScore * 0.3;
+   519→  });
+   520→  const repMax = Math.max(...repScores, 0.5);
+   521→  const repMin = Math.min(...repScores, 0.5);
+   522→
+   523→  // Compute commitment reliability boost per route, aggregated across ALL legs
+   524→  // (not just legs[0]). Uses the same computeRouteCommitment function as
+   525→  // isBetterRoute and advanceSearching — no drift.
+   526→  const commitBoost = valid.map((r) => {
+   527→    return computeRouteCommitment(r, { reputationMap, corridorScores, commitmentReliability, riskTolerance });
+   528→  });
+   529→
+   530→  const scored = valid.map((r, idx) => {
+   531→    // Normalize each axis to 0..1 across the candidate set.
+   532→    const costMax = valid.reduce((m, x) => moneyMax(m, x.effectiveCost), new Decimal(0)).toNumber() || 1;
+   533→    const costMin = valid.reduce((m, x) => moneyMin(m, x.effectiveCost), cheapest.effectiveCost).toNumber();
+   534→    const durMax = Math.max(...valid.map((x) => x.expectedExecutionSeconds)) || 1;
+   535→    const durMin = fastest.expectedExecutionSeconds;
+   536→    const riskMax = Math.max(...valid.map((x) => x.risk.composite)) || 1;
+   537→    const riskMin = safest.risk.composite;
+   538→    const normCost = costMax === costMin ? 0 : (r.effectiveCost.toNumber() - costMin) / (costMax - costMin);
+   539→    const normDur = durMax === durMin ? 0 : (r.expectedExecutionSeconds - durMin) / (durMax - durMin);
+   540→    const normRisk = riskMax === riskMin ? 0 : (r.risk.composite - riskMin) / (riskMax - riskMin);
+   541→    // Reputation: higher = better, so we invert (1 - normalized) to get a penalty.
+   542→    const normRep = repMax === repMin ? 0 : (repMax - repScores[idx]) / (repMax - repMin);
+   543→    // Commitment reliability boost: reduces the reputation penalty by up to 20%
+   544→    // for providers with high commitment reliability. This is a MODEST nudge —
+   545→    // it never overrides hard constraints or makes a bad route appear good.
+   546→    const commitReduction = commitBoost[idx] * 0.2;
+   547→    const adjustedRepPenalty = weights.reputation * normRep * (1 - commitReduction);
+   548→    // score = 1 - weighted penalty (higher is better)
+   549→    const penalty = weights.cost * normCost + weights.speed * normDur + weights.risk * normRisk + adjustedRepPenalty;
+   550→    return { route: r, score: 1 - penalty };
+   551→  });
+   552→  const best = scored.sort((a, b) => b.score - a.score)[0].route;
+   553→
+   554→  for (const r of valid) {
+   555→    if (r === best) r.tag = ROUTE_TAG.BEST;
+   556→    else if (r === cheapest) r.tag = ROUTE_TAG.CHEAPEST;
+   557→    else if (r === fastest) r.tag = ROUTE_TAG.FASTEST;
+   558→    else if (r === safest) r.tag = ROUTE_TAG.SAFEST;
+   559→    else r.tag = ROUTE_TAG.CANDIDATE;
+   560→    r.explanation = explainRoute(r, valid, { cheapest, fastest, safest, best });
+   561→  }
+   562→  // Order: best first, then cheapest, fastest, safest, then others by score
+   563→  const tagOrder: Record<string, number> = {
+   564→    [ROUTE_TAG.BEST]: 0,
+   565→    [ROUTE_TAG.CHEAPEST]: 1,
+   566→    [ROUTE_TAG.FASTEST]: 2,
+   567→    [ROUTE_TAG.SAFEST]: 3,
+   568→    [ROUTE_TAG.CANDIDATE]: 4,
+   569→  };
+   570→  valid.sort((a, b) => (tagOrder[a.tag] ?? 9) - (tagOrder[b.tag] ?? 9));
+   571→  // Append rejected routes at the end for transparency
+   572→  const rejected = routes.filter((r) => r.hardFilterRejection);
+   573→  return [...valid, ...rejected];
+   574→}
+   575→
+   576→function weightFor(riskTolerance: string): { cost: number; speed: number; risk: number; reputation: number } {
+   577→  // Reputation is a MODEST factor — it nudges ranking but never overrides
+   578→  // hard constraints or makes an expensive route appear cheapest.
+   579→  switch (riskTolerance) {
+   580→    case "MAX_RELIABILITY":
+   581→      return { cost: 0.15, speed: 0.15, risk: 0.55, reputation: 0.15 };
+   582→    case "BALANCED":
+   583→      return { cost: 0.35, speed: 0.20, risk: 0.30, reputation: 0.15 };
+   584→    case "LOWEST_COST":
+   585→      return { cost: 0.60, speed: 0.15, risk: 0.10, reputation: 0.15 };
+   586→    default:
+   587→      return { cost: 0.35, speed: 0.20, risk: 0.30, reputation: 0.15 };
+   588→  }
+   589→}
+   590→
+   591→// ---- Shared route scoring function (Prompt 3.2) ---------------------------
+   592→//
+   593→// This is the SINGLE source of truth for route quality scoring. It is used by:
+   594→//   - rankAndTag (initial route ranking among candidates)
+   595→//   - isBetterRoute (patient-execution route replacement comparison)
+   596→//   - advanceSearching (WAIT_FOR_BETTER re-evaluation)
+   597→//
+   598→// All three must use the EXACT same scoring semantics to prevent drift between
+   599→// initial ranking and re-evaluation. A route that wins on reputation during
+   600→// initial ranking must also win during re-evaluation.
+   601→
+   602→export interface RouteScoreContext {
+   603→  riskTolerance: string;
+   604→  reputationMap?: Map<string, number>;
+   605→  corridorScores?: Map<string, number>;
+   606→  commitmentReliability?: Map<string, number>;
+   607→}
+   608→
+   609→// Compute the raw (un-normalized) score for a single route. Lower = better
+   610→// (it's a penalty). This is used for pairwise comparison where normalization
+   611→// across a candidate set isn't available.
+   612→export function scoreRoute(route: CandidateRoute, ctx: RouteScoreContext): number {
+   613→  return calculateAbsoluteRouteQuality(route, ctx);
+   614→}
+   615→
+   616→// ---- Absolute Route Quality (Prompt 3.3) ---------------------------------
+   617→//
+   618→// A STABLE cross-time route quality score that does NOT depend on the
+   619→// candidate set. Each dimension is bounded 0..1 using absolute reference
+   620→// points, so the same route gets the same quality score regardless of what
+   621→// other routes exist in the marketplace at that moment.
+   622→//
+   623→// Used by:
+   624→//   - advanceSearching (WAIT_FOR_BETTER re-evaluation) via shouldReplaceRoute
+   625→//   - isBetterRoute (delegates to shouldReplaceRoute)
+   626→//
+   627→// NOT used by rankAndTag (which uses candidate-set-relative normalization for
+   628→// ranking among currently available alternatives).
+   629→
+   630→// Absolute reference points for normalization (stable across time):
+   631→const ABS_COST_REF = 0.01;   // 1% effective cost = penalty 1.0 (100 bps)
+   632→const ABS_DURATION_REF = 600; // 10 minutes = penalty 1.0
+   633→
+   634→export function calculateAbsoluteRouteQuality(route: CandidateRoute, ctx: RouteScoreContext): number {
+   635→  const w = weightFor(ctx.riskTolerance);
+   636→  // Source notional = sum of all SOURCE legs. For a split route
+   637→  // ($6,000 + $4,000), this is $10,000 — not just the first leg's $6,000.
+   638→  // For a single-leg route, this equals legs[0].amount.
+   639→  // For a multi-hop route, SOURCE legs still represent the initial notional.
+   640→  const sourceNotional = route.legs
+   641→    .filter((l) => l.role === "SOURCE")
+   642→    .reduce((s, l) => s + l.amount.toNumber(), 0);
+   643→  const notional = sourceNotional || route.legs[0]?.amount.toNumber() || 1;
+   644→
+   645→  // Bounded absolute dimensions (each 0..1, higher = worse):
+   646→  const absCost = Math.min(1, route.effectiveCost.toNumber() / notional / ABS_COST_REF);
+   647→  const absDur = Math.min(1, route.expectedExecutionSeconds / ABS_DURATION_REF);
+   648→  const absRisk = Math.min(1, route.risk.composite);
+   649→
+   650→  // Route reputation across ALL legs (0..1, higher = better → invert for penalty).
+   651→  const routeRep = computeRouteReputation(route, ctx);
+   652→  const absRep = 1 - routeRep; // 0 = perfect reputation, 1 = no reputation
+   653→
+   654→  // Commitment reliability across ALL legs (0..1, higher = better).
+   655→  const routeCommit = computeRouteCommitment(route, ctx);
+   656→  const commitReduction = routeCommit * 0.2;
+   657→
+   658→  const adjustedRepPenalty = w.reputation * absRep * (1 - commitReduction);
+   659→  return w.cost * absCost + w.speed * absDur + w.risk * absRisk + adjustedRepPenalty;
+   660→}
+   661→
+   662→// ---- Route replacement (Prompt 3.3) --------------------------------------
+   663→//
+   664→// Determines whether a newly discovered route should replace the current
+   665→// reference route during WAIT_FOR_BETTER. Uses absolute quality (not
+   666→// candidate-set-normalized) so the comparison is stable across time.
+   667→//
+   668→// ROUTE_REPLACEMENT_THRESHOLD: the minimum absolute quality improvement
+   669→// required to justify replacing the reference route. Expressed in normalized
+   670→// quality units (0..1 scale). A value of 0.01 means the new route must be
+   671→// at least 1% better in absolute quality terms.
+   672→export const ROUTE_REPLACEMENT_THRESHOLD = 0.01;
+   673→
+   674→export function shouldReplaceRoute(
+   675→  newRoute: CandidateRoute,
+   676→  refRoute: CandidateRoute,
+   677→  ctx: RouteScoreContext,
+   678→): { replace: boolean; improvement: number; reason: string } {
+   679→  if (newRoute.hardFilterRejection) return { replace: false, improvement: 0, reason: "new route rejected by hard filter" };
+   680→  if (refRoute.hardFilterRejection) return { replace: true, improvement: 1, reason: "reference route rejected" };
+   681→
+   682→  const refQuality = calculateAbsoluteRouteQuality(refRoute, ctx);
+   683→  const newQuality = calculateAbsoluteRouteQuality(newRoute, ctx);
+   684→  const improvement = refQuality - newQuality; // positive = new is better
+   685→
+   686→  if (improvement >= ROUTE_REPLACEMENT_THRESHOLD) {
+   687→    return { replace: true, improvement, reason: `absolute quality improved by ${improvement.toFixed(4)} (threshold: ${ROUTE_REPLACEMENT_THRESHOLD})` };
+   688→  }
+   689→  return { replace: false, improvement, reason: `improvement ${improvement.toFixed(4)} below threshold ${ROUTE_REPLACEMENT_THRESHOLD}` };
+   690→}
+   691→
+   692→// Compute route-level reputation across ALL material legs.
+   693→// 70% weighted average + 30% minimum (weakest-leg penalty).
+   694→export function computeRouteReputation(route: CandidateRoute, ctx: RouteScoreContext): number {
+   695→  if (route.legs.length === 0) return 0.5;
+   696→  const legScores = route.legs.map((l) => {
+   697→    const corridorKey = `${l.providerId}:${l.sourceAsset}:${l.destinationAsset}:${l.sourceCountry}:${l.destinationCountry}`;
+   698→    const corridorScore = ctx.corridorScores?.get(corridorKey);
+   699→    if (corridorScore !== undefined) return corridorScore;
+   700→    return ctx.reputationMap?.get(l.providerId) ?? 0.5;
+   701→  });
+   702→  const avg = legScores.reduce((s, x) => s + x, 0) / legScores.length;
+   703→  const minScore = Math.min(...legScores);
+   704→  return avg * 0.7 + minScore * 0.3;
+   705→}
+   706→
+   707→// Compute route-level commitment reliability across ALL material legs.
+   708→// Uses the same aggregation style as reputation: average across legs.
+   709→export function computeRouteCommitment(route: CandidateRoute, ctx: RouteScoreContext): number {
+   710→  if (route.legs.length === 0) return 0;
+   711→  const legCommitments = route.legs.map((l) => {
+   712→    return ctx.commitmentReliability?.get(l.providerId) ?? 0;
+   713→  });
+   714→  return legCommitments.reduce((s, x) => s + x, 0) / legCommitments.length;
+   715→}
+   716→
+   717→function explainRoute(
+   718→  r: CandidateRoute,
+   719→  all: CandidateRoute[],
+   720→  refs: { cheapest: CandidateRoute; fastest: CandidateRoute; safest: CandidateRoute; best: CandidateRoute },
+   721→): string {
+   722→  const parts: string[] = [];
+   723→  const labelMap: Record<string, string> = {
+   724→    [ROUTE_TAG.BEST]: "Best overall",
+   725→    [ROUTE_TAG.CHEAPEST]: "Lowest cost",
+   726→    [ROUTE_TAG.FASTEST]: "Fastest",
+   727→    [ROUTE_TAG.SAFEST]: "Safest",
+   728→    [ROUTE_TAG.CANDIDATE]: "Candidate route",
+   729→  };
+   730→  parts.push(labelMap[r.tag] ?? "Candidate route");
+   731→
+   732→  // Cost comparison vs next-best
+   733→  const others = all.filter((x) => x !== r).sort((a, b) => a.effectiveCost.minus(b.effectiveCost).toNumber());
+   734→  if (others.length > 0 && r.effectiveCost.lt(others[0].effectiveCost)) {
+   735→    const diffBps = others[0].effectiveCost.minus(r.effectiveCost).dividedBy(r.legs[0]?.amount ?? 1).times(10000).toNumber();
+   736→    if (diffBps > 0) parts.push(`${(diffBps / 100).toFixed(2)}% cheaper than next-best route`);
+   737→  }
+   738→
+   739→  // Channel
+   740→  const hasManual = r.legs.some((l) => l.channelType === CHANNEL_TYPE.MANUAL);
+   741→  parts.push(hasManual ? "Manual confirmation required" : "Automatic payout");
+   742→
+   743→  // Settlement asset quality
+   744→  const saRisks = r.legs.map((l) => l.settlementAssetRisk).filter(Boolean);
+   745→  if (saRisks.length > 0) {
+   746→    const maxSa = Math.max(...saRisks.map((s) => requireSettlementAssetRisk(s!)));
+   747→    if (maxSa < 0.2) parts.push("Established settlement asset");
+   748→    else if (maxSa < 0.45) parts.push("Solid settlement asset");
+   749→    else parts.push("Emerging settlement asset (higher settlement-asset risk)");
+   750→  }
+   751→
+   752→  // Liquidity
+   753→  if (r.risk.liquidity < 0.3) parts.push("High liquidity");
+   754→  else if (r.risk.liquidity < 0.6) parts.push("Adequate liquidity");
+   755→  else parts.push("Lower liquidity");
+   756→
+   757→  // Provider reliability (from the first leg's provider risk)
+   758→  if (r.risk.counterparty < 0.2) parts.push("High provider reliability");
+   759→  else if (r.risk.counterparty < 0.4) parts.push("Good provider reliability");
+   760→
+   761→  // Hops
+   762→  if (r.hopCount > 1) parts.push(`${r.hopCount} hops`);
+   763→  if (r.split) parts.push("Split across multiple providers");
+   764→
+   765→  // Incentive
+   766→  if (r.incentiveBps > 0) parts.push(`${(r.incentiveBps / 100).toFixed(2)}% settlement incentive`);
+   767→
+   768→  parts.push(`Estimated execution: ${formatDuration(r.expectedExecutionSeconds)}`);
+   769→  return parts.join(" • ");
+   770→}
+   771→
+   772→function formatDuration(seconds: number): string {
+   773→  if (seconds < 60) return `${seconds} seconds`;
+   774→  const m = Math.floor(seconds / 60);
+   775→  const s = seconds % 60;
+   776→  return s ? `${m}m ${s}s` : `${m} minute${m > 1 ? "s" : ""}`;
+   777→}
+   778→
+   779→// ---- Top-level orchestrator ---------------------------------------------
+   780→
+   781→export interface FindRoutesInput {
+   782→  sourceAmount: Decimal | string | number;
+   783→  sourceAsset: string;
+   784→  sourceCountry: string;
+   785→  destinationAsset: string;
+   786→  destinationCountry: string;
+   787→  riskTolerance: string;
+   788→  allowedSettlementAssets: string[];
+   789→  prohibitedSettlementAssets: string[];
+   790→  maxHops?: number;
+   791→}
+   792→
+   793→export async function findRoutes(input: FindRoutesInput): Promise<CandidateRoute[]> {
+   794→  const adj = await buildGraph();
+   795→  const source = nodeKey(input.sourceAsset, input.sourceCountry);
+   796→  const dest = nodeKey(input.destinationAsset, input.destinationCountry);
+   797→  const maxHops = input.maxHops ?? 4;
+   798→
+   799→  const paths = enumeratePaths(adj, source, dest, maxHops);
+   800→  if (paths.length === 0) return [];
+   801→
+   802→  const settlementAssets = await db.settlementAsset.findMany();
+   803→  const saMap = new Map(settlementAssets.map((s) => [s.id, s] as const));
+   804→  const providers = await db.liquidityProvider.findMany();
+   805→  const provMap = new Map(providers.map((p) => [p.id, p] as const));
+   806→
+   807→  const candidates: CandidateRoute[] = [];
+   808→  for (const path of paths) {
+   809→    const c = await buildCandidateRoute(
+   810→      path,
+   811→      new Decimal(input.sourceAmount),
+   812→      input.sourceAsset,
+   813→      input.destinationAsset,
+   814→      saMap,
+   815→      provMap,
+   816→    );
+   817→    if (c) candidates.push(c);
+   818→  }
+   819→
+   820→  // Apply hard filters
+   821→  const ctx: HardFilterContext = {
+   822→    riskTolerance: input.riskTolerance,
+   823→    prohibitedSettlementAssets: input.prohibitedSettlementAssets,
+   824→    allowedSettlementAssets: input.allowedSettlementAssets,
+   825→  };
+   826→  const filtered = candidates.map((c) => applyHardFilters(c, ctx));
+   827→
+   828→  // Fetch provider reputation + corridor scores + commitment reliability for
+   829→  // ranking integration. All are modest factors that nudge ranking but never
+   830→  // override hard constraints.
+   831→  let reputationMap: Map<string, number> | undefined;
+   832→  let corridorScoreMap: Map<string, number> | undefined;
+   833→  let commitmentReliabilityMap: Map<string, number> | undefined;
+   834→  try {
+   835→    const { getReputationMap, getCorridorScoreMap } = await import("@/lib/economics/reputation");
+   836→    const { getCommitmentReliabilityMap } = await import("@/lib/economics/commitments");
+   837→    reputationMap = await getReputationMap();
+   838→    corridorScoreMap = await getCorridorScoreMap();
+   839→    commitmentReliabilityMap = await getCommitmentReliabilityMap();
+   840→  } catch {
+   841→    // If reputation service is unavailable, fall back to neutral scores.
+   842→  }
+   843→
+   844→  // Rank and tag (with reputation + corridor + commitment as factors)
+   845→  return rankAndTag(filtered, input.riskTolerance, reputationMap, corridorScoreMap, commitmentReliabilityMap);
+   846→}
+   847→
+   848→// Quick helper that delegates to shouldReplaceRoute. This is kept for
+   849→// backward compatibility but the canonical path is shouldReplaceRoute.
+   850→export function isBetterRoute(
+   851→  newRoute: CandidateRoute,
+   852→  refRoute: CandidateRoute,
+   853→  riskTolerance: string,
+   854→  ctx?: RouteScoreContext,
+   855→): boolean {
+   856→  const scoreCtx: RouteScoreContext = ctx ?? { riskTolerance };
+   857→  return shouldReplaceRoute(newRoute, refRoute, scoreCtx).replace;
+   858→}
+   859→
+   860→// ---- Persisted route reconstruction (Prompt 3.3 + 3.4) --------------------
+   861→//
+   862→// Rebuilds a real CandidateRoute from a persisted Route + Leg[] with all
+   863→// material fields needed for scoring: provider IDs, corridors, amounts,
+   864→// risk dimensions, etc. No fake provider IDs or empty fields.
+   865→//
+   866→// Prompt 3.4: Uses the LEG'S OWN SNAPSHOT FIELDS (snapshotFeeBps,
+   867→// snapshotSourceCountry, etc.) rather than the current mutable LiquidityOffer.
+   868→// This ensures the reconstructed route represents the route that existed when
+   869→// it was selected — not whatever the provider currently advertises.
+   870→
+   871→export async function reconstructPersistedRoute(routeId: string): Promise<CandidateRoute | null> {
+   872→  const route = await db.route.findUnique({
+   873→    where: { id: routeId },
+   874→    include: { legs: { include: { provider: true } } },
+   875→  });
+   876→  if (!route) return null;
+   877→
+   878→  const legs: CandidateLeg[] = route.legs
+   879→    .sort((a, b) => a.sequence - b.sequence)
+   880→    .map((l) => ({
+   881→      providerId: l.providerId,
+   882→      offerId: l.offerId,
+   883→      offerVersion: l.snapshotOfferVersion ?? 1,
+   884→      sequence: l.sequence,
+   885→      role: l.role,
+   886→      amount: l.amount,
+   887→      sourceAsset: l.sourceAsset,
+   888→      destinationAsset: l.destinationAsset,
+   889→      // Use the leg's historical snapshot, not the mutable offer.
+   890→      sourceCountry: l.snapshotSourceCountry ?? "GLOBAL",
+   891→      destinationCountry: l.snapshotDestinationCountry ?? "GLOBAL",
+   892→      settlementAssetId: l.settlementAssetId,
+   893→      channelType: l.channelType,
+   894→      feeBps: l.snapshotFeeBps ?? 0,
+   895→      incentiveBps: l.snapshotIncentiveBps ?? 0,
+   896→      rate: l.snapshotRate ?? new Decimal(1),
+   897→      expectedExecutionSeconds: l.snapshotExpectedExecutionSeconds ?? 60,
+   898→      providerRisk: providerRiskFromRecord(l.provider ? {
+   899→        trustModel: l.provider.trustModel,
+   900→        providerType: l.provider.providerType,
+   901→        reputationScore: l.provider.reputationScore,
+   902→        status: l.provider.status,
+   903→      } : { trustModel: "NON_CUSTODIAL", providerType: "HYBRID", reputationScore: 0.5, status: "ACTIVE" }),
+   904→      offerCapacity: new Decimal(0), // not needed for historical scoring
+   905→      settlementAssetRisk: null,
+   906→    }));
+   907→
+   908→  return {
+   909→    legs,
+   910→    hopCount: route.legCount,
+   911→    split: route.splitRoute,
+   912→    totalCost: route.totalCost,
+   913→    effectiveCost: route.effectiveCost,
+   914→    grossOutput: route.grossOutput,
+   915→    netOutput: route.netOutput,
+   916→    incentiveBps: route.incentiveBps,
+   917→    risk: {
+   918→      counterparty: route.riskCounterparty,
+   919→      settlementAsset: route.riskSettlementAsset,
+   920→      liquidity: route.riskLiquidity,
+   921→      operational: route.riskOperational,
+   922→      duration: route.riskDuration,
+   923→      composite: route.riskComposite,
+   924→    },
+   925→    expectedExecutionSeconds: route.expectedExecutionSeconds,
+   926→    explanation: route.explanation,
+   927→    tag: route.tag,
+   928→    hardFilterRejection: undefined,
+   929→  };
+   930→}
+   931→

@@ -19,12 +19,9 @@ import { db } from "@/lib/db";
 import { Decimal, moneyAdd, moneySub, moneyMul, moneyGte, moneyLte, moneyGt, moneyLt, moneyMin, moneyMax, bpsToFactor, feeForAmount, incentiveForAmount } from "./money";
 import {
   computeRouteRisk,
-  providerCounterpartyRisk,
   settlementAssetRisk,
   providerRiskFromRecord,
   settlementAssetRiskFromRecord,
-  assetRiskCeiling,
-  counterpartyRiskCeiling,
   type RouteRiskResult,
 } from "./risk";
 import {
@@ -34,6 +31,21 @@ import {
   ROUTE_TAG,
   SETTLEMENT_ASSET_TYPE,
 } from "./types";
+import {
+  calculateAbsoluteRouteQuality as sharedCalculateAbsoluteRouteQuality,
+  shouldReplaceRoute as sharedShouldReplaceRoute,
+  computeRouteReputation as sharedComputeRouteReputation,
+  computeRouteCommitment as sharedComputeRouteCommitment,
+  rankRoutes as sharedRankRoutes,
+  applyHardFilters as sharedApplyHardFilters,
+  ROUTE_REPLACEMENT_THRESHOLD as SHARED_ROUTE_REPLACEMENT_THRESHOLD,
+  type RouteInfo as SharedRouteInfo,
+  type RouteLegInfo as SharedRouteLegInfo,
+  type RouteScoreContext as SharedRouteScoreContext,
+  type HardFilterContext as SharedHardFilterContext,
+  type HardFilterResult as SharedHardFilterResult,
+  type RankedRoute,
+} from "@/lib/economics/shared";
 
 // ---- Graph node helpers --------------------------------------------------
 
@@ -419,57 +431,27 @@ function settlementAssetsBySymbol(
 }
 
 // ---- Hard filters --------------------------------------------------------
+//
+// Delegates to the canonical shared.applyHardFilters. The shared function
+// operates on plain-number RouteInfo; we convert CandidateRoute → RouteInfo
+// at the boundary. No formula is duplicated.
 
 export interface HardFilterContext {
   riskTolerance: string;
   prohibitedSettlementAssets: string[]; // asset ids
   allowedSettlementAssets: string[]; // asset ids (empty = all eligible)
-  minimumLiquidityUtilization?: number; // reject if any leg utilization above this
+  minimumLiquidityUtilization?: number; // legacy, unused (capacity checked in shared)
 }
 
 function applyHardFilters(route: CandidateRoute, ctx: HardFilterContext): CandidateRoute {
-  for (const leg of route.legs) {
-    // Provider suspension
-    if (leg.providerRisk.status !== "ACTIVE") {
-      route.hardFilterRejection = "Provider suspended";
-      return route;
-    }
-    // Prohibited settlement asset
-    if (leg.settlementAssetId && ctx.prohibitedSettlementAssets.includes(leg.settlementAssetId)) {
-      route.hardFilterRejection = "Uses a prohibited settlement asset";
-      return route;
-    }
-    // Allowed settlement asset whitelist
-    if (
-      leg.settlementAssetId &&
-      ctx.allowedSettlementAssets.length > 0 &&
-      !ctx.allowedSettlementAssets.includes(leg.settlementAssetId)
-    ) {
-      route.hardFilterRejection = "Settlement asset not in allow-list";
-      return route;
-    }
-    // Asset risk ceiling
-    if (leg.settlementAssetRisk) {
-      const ceiling = assetRiskCeiling(ctx.riskTolerance);
-      // Compute the actual risk for this asset
-      const r = settlementAssetRisk(leg.settlementAssetRisk);
-      if (r > ceiling) {
-        route.hardFilterRejection = `Settlement-asset risk ${r.toFixed(2)} exceeds ceiling ${ceiling.toFixed(2)} for ${ctx.riskTolerance}`;
-        return route;
-      }
-    }
-    // Counterparty risk ceiling
-    const cpr = providerCounterpartyRisk(leg.providerRisk);
-    if (cpr > counterpartyRiskCeiling(ctx.riskTolerance)) {
-      route.hardFilterRejection = `Counterparty risk ${cpr.toFixed(2)} exceeds ceiling for ${ctx.riskTolerance}`;
-      return route;
-    }
-    // Minimum capacity (utilization)
-    const util = new Decimal(leg.amount).dividedBy(new Decimal(leg.offerCapacity)).toNumber();
-    if (util > 1) {
-      route.hardFilterRejection = "Insufficient capacity";
-      return route;
-    }
+  const sharedCtx: SharedHardFilterContext = {
+    riskTolerance: ctx.riskTolerance,
+    prohibitedSettlementAssets: ctx.prohibitedSettlementAssets,
+    allowedSettlementAssets: ctx.allowedSettlementAssets,
+  };
+  const result: SharedHardFilterResult = sharedApplyHardFilters(candidateRouteToRouteInfo(route), sharedCtx);
+  if (result.rejectionReason) {
+    route.hardFilterRejection = result.rejectionReason;
   }
   return route;
 }
@@ -478,88 +460,76 @@ function requireSettlementAssetRisk(input: ReturnType<typeof settlementAssetRisk
   return settlementAssetRisk(input);
 }
 
+// ---- CandidateRoute → shared RouteInfo conversion -------------------------
+//
+// Production uses Decimal for money; the shared pure functions use number.
+// We convert at the boundary. Risk thresholds (0.3, 0.5, 0.7, 0.9) are coarse
+// enough that float64 is more than sufficient.
+
+function candidateRouteToRouteInfo(route: CandidateRoute): SharedRouteInfo {
+  return {
+    legs: route.legs.map((l): SharedRouteLegInfo => ({
+      providerId: l.providerId,
+      sourceAsset: l.sourceAsset,
+      destinationAsset: l.destinationAsset,
+      sourceCountry: l.sourceCountry ?? "",
+      destinationCountry: l.destinationCountry ?? "",
+      role: l.role ?? "SOURCE",
+      amount: l.amount?.toNumber?.() ?? (typeof l.amount === "number" ? l.amount : 0),
+      feeBps: l.feeBps ?? 0,
+      channelType: l.channelType ?? "AUTOMATIC",
+      offerCapacity: l.offerCapacity?.toNumber?.() ?? (typeof l.offerCapacity === "number" ? l.offerCapacity : 0),
+      expectedExecutionSeconds: l.expectedExecutionSeconds ?? 60,
+      settlementAssetId: l.settlementAssetId,
+      // Defensive: test mocks and historical routes may not have risk inputs.
+      // Scoring functions (calculateAbsoluteRouteQuality, computeRouteReputation,
+      // computeRouteCommitment) don't use these; only applyHardFilters + computeRouteRisk do.
+      provider: l.providerRisk ?? { trustModel: "NON_CUSTODIAL", providerType: "HYBRID", reputationScore: 0.5, status: "ACTIVE" },
+      settlementAsset: l.settlementAssetRisk ?? undefined,
+    })),
+    effectiveCost: route.effectiveCost?.toNumber?.() ?? (typeof route.effectiveCost === "number" ? route.effectiveCost : 0),
+    expectedExecutionSeconds: route.expectedExecutionSeconds,
+    riskComposite: route.risk?.composite ?? 0.5,
+    risk: route.risk,
+  };
+}
+
 // ---- Ranking & tagging ---------------------------------------------------
 //
-// Reputation integration (Prompt 3): reputation is a MODEST factor in the
-// composite score. It nudges ranking among already-eligible routes but NEVER
-// overrides hard constraints. A highly reputable provider gets a small
-// ranking advantage; an expensive route does not magically become cheapest.
+// Delegates the candidate-set-relative scoring to shared.rankRoutes. The
+// shared function normalizes cost/speed/risk/reputation across the current
+// candidate set and assigns BEST/CHEAPEST/FASTEST/SAFEST tags. Production
+// adds explanation strings on top (UI-facing, not a pure calculation).
 
 function rankAndTag(routes: CandidateRoute[], riskTolerance: string, reputationMap?: Map<string, number>, corridorScores?: Map<string, number>, commitmentReliability?: Map<string, number>): CandidateRoute[] {
   const valid = routes.filter((r) => !r.hardFilterRejection);
   if (valid.length === 0) return routes;
 
-  const cheapest = [...valid].sort((a, b) => a.effectiveCost.minus(b.effectiveCost).toNumber())[0];
-  const fastest = [...valid].sort((a, b) => a.expectedExecutionSeconds - b.expectedExecutionSeconds)[0];
-  const safest = [...valid].sort((a, b) => a.risk.composite - b.risk.composite)[0];
+  const ctx: SharedRouteScoreContext = { riskTolerance, reputationMap, corridorScores, commitmentReliability };
 
-  // Best: weighted by risk tolerance + reputation + corridor + commitment
-  const weights = weightFor(riskTolerance);
+  // Build pairs so we can map shared RankedRoute results back to CandidateRoute.
+  const pairs = valid.map((r) => ({ candidate: r, info: candidateRouteToRouteInfo(r) }));
+  const ranked: RankedRoute[] = sharedRankRoutes(pairs.map((p) => p.info), ctx);
 
-  // Compute route-level reputation across ALL material legs (not just legs[0]).
-  // For each leg, use corridor-specific score when available, falling back to
-  // the provider's global reputation. The route's combined reputation is the
-  // weighted average across legs, but penalized by the weakest leg (a chain is
-  // only as strong as its weakest link for reliability).
-  const repScores = valid.map((r) => {
-    if (r.legs.length === 0) return 0.5;
-    const legScores = r.legs.map((l) => {
-      // Try corridor-specific score first.
-      const corridorKey = `${l.providerId}:${l.sourceAsset}:${l.destinationAsset}:${l.sourceCountry}:${l.destinationCountry}`;
-      const corridorScore = corridorScores?.get(corridorKey);
-      if (corridorScore !== undefined) return corridorScore;
-      // Fall back to global reputation.
-      return reputationMap?.get(l.providerId) ?? 0.5;
-    });
-    // Combined reputation: 70% weighted average + 30% minimum (weakest-leg penalty).
-    // This ensures a multi-leg route with a weak intermediate provider is penalized.
-    const avg = legScores.reduce((s, x) => s + x, 0) / legScores.length;
-    const minScore = Math.min(...legScores);
-    return avg * 0.7 + minScore * 0.3;
-  });
-  const repMax = Math.max(...repScores, 0.5);
-  const repMin = Math.min(...repScores, 0.5);
+  // Map tags back using object identity (RouteInfo objects are fresh/unique).
+  const infoToCandidate = new Map<SharedRouteInfo, CandidateRoute>();
+  for (const p of pairs) infoToCandidate.set(p.info, p.candidate);
+  for (const rr of ranked) {
+    const c = infoToCandidate.get(rr.route);
+    if (c) c.tag = rr.tag;
+  }
 
-  // Compute commitment reliability boost per route, aggregated across ALL legs
-  // (not just legs[0]). Uses the same computeRouteCommitment function as
-  // isBetterRoute and advanceSearching — no drift.
-  const commitBoost = valid.map((r) => {
-    return computeRouteCommitment(r, { reputationMap, corridorScores, commitmentReliability, riskTolerance });
-  });
-
-  const scored = valid.map((r, idx) => {
-    // Normalize each axis to 0..1 across the candidate set.
-    const costMax = valid.reduce((m, x) => moneyMax(m, x.effectiveCost), new Decimal(0)).toNumber() || 1;
-    const costMin = valid.reduce((m, x) => moneyMin(m, x.effectiveCost), cheapest.effectiveCost).toNumber();
-    const durMax = Math.max(...valid.map((x) => x.expectedExecutionSeconds)) || 1;
-    const durMin = fastest.expectedExecutionSeconds;
-    const riskMax = Math.max(...valid.map((x) => x.risk.composite)) || 1;
-    const riskMin = safest.risk.composite;
-    const normCost = costMax === costMin ? 0 : (r.effectiveCost.toNumber() - costMin) / (costMax - costMin);
-    const normDur = durMax === durMin ? 0 : (r.expectedExecutionSeconds - durMin) / (durMax - durMin);
-    const normRisk = riskMax === riskMin ? 0 : (r.risk.composite - riskMin) / (riskMax - riskMin);
-    // Reputation: higher = better, so we invert (1 - normalized) to get a penalty.
-    const normRep = repMax === repMin ? 0 : (repMax - repScores[idx]) / (repMax - repMin);
-    // Commitment reliability boost: reduces the reputation penalty by up to 20%
-    // for providers with high commitment reliability. This is a MODEST nudge —
-    // it never overrides hard constraints or makes a bad route appear good.
-    const commitReduction = commitBoost[idx] * 0.2;
-    const adjustedRepPenalty = weights.reputation * normRep * (1 - commitReduction);
-    // score = 1 - weighted penalty (higher is better)
-    const penalty = weights.cost * normCost + weights.speed * normDur + weights.risk * normRisk + adjustedRepPenalty;
-    return { route: r, score: 1 - penalty };
-  });
-  const best = scored.sort((a, b) => b.score - a.score)[0].route;
+  // Identify extremes for explanation generation.
+  const cheapest = valid.reduce((m, r) => r.effectiveCost.lt(m.effectiveCost) ? r : m, valid[0]);
+  const fastest = valid.reduce((m, r) => r.expectedExecutionSeconds < m.expectedExecutionSeconds ? r : m, valid[0]);
+  const safest = valid.reduce((m, r) => r.risk.composite < m.risk.composite ? r : m, valid[0]);
+  const best = infoToCandidate.get(ranked[0].route) ?? valid[0];
 
   for (const r of valid) {
-    if (r === best) r.tag = ROUTE_TAG.BEST;
-    else if (r === cheapest) r.tag = ROUTE_TAG.CHEAPEST;
-    else if (r === fastest) r.tag = ROUTE_TAG.FASTEST;
-    else if (r === safest) r.tag = ROUTE_TAG.SAFEST;
-    else r.tag = ROUTE_TAG.CANDIDATE;
     r.explanation = explainRoute(r, valid, { cheapest, fastest, safest, best });
   }
-  // Order: best first, then cheapest, fastest, safest, then others by score
+
+  // Order: best first, then cheapest, fastest, safest, then others.
   const tagOrder: Record<string, number> = {
     [ROUTE_TAG.BEST]: 0,
     [ROUTE_TAG.CHEAPEST]: 1,
@@ -568,108 +538,35 @@ function rankAndTag(routes: CandidateRoute[], riskTolerance: string, reputationM
     [ROUTE_TAG.CANDIDATE]: 4,
   };
   valid.sort((a, b) => (tagOrder[a.tag] ?? 9) - (tagOrder[b.tag] ?? 9));
-  // Append rejected routes at the end for transparency
   const rejected = routes.filter((r) => r.hardFilterRejection);
   return [...valid, ...rejected];
 }
 
-function weightFor(riskTolerance: string): { cost: number; speed: number; risk: number; reputation: number } {
-  // Reputation is a MODEST factor — it nudges ranking but never overrides
-  // hard constraints or makes an expensive route appear cheapest.
-  switch (riskTolerance) {
-    case "MAX_RELIABILITY":
-      return { cost: 0.15, speed: 0.15, risk: 0.55, reputation: 0.15 };
-    case "BALANCED":
-      return { cost: 0.35, speed: 0.20, risk: 0.30, reputation: 0.15 };
-    case "LOWEST_COST":
-      return { cost: 0.60, speed: 0.15, risk: 0.10, reputation: 0.15 };
-    default:
-      return { cost: 0.35, speed: 0.20, risk: 0.30, reputation: 0.15 };
-  }
-}
-
-// ---- Shared route scoring function (Prompt 3.2) ---------------------------
+// ---- Shared route scoring (delegates to canonical shared.ts) ---------------
 //
-// This is the SINGLE source of truth for route quality scoring. It is used by:
-//   - rankAndTag (initial route ranking among candidates)
-//   - isBetterRoute (patient-execution route replacement comparison)
-//   - advanceSearching (WAIT_FOR_BETTER re-evaluation)
-//
-// All three must use the EXACT same scoring semantics to prevent drift between
-// initial ranking and re-evaluation. A route that wins on reputation during
-// initial ranking must also win during re-evaluation.
+// All pure route quality calculations live in src/lib/economics/shared.ts.
+// These wrappers convert CandidateRoute (Decimal) → RouteInfo (number) and
+// delegate. No formula is duplicated here.
 
-export interface RouteScoreContext {
-  riskTolerance: string;
-  reputationMap?: Map<string, number>;
-  corridorScores?: Map<string, number>;
-  commitmentReliability?: Map<string, number>;
-}
+export type RouteScoreContext = SharedRouteScoreContext;
 
-// Compute the raw (un-normalized) score for a single route. Lower = better
-// (it's a penalty). This is used for pairwise comparison where normalization
-// across a candidate set isn't available.
 export function scoreRoute(route: CandidateRoute, ctx: RouteScoreContext): number {
-  return calculateAbsoluteRouteQuality(route, ctx);
+  return sharedCalculateAbsoluteRouteQuality(candidateRouteToRouteInfo(route), ctx);
 }
-
-// ---- Absolute Route Quality (Prompt 3.3) ---------------------------------
-//
-// A STABLE cross-time route quality score that does NOT depend on the
-// candidate set. Each dimension is bounded 0..1 using absolute reference
-// points, so the same route gets the same quality score regardless of what
-// other routes exist in the marketplace at that moment.
-//
-// Used by:
-//   - advanceSearching (WAIT_FOR_BETTER re-evaluation) via shouldReplaceRoute
-//   - isBetterRoute (delegates to shouldReplaceRoute)
-//
-// NOT used by rankAndTag (which uses candidate-set-relative normalization for
-// ranking among currently available alternatives).
-
-// Absolute reference points for normalization (stable across time):
-const ABS_COST_REF = 0.01;   // 1% effective cost = penalty 1.0 (100 bps)
-const ABS_DURATION_REF = 600; // 10 minutes = penalty 1.0
 
 export function calculateAbsoluteRouteQuality(route: CandidateRoute, ctx: RouteScoreContext): number {
-  const w = weightFor(ctx.riskTolerance);
-  // Source notional = sum of all SOURCE legs. For a split route
-  // ($6,000 + $4,000), this is $10,000 — not just the first leg's $6,000.
-  // For a single-leg route, this equals legs[0].amount.
-  // For a multi-hop route, SOURCE legs still represent the initial notional.
-  const sourceNotional = route.legs
-    .filter((l) => l.role === "SOURCE")
-    .reduce((s, l) => s + l.amount.toNumber(), 0);
-  const notional = sourceNotional || route.legs[0]?.amount.toNumber() || 1;
-
-  // Bounded absolute dimensions (each 0..1, higher = worse):
-  const absCost = Math.min(1, route.effectiveCost.toNumber() / notional / ABS_COST_REF);
-  const absDur = Math.min(1, route.expectedExecutionSeconds / ABS_DURATION_REF);
-  const absRisk = Math.min(1, route.risk.composite);
-
-  // Route reputation across ALL legs (0..1, higher = better → invert for penalty).
-  const routeRep = computeRouteReputation(route, ctx);
-  const absRep = 1 - routeRep; // 0 = perfect reputation, 1 = no reputation
-
-  // Commitment reliability across ALL legs (0..1, higher = better).
-  const routeCommit = computeRouteCommitment(route, ctx);
-  const commitReduction = routeCommit * 0.2;
-
-  const adjustedRepPenalty = w.reputation * absRep * (1 - commitReduction);
-  return w.cost * absCost + w.speed * absDur + w.risk * absRisk + adjustedRepPenalty;
+  return sharedCalculateAbsoluteRouteQuality(candidateRouteToRouteInfo(route), ctx);
 }
 
-// ---- Route replacement (Prompt 3.3) --------------------------------------
-//
-// Determines whether a newly discovered route should replace the current
-// reference route during WAIT_FOR_BETTER. Uses absolute quality (not
-// candidate-set-normalized) so the comparison is stable across time.
-//
-// ROUTE_REPLACEMENT_THRESHOLD: the minimum absolute quality improvement
-// required to justify replacing the reference route. Expressed in normalized
-// quality units (0..1 scale). A value of 0.01 means the new route must be
-// at least 1% better in absolute quality terms.
-export const ROUTE_REPLACEMENT_THRESHOLD = 0.01;
+export function computeRouteReputation(route: CandidateRoute, ctx: RouteScoreContext): number {
+  return sharedComputeRouteReputation(candidateRouteToRouteInfo(route), ctx);
+}
+
+export function computeRouteCommitment(route: CandidateRoute, ctx: RouteScoreContext): number {
+  return sharedComputeRouteCommitment(candidateRouteToRouteInfo(route), ctx);
+}
+
+export const ROUTE_REPLACEMENT_THRESHOLD = SHARED_ROUTE_REPLACEMENT_THRESHOLD;
 
 export function shouldReplaceRoute(
   newRoute: CandidateRoute,
@@ -678,40 +575,7 @@ export function shouldReplaceRoute(
 ): { replace: boolean; improvement: number; reason: string } {
   if (newRoute.hardFilterRejection) return { replace: false, improvement: 0, reason: "new route rejected by hard filter" };
   if (refRoute.hardFilterRejection) return { replace: true, improvement: 1, reason: "reference route rejected" };
-
-  const refQuality = calculateAbsoluteRouteQuality(refRoute, ctx);
-  const newQuality = calculateAbsoluteRouteQuality(newRoute, ctx);
-  const improvement = refQuality - newQuality; // positive = new is better
-
-  if (improvement >= ROUTE_REPLACEMENT_THRESHOLD) {
-    return { replace: true, improvement, reason: `absolute quality improved by ${improvement.toFixed(4)} (threshold: ${ROUTE_REPLACEMENT_THRESHOLD})` };
-  }
-  return { replace: false, improvement, reason: `improvement ${improvement.toFixed(4)} below threshold ${ROUTE_REPLACEMENT_THRESHOLD}` };
-}
-
-// Compute route-level reputation across ALL material legs.
-// 70% weighted average + 30% minimum (weakest-leg penalty).
-export function computeRouteReputation(route: CandidateRoute, ctx: RouteScoreContext): number {
-  if (route.legs.length === 0) return 0.5;
-  const legScores = route.legs.map((l) => {
-    const corridorKey = `${l.providerId}:${l.sourceAsset}:${l.destinationAsset}:${l.sourceCountry}:${l.destinationCountry}`;
-    const corridorScore = ctx.corridorScores?.get(corridorKey);
-    if (corridorScore !== undefined) return corridorScore;
-    return ctx.reputationMap?.get(l.providerId) ?? 0.5;
-  });
-  const avg = legScores.reduce((s, x) => s + x, 0) / legScores.length;
-  const minScore = Math.min(...legScores);
-  return avg * 0.7 + minScore * 0.3;
-}
-
-// Compute route-level commitment reliability across ALL material legs.
-// Uses the same aggregation style as reputation: average across legs.
-export function computeRouteCommitment(route: CandidateRoute, ctx: RouteScoreContext): number {
-  if (route.legs.length === 0) return 0;
-  const legCommitments = route.legs.map((l) => {
-    return ctx.commitmentReliability?.get(l.providerId) ?? 0;
-  });
-  return legCommitments.reduce((s, x) => s + x, 0) / legCommitments.length;
+  return sharedShouldReplaceRoute(candidateRouteToRouteInfo(newRoute), candidateRouteToRouteInfo(refRoute), ctx);
 }
 
 function explainRoute(
