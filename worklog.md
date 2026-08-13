@@ -687,3 +687,23 @@ Stage Summary:
 - Dark theme, emerald accent, fully responsive, custom scrollbar styling, loading skeletons during scenarios fetch + during simulation run.
 - Pre-existing `@typescript-eslint/no-require-imports` errors in `lib/simulator/engine.ts` fixed (replaced `require()` with static ES imports). `bun run lint` now passes clean.
 - Verified end-to-end via agent-browser + VLM: scenarios fetch, config pre-fill, simulation POST 200, equilibrium badge, 12 stat cards, dual-axis chart with 4 lines, corridor table, provider leaderboard table, comparison table with green highlighting. No console/page errors. No layout overflow.
+
+---
+Task ID: P4-Simulator
+Agent: main (Z.ai Code)
+Task: Build the dRamp Network Simulator — a deterministic economic simulation engine that answers whether dRamp's market design creates sustainable incentives.
+
+Work Log:
+- Built simulation core: SeededRNG (mulberry32), SimWorld (in-memory, no production DB), SimConfig (fully configurable).
+- Built synthetic generators: 10 fiat assets/countries, 4 settlement assets (USDC/EURC/SC/WETH), heterogeneous users with log-normal transaction sizes, 7 provider strategies (aggressive/premium/liquidity maximizer/market maker/incentive seeker/conservative/opportunistic), incentive campaigns.
+- Built simulation engine: demand generation, route discovery (direct + multi-hop), risk-tolerance-weighted route selection, simulated execution with failure model, strategy-based pricing adjustments, provider entry/exit, campaign expiry, 6 shock types (liquidity/provider exit/asset depeg/incentive end/demand surge/regulatory), metrics collection with equilibrium detection (POSITIVE/FRAGILE/NEGATIVE/FORMING).
+- Built API: GET /api/simulator/scenarios (9 preset experiments), POST /api/simulator/run (full simulation with metrics, corridor analysis, provider leaderboard).
+- Built UI (via subagent): simulator panel with scenario picker, config form, results dashboard (equilibrium badge, 12 stat cards, Recharts dual-axis chart, corridor table, provider leaderboard), comparison mode.
+- Tests: tests/p4-simulator.test.ts (21 assertions) — seed reproducibility, provider growth, provider exit, liquidity shock, demand surge, incentive expiry, equilibrium detection, metrics collection. All pass.
+- All existing tests pass (collateral 23). Lint + type-check clean.
+- Pushed to GitHub (commit 7389912).
+
+Stage Summary:
+- The dRamp Network Simulator is live. It can answer: How much liquidity is required before dRamp becomes competitive? How much can a provider earn per unit of deployed liquidity? Does reputation create a useful flywheel? Is patient execution economically valuable? Can incentives bootstrap adoption? How resilient is the network to provider exit? Does the network converge toward a positive equilibrium?
+- 9 preset experiments available: Provider Growth (5→50), Largest Provider Exit, Stablecoin Incentive Bootstrap, Volatile Settlement Asset, Patient Execution Comparison, Liquidity Shock (50%), Demand Surge (5×), No Incentives (Baseline), Reputation Disabled.
+- The simulator reuses the production routing/risk/scoring logic patterns (same weight functions, same risk dimensions) without duplicating the domain services — it's an analytical layer, not a parallel engine.
