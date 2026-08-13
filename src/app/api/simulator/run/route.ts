@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { runSimulation } from "@/lib/simulator/engine";
+import { runSimulation } from "@/lib/simulator/engine-faithful";
 import { createDefaultConfig, SimConfig } from "@/lib/simulator/world";
 import { requireAdmin, isAuthed } from "@/lib/auth-guard";
 
