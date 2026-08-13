@@ -807,3 +807,30 @@ Stage Summary:
 - Incentive accounting is leg/campaign-aware: only qualifying legs receive incentives, calculated on leg amount not route netOutput.
 - Step duration calibrated to 1 minute — economically meaningful unit.
 - Simulator is READY for controlled strategic experiments.
+
+---
+Task ID: P4.5-LiquiditySettlement
+Agent: main (Z.ai Code)
+Task: Implement liquidity inventory, stochastic settlement, and demand patience. Make all new assumptions explicit in config (versioned, no silent changes). Keep all existing tests passing.
+
+Work Log:
+- Added SimLiquidityInventory (per-asset balances, separate from collateral) + SettlementReliabilityProfile (fastRate/delayedRate/retryRate/failureRate) + DEFAULT_RELIABILITY_PROFILES by provider type to world.ts.
+- Added liquidity, reliabilityProfile, settlementsFast/Delayed/Retried/Failed to SimProvider. Added settlementDurationSteps to SimOffer. Added maxAcceptablePriceBps + maxAcceptableLatencySteps to SimIntent. Added abandonedIntents + liquidityConstrainedFailures to SimMetrics.
+- Added 6 new config fields: enableLiquidityInventory, enableStochasticSettlement, enableDemandPatience, defaultMaxAcceptablePriceBps, defaultMaxAcceptableLatencySteps, liquidityReplenishSteps. All default to P4.5 active; setting to false restores P4.4 behavior.
+- Updated generator: createLiquidityInventory() gives providers per-asset cash balances (source: 20-60% of collateral, destination: 5-25% — providers hold less foreign currency). getReliabilityProfile() adds ±2% variation per provider.
+- Updated findRoutesFaithful: routing now checks destination liquidity inventory for direct AND multi-hop routes. A provider can have capacity (collateral) but insufficient local fiat — the route is rejected.
+- Updated executeIntent: (1) double-checks liquidity at execution time, (2) samples stochastic settlement outcome (FAST/DELAYED/RETRY/FAILURE) and adjusts durationSteps accordingly, (3) CONSUMES liquidity on success (payout decreases destination balance, receipt increases source balance), (4) tracks settlement outcomes per provider.
+- Updated matchAndExecute: demand patience — intents abandon if price exceeds maxAcceptablePriceBps or wait exceeds maxAcceptableLatencySteps. New status ABANDONED.
+- Added replenishLiquidity() step: providers periodically top up cash balances toward target (30% of collateral per asset).
+- Added sampleSettlementOutcome() helper using provider's reliability profile.
+- Updated collectMetrics: tracks abandonedIntents, liquidityConstrainedFailures, settlement outcomes.
+- Tests: P4 mechanics expanded to 80 assertions — liquidity inventory (per-asset balances, separate from collateral), stochastic settlement (reliability profiles, outcome tracking, banks vs agents), demand patience (price/latency limits, abandonment tracking), config versioning (all assumptions explicit, backward compatible).
+- All tests pass: P4 canonical 91, P4 simulator 21, P4 faithful 19, P4 mechanics 80. Lint clean.
+- Pushed to GitHub (commit 53d219a).
+
+Stage Summary:
+- The simulator now models the most important economic constraint in cross-border payments: liquidity inventory separate from collateral. A provider can be well-collateralized but unable to complete a payout due to insufficient local fiat.
+- Settlement is now stochastic with per-provider-type reliability profiles. Banks settle fast (98%) with low failure (0.2%); local agents are slower (85%) with higher failure (4%). Reputation now has genuine economic meaning.
+- Demand has patience: customers abandon if price or latency exceeds their limits. Congestion now causes customer loss, not just retry.
+- All new assumptions are explicitly versioned in SimConfig. P4.4 behavior can be restored by disabling the P4.5 flags.
+- The simulator is now economically realistic enough for controlled experiments. Next steps (P4.6-P4.8): FX volatility, adaptive agents, Monte Carlo stress testing.
