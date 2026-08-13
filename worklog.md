@@ -861,3 +861,32 @@ Stage Summary:
 - Liquidity is conserved: treasury → operating transfers are the only source of replenishment. No balances are created from nowhere. When treasury is depleted, providers must wait for settlement receipts.
 - FX valuation enables meaningful cross-asset comparison: $50k USD vs ₦50k are now correctly valued differently.
 - The simulator is now economically coherent: settlement timing, liquidity conservation, and FX valuation are all modeled correctly. Next steps (P4.7-P4.8): adaptive agents, Monte Carlo stress testing.
+
+---
+Task ID: P4.7-MultiHopConservation
+Agent: main (Z.ai Code)
+Task: Fix multi-hop settlement conservation. Intermediate settlement assets must be conserved (debit == credit). Per-leg async settlement (dependency chain). Upstream failure cancels downstream legs.
+
+Work Log:
+- Added SimInFlightLeg type (per-leg state: PENDING/EXECUTING/SETTLED/FAILED, startStep, completionStep, durationSteps, settlementOutcome, reservation) to world.ts.
+- Added SimSettlementTransfer type (fromProviderId, toProviderId, asset, amount, fromLegIndex, toLegIndex, settlementStep, status) to world.ts.
+- Rewrote SimInFlightExecution: now contains SimInFlightLeg[] with per-leg async state + currentLegIndex (dependency chain pointer). No single completionStep — legs settle asynchronously.
+- Added settlementTransfers array to SimWorld.
+- Rewrote processInFlightExecutions: processes legs in dependency order. PENDING legs check if upstream has settled before starting. EXECUTING legs settle when completionStep arrives. Stochastic outcome sampled when leg STARTS (not at route creation).
+- Added settleLeg(): settles one leg — consumes liquidity (source +, destination -), credits provider economics, releases reservation, records execution history, accrues incentives. Called per-leg.
+- Added createSettlementTransfer(): credits downstream provider's source-asset balance when upstream leg settles. This is the conserved transfer: upstream debited the asset in settleLeg, downstream credits it here. Debit == credit.
+- Added failExecution(): cancels downstream legs when upstream fails. Releases all reservations for EXECUTING/PENDING legs. Marks intent FAILED with "upstream settlement failure" reason.
+- Added completeExecution(): marks intent COMPLETED when all legs settle.
+- Rewrote executeIntent: creates SimInFlightLeg[] with per-leg state. Only first leg starts EXECUTING; others are PENDING. Reserves capacity only for the first leg (subsequent legs reserve when they start in processInFlightExecutions).
+- Removed old stochastic settlement sampling from executeIntent (now done in processInFlightExecutions when legs start).
+- Added 3 new conservation metrics: internalSettlementVolume (USD value of transfers), inFlightValueUsd (current in-flight value), settlementTransferCount.
+- Updated API route fallback metrics.
+- Tests: P4 mechanics expanded to 115 assertions — multi-hop asset conservation (transfer structure, conservation metrics, source code verification), per-leg async settlement (4 states, dependency chain, only first leg starts EXECUTING, upstream failure cancellation).
+- All tests pass: P4 canonical 91, P4 simulator 21, P4 faithful 19, P4 mechanics 115. Lint clean.
+- Pushed to GitHub (commit 562a0d7).
+
+Stage Summary:
+- Multi-hop settlement assets are now CONSERVED: Provider A's USDC debit == Provider B's USDC credit. No assets created from nowhere.
+- Legs settle ASYNCHRONOUSLY in dependency order: leg N+1 can only start after leg N settles. The intermediate settlement asset is transferred (conserved) before the next leg can use it.
+- Upstream failure cancels downstream legs: if leg 0 fails, legs 1+ don't settle. The execution is marked FAILED.
+- The simulator is now economically coherent for multi-hop routes. Next step: calibration experiment proving conservation invariants before strategic experiments.
