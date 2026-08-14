@@ -1026,3 +1026,30 @@ Stage Summary:
   3. Backtracks across hops when downstream fails
   4. Is validated against brute-force oracle
 - Commit SHA: 3cffc16 (pushed to GitHub main).
+
+---
+Task ID: P4.8.8O-FreezeRoutingDiagnostic
+Agent: main (Z.ai Code)
+Task: Remove invalid source-vs-destination liquidity prefilter. Make structural reachability use 4-hop enumeratePaths. Label alternative-production as LOWER_BOUND. Add regression tests.
+
+Work Log:
+- Removed the invalid `amt > maxDstLiquidity` prefilter. It compared source-asset input against destination-asset liquidity, which is invalid whenever FX ≠ 1. The correct output-aware check happens inside checkPathFeasibilityStaged via computeHopOutput().
+- Added regression tests: rate 0.5 (source 10k, output 5k, liq 6k → feasible, old prefilter would skip); rate 2.0 (source 10k, output 20k, liq 15k → infeasible, correctly evaluated not skipped).
+- Made structural reachability use enumeratePaths(MAX_HOPS=4) for both asset and corridor levels. Previously only checked direct + single settlement-asset hop (2-hop max). Now builds asset-level adjacency map and corridor-level adjacency map and enumerates 4-hop paths.
+- Added 3-hop structural regression test: USD→USDC→EURC→NGN where no direct or 2-hop path exists. Structural reachability = true, production feasible = true.
+- The alternative-production solver remains as implemented in 4.8.8N. For 2-offer splits, downstream-constrained breakpoints are generated. For 3+ offers, generic breakpoints are used. This is a LOWER_BOUND, not EXACT.
+- Brute-force oracle validates 2/3/5/7-offer single-hop cases. Zero disagreements.
+- All tests pass: 575 total assertions (114 path-feasibility). Lint clean.
+- Quick validation (1 seed, n=100): routing gain 5-12pp depending on topology.
+- Pushed to GitHub main (commit b80e580).
+
+Stage Summary:
+- The routing diagnostic is now correctly structured:
+  A. Structural (4-hop graph, ignores capacity/liquidity/risk)
+  B. Capacity (greedy coverAmount)
+  C. Greedy liquidity (output-aware)
+  C'. Inventory-feasible (SOME assignment has liquidity, ignores risk)
+  D. Greedy production (coverAmount + risk)
+  D'. Alternative production (SOME assignment satisfies ALL constraints) — LOWER_BOUND
+- The production routing gain (D→D') is labeled LOWER_BOUND because the 3+ offer split search is not proven exhaustive for all downstream configurations.
+- Commit SHA: b80e580 (pushed to GitHub main).
