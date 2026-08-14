@@ -910,3 +910,54 @@ Stage Summary:
 - Downstream failure recovery: if leg 2 fails after leg 1 settled, the USDC transfer is reversed — Provider B returns it to Provider A. No stranded assets.
 - Offer version is no longer incremented on reservation (semantic cleanup).
 - The simulator is now economically coherent: settlement assets are conserved across multi-hop routes, with numeric balance verification.
+
+---
+Task ID: P4.8.8-ProductionFaithfulPathReachability
+Agent: main (Z.ai Code)
+Task: Extract computeHopOutput/coverAmount/enumeratePaths into shared.ts. Implement production-faithful route feasibility in the experiment (maxHops=4, split-capacity, hop propagation, risk ceilings, liquidity). Add route-composition metrics. Add regression tests. Rerun the 20-seed topology experiment.
+
+Work Log:
+- Extracted three canonical functions into src/lib/economics/shared.ts (sections 17-19):
+  - computeHopOutput(inputAmount, {feeBps, rate, incentiveBps}) → {output, fee, incentive}. Pure-number formula: fee = amt*feeBps/10000; afterFee = amt-fee; converted = afterFee*rate; incentive = converted*incentiveBps/10000; output = converted+incentive.
+  - coverAmount(offers[], amount) → {assignments, split} | null. Tries single offer first (avail-reserved >= amount AND amount >= min), then splits greedily across sorted offers (AUTOMATIC first, lower fee, higher capacity). Returns null if combined capacity insufficient.
+  - enumeratePaths(adj, source, dest, maxHops) → PathStep[][]. Generic DFS simple-path enumeration with visited-set, parallel-edge grouping. Preserves production's exact behavior.
+- Refactored production routing.ts to delegate all three functions to shared:
+  - computeHopOutput: converts Decimal→number, calls shared, converts back to Decimal.
+  - coverAmount: converts AdjEdge[]→CoverOffer[], calls shared, maps offerId back to AdjEdge.
+  - enumeratePaths: converts Map<string,AdjEdge[]>→Map<string,AdjacencyEdge<AdjEdge>[]>, calls shared.
+  - Removed now-unused money imports (moneySub, moneyGte, moneyLte, moneyGt, moneyLt, moneyMin, moneyMax, feeForAmount, incentiveForAmount). Kept moneyAdd, moneyMul, bpsToFactor (still used in buildCandidateRoute).
+  - type PathStep = SharedPathStep<AdjEdge> (alias to shared's generic type).
+  - All 91 canonical tests pass — production behavior preserved.
+- Implemented production-faithful route feasibility in the experiment:
+  - checkPathFeasibility(path, amount, riskTolerance, world, saRiskCache, cpRiskCache): mirrors production buildCandidateRoute + applyHardFilters + execution-time liquidity check. For each hop: coverAmount (split-capacity), computeHopOutput (hop propagation), provider status, min/max, destination liquidity, settlement-asset risk ceiling (per user's ACTUAL riskTolerance), counterparty risk ceiling. Returns {liqFeasible, prodFeasible, split} | null.
+  - extractMetrics now builds an adjacency map from active offers, enumerates paths (maxHops=4), and checks each demand against all paths using checkPathFeasibility.
+  - Tiered evaluation: group paths by hop count (1-hop, 2-hop, 3+4-hop), check shortest first, stop each tier at first feasible path. "total" mode stops at first prod-feasible path; "full" mode checks all tiers for breakdown.
+  - Route-composition metrics: directReachablePct (1-hop single), splitDirectReachablePct (1-hop split), twoHopReachablePct, threePlusHopReachablePct, productionExecutableReachabilityPct (total).
+  - Demand sampling: 8 samples per corridor (full mode), 4 (total mode), evenly spaced by amount.
+  - Path cache: buildPathCache(world) enumerates all paths ONCE per run, reused across all 6 extractMetrics calls (graph structure doesn't change — no providers exit).
+  - Per-tier path limit: 15 paths per hop-count tier.
+  - Destination-liquidity pre-filter: skip demands where amount > max destination-asset liquidity across all active providers.
+  - Import guard: experiment only runs when executed directly (pathToFileURL check), not when imported by tests.
+- Removed local duplicate hopOutput() function from the experiment.
+- Updated RunMetrics interface with 4 new fields (directReachablePct, splitDirectReachablePct, twoHopReachablePct, threePlusHopReachablePct).
+- Updated printResults with Table A2 (Route Composition) and expanded Conclusion section.
+- Tests: 59 new assertions in tests/p4-path-feasibility.test.ts:
+  - computeHopOutput identity: shared (number) == old production (Decimal) formula, 5 test cases (varied amounts, fees, rates, incentives).
+  - coverAmount split-capacity: 6k+4k satisfies 10k (split=true, 2 assignments); single offer; insufficient combined capacity; reserved capacity.
+  - enumeratePaths: discovers 1-hop, 2-hop, 3-hop, 4-hop paths; maxHops=2 excludes 3+4-hop; no-path returns empty.
+  - checkPathFeasibility: 3-hop bridge reachable (USD→USDC→EURC→NGN); 4-hop path reachable (USD→USDC→EURC→GBP→NGN); per-user risk tolerance (MAX_RELIABILITY rejects risky provider, LOWEST_COST accepts); split direct classification (6k+4k for 10k = split, 6k for 5k = single); liquidity failure (no destination balance → infeasible).
+- Integrity test expanded to 47 assertions (was 27): added checks for shared imports, no duplicate formula, MAX_HOPS=4, route-composition metrics, risk caches, import guard, production routing delegation.
+- All tests pass: P4.2 Canonical 91, P4.8.8 Integrity 47, P4.7.1 Mechanics 124, P4.7.4 Reconciliation 10, P4.7.2 Conservation 14, P4.1 Faithful 19, P4 Simulator 21, P4.8.8 Path Feasibility 59, P4.7.2A Calibration 88, P4.8 Density 42. Total: 515 assertions. Lint clean.
+- Reran the full 20-seed topology experiment (300 runs).
+
+Stage Summary:
+- The experiment now answers the SAME routing question as the actual dRamp engine: "Given the exact same demand, can the actual dRamp routing engine assemble sufficient liquidity across providers and hops to execute it?"
+- One canonical economics layer: computeHopOutput, coverAmount, enumeratePaths all live in shared.ts. Production and experiment import the same functions. No duplicate formula.
+- Key experiment finding: LIQUIDITY IS THE DOMINANT BOTTLENECK, not topology or provider count.
+  - Graph reachability (asset/corridor) at 100 providers: 94-100% — the graph structure is NOT the bottleneck.
+  - Production-executable reachability at 100 providers: 2-5% — the gap is almost entirely liquidity (providers lack destination-asset balances).
+  - Split direct: 0% everywhere — individual provider capacity is sufficient for feasible demands; fragmentation is NOT the issue.
+  - Completion: 22-46% (higher than prod-exec because intent generation favors small amounts which are easier to route, while prod-exec samples evenly by amount including large hard-to-serve amounts).
+  - BRIDGED multi-hop share: 37% — bridge topology creates 2-hop routes that the simulator actually uses.
+- The strategic conclusion: adding more providers or changing topology has diminishing returns once graph reachability is high (~100 providers). The binding constraint is liquidity inventory — providers need to hold more destination-asset balances to actually execute transfers.
+- Pushed to GitHub (commit e9fcd36).
