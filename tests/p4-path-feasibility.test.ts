@@ -34,7 +34,7 @@ async function main() {
   console.log("dRamp P4.8.8 — Production-Faithful Path Reachability Tests");
 
   const Decimal = (await import("decimal.js")).default;
-  const { computeHopOutput, coverAmount, enumeratePaths, settlementAssetRisk, providerCounterpartyRisk } = await import("../src/lib/economics/shared");
+  const { computeHopOutput, coverAmount, enumeratePaths, settlementAssetRisk, providerCounterpartyRisk, counterpartyRiskCeiling } = await import("../src/lib/economics/shared");
   const { createWorld, createDefaultConfig } = await import("../src/lib/simulator/world");
   const { checkPathFeasibility, toProductionCapacity, productionUsable } = await import("../experiments/p4-topology-experiment");
   type SimOffer = import("../src/lib/simulator/world").SimOffer;
@@ -513,8 +513,160 @@ async function main() {
     assert(productionUsable(prodCap) === 10000, "No reservations: usable = 10000 (no double-subtraction possible)");
   }
 
+  // =========================================================================
+  // 10. (4.8.8N) Downstream-constrained 5k/5k split regression
+  // =========================================================================
+  console.log("\n== 10. Downstream-constrained 5k/5k split (4.8.8N) ==");
+
+  const { checkPathFeasibilityStaged, checkAlternativeProductionFeasibility } = await import("../experiments/p4-topology-experiment");
+
+  // The critical counterexample: demand 10k, hop 1 has A (mult 2.0) and B (mult 1.0).
+  // Hop 2 requires exactly 15k input (min=max=15k). Only A=5k, B=5k works:
+  //   output = 5k*2.0 + 5k*1.0 = 15k ✓
+  // Old breakpoint solver didn't generate 5k as a candidate for A.
+  {
+    const pA = makeProvider("pA", "COLLATERALIZED", "BANK", 0.9, { USDC: 100000 });
+    const pB = makeProvider("pB", "COLLATERALIZED", "BANK", 0.9, { USDC: 100000 });
+    const pZ = makeProvider("pZ", "COLLATERALIZED", "BANK", 0.9, { NGN: 15000 });
+    // Hop 1: A (rate 2.0, fee 0), B (rate 1.0, fee 0)
+    const oA = makeOffer("oA", "pA", "USD", "US", "USDC", "GLOBAL", 2.0, 0, 10000, "asset_usdc");
+    const oB = makeOffer("oB", "pB", "USD", "US", "USDC", "GLOBAL", 1.0, 0, 10000, "asset_usdc");
+    // Hop 2: min=max=15k, capacity=15k, liq=15k, rate=1.0
+    const oZ = makeOffer("oZ", "pZ", "USDC", "GLOBAL", "NGN", "NG", 1.0, 0, 15000, "asset_usdc");
+    oZ.minimumAmount = 15000;
+    oZ.maximumAmount = 15000;
+    const world = buildTestWorld([pA, pB, pZ], [oA, oB, oZ], [stableAsset]);
+    const { sa, cp } = buildRiskCaches(world);
+    const adj = new Map<string, { to: string; edge: SimOffer }[]>();
+    for (const o of [oA, oB, oZ]) {
+      const from = `${o.sourceAsset}:${o.sourceCountry}`;
+      const to = `${o.destinationAsset}:${o.destinationCountry}`;
+      if (!adj.has(from)) adj.set(from, []);
+      adj.get(from)!.push({ to, edge: o });
+    }
+    const paths = enumeratePaths(adj, "USD:US", "NGN:NG", 4);
+    const twoHop = paths.filter((p: any) => p.length === 2);
+    assert(twoHop.length > 0, "5k/5k: 2-hop path discovered");
+
+    // Greedy: coverAmount picks by fee (both 0), then capacity (both 10k). Picks first.
+    // If it picks A entirely: A=10k → output 20k → hop2 min=15k, max=15k → 20k > 15k → FAIL.
+    // If it picks B entirely: B=10k → output 10k → hop2 min=15k → 10k < 15k → FAIL.
+    // Greedy split: A=10k, B=0 → output 20k → FAIL. Or A=0, B=10k → output 10k → FAIL.
+    // Only A=5k, B=5k → output 15k → PASS.
+    const staged = checkPathFeasibilityStaged(twoHop[0], 10000, "BALANCED", world, sa, cp);
+    assert(staged !== null, "5k/5k: structurally feasible");
+    assert(staged!.productionFeasible === false, "5k/5k: greedy production INFEASIBLE (coverAmount doesn't find 5k/5k)");
+    assert(staged!.alternativeProductionFeasible === true, "5k/5k: alternative production FEASIBLE (downstream-aware search finds 5k/5k split)");
+
+    // Also verify directly.
+    const altResult = checkAlternativeProductionFeasibility(twoHop[0], 10000, "BALANCED", world, sa, cp);
+    assert(altResult === true, "5k/5k: checkAlternativeProductionFeasibility returns true");
+  }
+
+  // (4.8.8N) Brute-force oracle: fine-grained enumeration for small graphs.
+  // Tests 2/3/5/7 offers with multiple demand amounts.
+  {
+    // Helper: brute-force oracle that tries fine-grained allocation amounts.
+    function bruteForceAlternative(
+      offers: { offer: SimOffer; provider: any }[],
+      amount: number,
+      riskTolerance: string,
+      world: any,
+      saRiskCache: Map<string, number>,
+      cpRiskCache: Map<string, number>,
+    ): boolean {
+      // Try all single offers.
+      for (const { offer, provider } of offers) {
+        if (provider.status !== "ACTIVE") continue;
+        if (cpRiskCache.get(provider.id)! > counterpartyRiskCeiling(riskTolerance)) continue;
+        const outMult = (1 - offer.feeBps / 10000) * offer.rate;
+        const liq = provider.liquidity.balances.get(offer.destinationAsset) ?? 0;
+        const maxV = Math.min(offer.availableCapacity, liq / outMult, offer.maximumAmount);
+        if (amount <= maxV && amount >= offer.minimumAmount) {
+          const h = computeHopOutput(amount, { feeBps: offer.feeBps, rate: offer.rate, incentiveBps: 0 });
+          if (liq >= h.output) return true;
+        }
+      }
+      // Try all pairs with fine-grained breakpoints.
+      const step = Math.max(1, Math.floor(amount / 100)); // 1% granularity
+      for (let i = 0; i < offers.length; i++) {
+        for (let j = i + 1; j < offers.length; j++) {
+          const { offer: o1, provider: p1 } = offers[i];
+          const { offer: o2, provider: p2 } = offers[j];
+          if (p1.status !== "ACTIVE" || p2.status !== "ACTIVE") continue;
+          if (cpRiskCache.get(p1.id)! > counterpartyRiskCeiling(riskTolerance)) continue;
+          if (cpRiskCache.get(p2.id)! > counterpartyRiskCeiling(riskTolerance)) continue;
+          const liq1 = p1.liquidity.balances.get(o1.destinationAsset) ?? 0;
+          const liq2 = p2.liquidity.balances.get(o2.destinationAsset) ?? 0;
+          const outMult1 = (1 - o1.feeBps / 10000) * o1.rate;
+          const outMult2 = (1 - o2.feeBps / 10000) * o2.rate;
+          const maxV1 = Math.min(o1.availableCapacity, liq1 / outMult1, o1.maximumAmount);
+          const maxV2 = Math.min(o2.availableCapacity, liq2 / outMult2, o2.maximumAmount);
+          // Try fine-grained amounts.
+          for (let take1 = o1.minimumAmount; take1 <= Math.min(amount, maxV1); take1 += step) {
+            const rem = amount - take1;
+            if (rem < o2.minimumAmount || rem > maxV2) continue;
+            const h1 = computeHopOutput(take1, { feeBps: o1.feeBps, rate: o1.rate, incentiveBps: 0 });
+            const h2 = computeHopOutput(rem, { feeBps: o2.feeBps, rate: o2.rate, incentiveBps: 0 });
+            if (liq1 >= h1.output && liq2 >= h2.output) return true;
+          }
+        }
+      }
+      // Try all triples with sum check.
+      for (let i = 0; i < offers.length; i++) {
+        for (let j = i + 1; j < offers.length; j++) {
+          for (let k = j + 1; k < offers.length; k++) {
+            const os = [offers[i].offer, offers[j].offer, offers[k].offer];
+            const ps = [offers[i].provider, offers[j].provider, offers[k].provider];
+            if (ps.some((p) => p.status !== "ACTIVE")) continue;
+            if (ps.some((p) => cpRiskCache.get(p.id)! > counterpartyRiskCeiling(riskTolerance))) continue;
+            const maxVs = os.map((o, idx) => {
+              const liq = ps[idx].liquidity.balances.get(o.destinationAsset) ?? 0;
+              return Math.min(o.availableCapacity, liq / ((1 - o.feeBps / 10000) * o.rate), o.maximumAmount);
+            });
+            const sumMax = maxVs.reduce((s, v) => s + v, 0);
+            const sumMin = os.reduce((s, o) => s + o.minimumAmount, 0);
+            if (sumMax >= amount && sumMin <= amount) return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    // Test with 2, 3, 5, 7 offers.
+    for (const numOffers of [2, 3, 5, 7]) {
+      const providers: any[] = [];
+      const offers: any[] = [];
+      for (let i = 0; i < numOffers; i++) {
+        const rate = 0.8 + i * 0.15;
+        const liq = i === 0 ? 0 : (i * 8000 + 3000); // first offer has no liquidity
+        const trust = i % 4 === 3 ? "NON_CUSTODIAL" : "COLLATERALIZED";
+        const pType = i % 4 === 3 ? "DEX" : "BANK";
+        const rep = i % 4 === 3 ? 0.3 : 0.9;
+        const p = makeProvider(`bf${i}`, trust, pType, rep, { NGN: liq });
+        const o = makeOffer(`bf_o${i}`, `bf${i}`, "USD", "US", "NGN", "NG", rate, 5 + i * 3, 5000, "asset_usdc");
+        providers.push(p); offers.push(o);
+      }
+      const world = buildTestWorld(providers, offers, [stableAsset]);
+      const { sa, cp } = buildRiskCaches(world);
+      const path: { fromNode: string; toNode: string; edges: SimOffer[] }[] = [{
+        fromNode: "USD:US", toNode: "NGN:NG", edges: offers,
+      }];
+
+      for (const amt of [500, 1000, 3000, 5000, 8000, 10000]) {
+        const staged = checkPathFeasibilityStaged(path, amt, "BALANCED", world, sa, cp);
+        const altResult = staged?.alternativeProductionFeasible ?? false;
+        const bruteForce = bruteForceAlternative(
+          offers.map((o, i) => ({ offer: o, provider: providers[i] })),
+          amt, "BALANCED", world, sa, cp,
+        );
+        assert(altResult === bruteForce, `Oracle (${numOffers} offers, amt=${amt}): alternative (${altResult}) == brute force (${bruteForce})`);
+      }
+    }
+  }
+
   console.log(`\n========================================`);
-  console.log(`  P4.8.8A Path Feasibility: Passed: ${passed}  |  Failed: ${failed}`);
+  console.log(`  P4.8.8N Path Feasibility: Passed: ${passed}  |  Failed: ${failed}`);
   console.log(`========================================`);
   if (failed > 0) {
     console.log("\nFailures:");

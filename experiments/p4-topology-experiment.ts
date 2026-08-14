@@ -419,6 +419,406 @@ export interface PathFeasibility {
   split: boolean;
 }
 
+// (Prompt 4.8.8N) Staged feasibility with downstream-aware alternative search.
+export interface StagedFeasibility {
+  capacityFeasible: boolean;    // B: coverAmount succeeds
+  liquidityFeasible: boolean;   // C: + destination liquidity (output-aware, greedy coverAmount)
+  productionFeasible: boolean;  // D: + risk ceilings + min/max + provider status (greedy)
+  split: boolean;
+  failureReason: "none" | "capacity" | "liquidity" | "minMax" | "providerStatus" | "risk" | "providerMissing";
+  inventoryFeasible: boolean;            // C': SOME assignment has liquidity (ignores risk)
+  alternativeProductionFeasible: boolean; // D': SOME assignment satisfies ALL constraints
+}
+
+// (Prompt 4.8.8N) Check if there exists ANY assignment across parallel offers
+// that satisfies ALL production constraints, using downstream-aware search.
+// This is the true alternative-production feasibility — the upper bound on
+// what inventory-aware routing could achieve.
+//
+// The search uses breakpoint-based allocation with downstream propagation:
+// for each candidate split on hop N, the actual output is computed and passed
+// to hop N+1. If downstream fails, backtrack and try a different split.
+//
+// Breakpoints are derived from economically meaningful values:
+//   0, minimumAmount, maxViable, remaining, and downstream-constrained amounts.
+//
+// Downstream-constrained breakpoints: for multi-hop paths, the amount allocated
+// to offer X on hop N affects the total hop output, which must be feasible for
+// hop N+1. The critical breakpoints are where the total output crosses
+// downstream min/max/liquidity thresholds.
+export function checkAlternativeProductionFeasibility(
+  path: PathStep<SimOffer>[],
+  amount: number,
+  riskTolerance: string,
+  world: SimWorld,
+  saRiskCache: Map<string, number>,
+  cpRiskCache: Map<string, number>,
+): boolean {
+  // Precompute offer info for each hop.
+  const hopInfos = path.map((step) => {
+    return step.edges
+      .map((o) => {
+        const prodCap = toProductionCapacity({
+          availableCapacity: o.availableCapacity,
+          reservedCapacity: o.reservedCapacity,
+        });
+        const usableCap = prodCap.availableCapacity - prodCap.reservedCapacity;
+        const provider = world.providers.get(o.providerId);
+        const dstLiquidity = provider?.liquidity?.balances?.get(o.destinationAsset) ?? 0;
+        let riskOK = true;
+        if (provider && provider.status === "ACTIVE") {
+          if (o.settlementAssetId) {
+            const saRisk = saRiskCache.get(o.settlementAssetId);
+            if (saRisk !== undefined && saRisk > assetRiskCeiling(riskTolerance)) riskOK = false;
+          }
+          const cpRisk = cpRiskCache.get(provider.id);
+          if (cpRisk !== undefined && cpRisk > counterpartyRiskCeiling(riskTolerance)) riskOK = false;
+        }
+        const outputMultiplier = (1 - o.feeBps / 10000) * o.rate * (1 + (o.incentiveBps ?? 0) / 10000);
+        const liquidityLimit = outputMultiplier > 0 ? dstLiquidity / outputMultiplier : 0;
+        const maxViable = Math.min(usableCap, liquidityLimit, o.maximumAmount);
+        return {
+          offer: o, provider, usableCap, dstLiquidity, liquidityLimit, maxViable,
+          outputMultiplier, minimumAmount: o.minimumAmount, maximumAmount: o.maximumAmount,
+          feeBps: o.feeBps, rate: o.rate, incentiveBps: o.incentiveBps ?? 0,
+          statusOK: provider?.status === "ACTIVE", riskOK,
+        };
+      })
+      .filter((x) => x.provider && x.statusOK && x.usableCap > 0 && x.riskOK && x.maxViable >= x.minimumAmount);
+  });
+
+  // Compute downstream constraints for breakpoint generation.
+  // For hop i, the downstream min/max are the minimum/maximum amounts that
+  // hop i+1 can accept. If hop i+1 has offers with min=15k, then hop i's
+  // total output must be ≥ 15k.
+  function getDownstreamMin(i: number): number {
+    if (i + 1 >= hopInfos.length) return 0;
+    const nextOffers = hopInfos[i + 1];
+    if (nextOffers.length === 0) return 0;
+    // The minimum total output from hop i that could be feasible downstream
+    // is the minimum amount of any single offer on hop i+1.
+    return Math.min(...nextOffers.map((x) => x.minimumAmount));
+  }
+
+  function getDownstreamMax(i: number): number {
+    if (i + 1 >= hopInfos.length) return Infinity;
+    const nextOffers = hopInfos[i + 1];
+    if (nextOffers.length === 0) return 0;
+    // The maximum total output from hop i that could be feasible downstream
+    // is the sum of all maxViable on hop i+1.
+    return nextOffers.reduce((s, x) => s + x.maxViable, 0);
+  }
+
+  // Generate candidate allocation amounts for an offer, including
+  // downstream-constrained breakpoints.
+  function getCandidateAmounts(
+    offerIdx: number,
+    hopIdx: number,
+    remaining: number,
+    offers: typeof hopInfos[number],
+  ): number[] {
+    const x = offers[offerIdx];
+    const candidates = new Set<number>();
+
+    // 0: skip
+    candidates.add(0);
+
+    // minimumAmount
+    if (x.minimumAmount <= x.maxViable && x.minimumAmount <= remaining) {
+      candidates.add(x.minimumAmount);
+    }
+
+    // maxViable (capped at remaining)
+    const maxTake = Math.min(remaining, x.maxViable);
+    if (maxTake >= x.minimumAmount) {
+      candidates.add(maxTake);
+    }
+
+    // remaining (if ≤ maxViable)
+    if (remaining <= x.maxViable && remaining >= x.minimumAmount) {
+      candidates.add(remaining);
+    }
+
+    // Downstream-constrained breakpoints:
+    // The total hop output = Σ(alloc_j * outputMultiplier_j).
+    // If this offer has outputMultiplier m_j and takes amount a_j,
+    // and other offers take amounts that sum to S_input with outputMultiplier M_avg,
+    // then total output ≈ a_j * m_j + (remaining - a_j) * M_avg_other.
+    //
+    // For 2-offer splits (the most common case), this is exact:
+    // total_output = a * m_a + (remaining - a) * m_b
+    // We need total_output ∈ [downstreamMin, downstreamMax].
+    // So: a * m_a + (remaining - a) * m_b >= downstreamMin
+    //     a * (m_a - m_b) >= downstreamMin - remaining * m_b
+    //     a >= (downstreamMin - remaining * m_b) / (m_a - m_b)  [if m_a > m_b]
+    //     a <= (downstreamMax - remaining * m_b) / (m_a - m_b)  [if m_a < m_b]
+    const dsMin = getDownstreamMin(hopIdx);
+    const dsMax = getDownstreamMax(hopIdx);
+
+    if (offers.length === 2 && offerIdx === 0) {
+      const other = offers[1];
+      const mA = x.outputMultiplier;
+      const mB = other.outputMultiplier;
+      if (mA !== mB) {
+        // a * mA + (remaining - a) * mB >= dsMin
+        // a >= (dsMin - remaining * mB) / (mA - mB)
+        const denom = mA - mB;
+        if (Math.abs(denom) > 1e-12) {
+          const aMin = (dsMin - remaining * mB) / denom;
+          if (aMin >= x.minimumAmount && aMin <= maxTake && aMin > 0) {
+            candidates.add(aMin);
+          }
+          const aMax = (dsMax - remaining * mB) / denom;
+          if (aMax >= x.minimumAmount && aMax <= maxTake && aMax > 0) {
+            candidates.add(aMax);
+          }
+        }
+      }
+    }
+
+    // remaining - maxViable_of_next_offer
+    if (offerIdx + 1 < offers.length) {
+      const nextMax = offers[offerIdx + 1].maxViable;
+      const needed = remaining - nextMax;
+      if (needed >= x.minimumAmount && needed <= x.maxViable && needed > 0) {
+        candidates.add(needed);
+      }
+      // remaining - sum of ALL remaining offers' maxViable
+      let sumRestMax = 0;
+      for (let j = offerIdx + 1; j < offers.length; j++) sumRestMax += offers[j].maxViable;
+      const minNeeded = remaining - sumRestMax;
+      if (minNeeded >= x.minimumAmount && minNeeded <= x.maxViable && minNeeded > 0) {
+        candidates.add(minNeeded);
+      }
+    }
+
+    // Filter to valid range and return sorted.
+    return [...candidates]
+      .filter((a) => a >= 0 && a <= remaining + 1e-9 && (a === 0 || (a >= x.minimumAmount && a <= x.maxViable)))
+      .sort((a, b) => b - a); // try larger amounts first (more likely to cover remaining)
+  }
+
+  // Recursive split enumeration with downstream backtracking.
+  // (Prompt 4.8.8N) CRITICAL FIX: enumerateSplits must try ALL candidate
+  // amounts and return multiple possible outputs, not just the first one.
+  // The caller (tryHop) then tries each output downstream and backtracks
+  // if it fails. This is what makes the search downstream-aware.
+  function enumerateSplits(
+    hopIdx: number,
+    offerIdx: number,
+    remaining: number,
+    outputSoFar: number,
+  ): { output: number }[] {
+    if (remaining <= 0.000001) return [{ output: outputSoFar }];
+    if (offerIdx >= hopInfos[hopIdx].length) return [];
+
+    const offers = hopInfos[hopIdx];
+    const candidates = getCandidateAmounts(offerIdx, hopIdx, remaining, offers);
+    const results: { output: number }[] = [];
+
+    for (const amt of candidates) {
+      const actualAmt = Math.min(amt, remaining);
+      if (actualAmt < 0.000001) {
+        // Skip this offer, try next.
+        const subResults = enumerateSplits(hopIdx, offerIdx + 1, remaining, outputSoFar);
+        results.push(...subResults);
+        continue;
+      }
+      const x = offers[offerIdx];
+      if (actualAmt < x.minimumAmount) continue;
+      if (actualAmt > x.maxViable) continue;
+      const hopResult = computeHopOutput(actualAmt, {
+        feeBps: x.feeBps, rate: x.rate, incentiveBps: x.incentiveBps,
+      });
+      if (x.dstLiquidity < hopResult.output) continue;
+      const subResults = enumerateSplits(hopIdx, offerIdx + 1, remaining - actualAmt, outputSoFar + hopResult.output);
+      results.push(...subResults);
+    }
+
+    return results;
+  }
+
+  // Try each single offer, then split search, with hop backtracking.
+  function tryHop(i: number, currentAmount: number): boolean {
+    if (i >= path.length) return true;
+    const offers = hopInfos[i];
+    if (offers.length === 0) return false;
+
+    // Strategy 1: single-offer assignments (backtrack across hops).
+    for (let idx = 0; idx < offers.length; idx++) {
+      const x = offers[idx];
+      if (x.maxViable >= currentAmount && currentAmount >= x.minimumAmount && currentAmount <= x.maximumAmount) {
+        const hopResult = computeHopOutput(currentAmount, {
+          feeBps: x.feeBps, rate: x.rate, incentiveBps: x.incentiveBps,
+        });
+        if (x.dstLiquidity >= hopResult.output) {
+          if (tryHop(i + 1, hopResult.output)) return true;
+        }
+      }
+    }
+
+    // Strategy 2: downstream-aware split search.
+    // (Prompt 4.8.8N) Try ALL possible split outputs, not just the first.
+    const splitResults = enumerateSplits(i, 0, currentAmount, 0);
+    for (const splitResult of splitResults) {
+      if (tryHop(i + 1, splitResult.output)) return true;
+    }
+
+    return false;
+  }
+
+  return tryHop(0, amount);
+}
+
+// (Prompt 4.8.8I) Inventory-feasibility check (liquidity only, no risk).
+export function checkInventoryFeasibility(
+  path: PathStep<SimOffer>[],
+  amount: number,
+  world: SimWorld,
+): boolean {
+  function tryHop(i: number, currentAmount: number): boolean {
+    if (i >= path.length) return true;
+    const step = path[i];
+    const offersWithLiquidity = step.edges
+      .map((o) => {
+        const prodCap = toProductionCapacity({ availableCapacity: o.availableCapacity, reservedCapacity: o.reservedCapacity });
+        const usableCap = prodCap.availableCapacity - prodCap.reservedCapacity;
+        const provider = world.providers.get(o.providerId);
+        const dstLiquidity = provider?.liquidity?.balances?.get(o.destinationAsset) ?? 0;
+        return { offer: o, provider, usableCap, dstLiquidity, minimumAmount: o.minimumAmount };
+      })
+      .filter((x) => x.provider && x.provider.status === "ACTIVE" && x.usableCap > 0);
+
+    for (const x of offersWithLiquidity) {
+      if (x.usableCap >= currentAmount && currentAmount >= x.minimumAmount) {
+        const hopResult = computeHopOutput(currentAmount, {
+          feeBps: x.offer.feeBps, rate: x.offer.rate, incentiveBps: x.offer.incentiveBps ?? 0,
+        });
+        if (x.dstLiquidity >= hopResult.output) {
+          if (tryHop(i + 1, hopResult.output)) return true;
+        }
+      }
+    }
+
+    // Greedy liquidity-aware split.
+    const sorted = [...offersWithLiquidity].sort((a, b) => b.dstLiquidity / (b.usableCap + 1) - a.dstLiquidity / (a.usableCap + 1));
+    let remaining = currentAmount;
+    let splitOutput = 0;
+    for (const x of sorted) {
+      if (remaining <= 0) break;
+      const take = Math.min(remaining, x.usableCap);
+      if (take < x.minimumAmount) continue;
+      const hopResult = computeHopOutput(take, { feeBps: x.offer.feeBps, rate: x.offer.rate, incentiveBps: x.offer.incentiveBps ?? 0 });
+      if (x.dstLiquidity >= hopResult.output) {
+        remaining -= take;
+        splitOutput += hopResult.output;
+      }
+    }
+    if (remaining <= 0) return tryHop(i + 1, splitOutput);
+    return false;
+  }
+  return tryHop(0, amount);
+}
+
+// (Prompt 4.8.8F-M) Staged feasibility check.
+export function checkPathFeasibilityStaged(
+  path: PathStep<SimOffer>[],
+  amount: number,
+  riskTolerance: string,
+  world: SimWorld,
+  saRiskCache: Map<string, number>,
+  cpRiskCache: Map<string, number>,
+): StagedFeasibility | null {
+  let currentAmount = amount;
+  let split = false;
+  let capacityOK = true;
+  let liquidityOK = true;
+  let productionOK = true;
+  let failureReason: StagedFeasibility["failureReason"] = "none";
+
+  for (let i = 0; i < path.length; i++) {
+    const step = path[i];
+    const coverOffers: CoverOffer[] = step.edges.map((o) => {
+      const prodCap = toProductionCapacity({ availableCapacity: o.availableCapacity, reservedCapacity: o.reservedCapacity });
+      return {
+        id: o.id, channelType: o.channelType, feeBps: o.feeBps,
+        availableCapacity: prodCap.availableCapacity, reservedCapacity: prodCap.reservedCapacity,
+        minimumAmount: o.minimumAmount,
+      };
+    });
+
+    const cover = coverAmount(coverOffers, currentAmount);
+    if (!cover) {
+      // (Prompt 4.8.8N) coverAmount failure means greedy capacity assignment
+      // failed. This does NOT mean the path is structurally infeasible —
+      // an alternative assignment might succeed. Return a staged result
+      // with capacityFeasible=false but still check alternative production.
+      return {
+        capacityFeasible: false,
+        liquidityFeasible: false,
+        productionFeasible: false,
+        split: false,
+        failureReason: "capacity",
+        inventoryFeasible: checkInventoryFeasibility(path, amount, world),
+        alternativeProductionFeasible: checkAlternativeProductionFeasibility(path, amount, riskTolerance, world, saRiskCache, cpRiskCache),
+      };
+    }
+    if (cover.split) split = true;
+
+    let hopOutputTotal = 0;
+    for (const a of cover.assignments) {
+      const offer = step.edges.find((e) => e.id === a.offerId);
+      if (!offer) return null;
+      const provider = world.providers.get(offer.providerId);
+
+      if (!provider) {
+        productionOK = false; liquidityOK = false;
+        failureReason = "providerMissing";
+        return { capacityFeasible: capacityOK, liquidityFeasible: liquidityOK, productionFeasible: productionOK, split, failureReason, inventoryFeasible: false, alternativeProductionFeasible: false };
+      }
+      if (provider.status !== "ACTIVE") {
+        productionOK = false;
+        if (failureReason === "none") failureReason = "providerStatus";
+      }
+      if (a.amount < offer.minimumAmount || a.amount > offer.maximumAmount) {
+        productionOK = false;
+        if (failureReason === "none") failureReason = "minMax";
+      }
+
+      // (4.8.8B) Output-aware liquidity check.
+      const hopResult = computeHopOutput(a.amount, {
+        feeBps: offer.feeBps, rate: offer.rate, incentiveBps: offer.incentiveBps ?? 0,
+      });
+      const requiredDstLiquidity = hopResult.output;
+      const dstLiquidity = provider.liquidity.balances.get(offer.destinationAsset) ?? 0;
+      if (dstLiquidity < requiredDstLiquidity) {
+        liquidityOK = false; productionOK = false;
+        if (failureReason === "none") failureReason = "liquidity";
+      }
+
+      if (offer.settlementAssetId) {
+        const saRisk = saRiskCache.get(offer.settlementAssetId);
+        if (saRisk !== undefined && saRisk > assetRiskCeiling(riskTolerance)) {
+          productionOK = false;
+          if (failureReason === "none") failureReason = "risk";
+        }
+      }
+      const cpRisk = cpRiskCache.get(provider.id);
+      if (cpRisk !== undefined && cpRisk > counterpartyRiskCeiling(riskTolerance)) {
+        productionOK = false;
+        if (failureReason === "none") failureReason = "risk";
+      }
+      hopOutputTotal += hopResult.output;
+    }
+    currentAmount = hopOutputTotal;
+  }
+
+  const inventoryFeasible = liquidityOK ? true : checkInventoryFeasibility(path, amount, world);
+  const alternativeProductionFeasible = productionOK ? true : checkAlternativeProductionFeasibility(path, amount, riskTolerance, world, saRiskCache, cpRiskCache);
+
+  return { capacityFeasible: capacityOK, liquidityFeasible: liquidityOK, productionFeasible: productionOK, split, failureReason, inventoryFeasible, alternativeProductionFeasible };
+}
+
 // ---- Capacity semantics adapter (Prompt 4.8.8A) ------------------------
 //
 // CRITICAL: Production and the simulator use DIFFERENT capacity conventions:
@@ -563,8 +963,11 @@ export interface RunMetrics {
   // Five-level reachability ladder (each stricter than the last).
   assetReachablePct: number;                    // Abstract asset path (ignores countries)
   corridorReachablePct: number;                 // Asset + country match
-  liquidityExecutableReachabilityPct: number;   // + capacity, dest liquidity (demand-weighted, no risk)
-  productionExecutableReachabilityPct: number;  // + risk ceilings, min/max, provider status (production-faithful path search)
+  capacityExecutableReachabilityPct: number;    // B: + coverAmount succeeds
+  liquidityExecutableReachabilityPct: number;   // C: + dest liquidity (greedy coverAmount, output-aware)
+  inventoryExecutableReachabilityPct: number;   // C': SOME assignment has liquidity (ignores risk)
+  productionExecutableReachabilityPct: number;  // D: + risk ceilings, min/max, provider status (greedy)
+  alternativeProductionExecutableReachabilityPct: number; // D': SOME assignment satisfies ALL constraints
   // Production-faithful route composition (Prompt 4.8.8).
   // Each is the demand-weighted % reachable by that path type. These overlap:
   // a demand may be reachable by multiple path types. totalProdExec ≤ sum of these.
@@ -755,8 +1158,11 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
   let prodExecutableReachablePairs = 0;
   let assetReachableVolume = 0;
   let corridorReachableVolume = 0;
+  let capacityExecutableVolume = 0;
   let liqExecutableVolume = 0;
+  let inventoryExecutableVolume = 0;
   let prodExecutableVolume = 0;
+  let altProductionExecutableVolume = 0;
   let corridorsWithMultipleRoutes = 0;
   // Route-composition weights (Prompt 4.8.8). These overlap: a demand may be
   // reachable by multiple path types. totalProdExec ≤ sum of these.
@@ -852,8 +1258,11 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
       if (liq > maxDstLiquidity) maxDstLiquidity = liq;
     }
 
+    let capacityExecutableWeight = 0;
     let liqExecutableWeight = 0;
+    let inventoryExecutableWeight = 0;
     let prodExecutableWeight = 0;
+    let altProductionExecutableWeight = 0;
     let directWeight = 0;
     let splitDirectWeight = 0;
     let twoHopWeight = 0;
@@ -886,70 +1295,76 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
     for (const demand of sampledDemands) {
       const amt = demand.amount;
       const rt = demand.riskTolerance;
+      let capOK = false;
       let liqOK = false;
+      let invOK = false;
       let prodOK = false;
-      let hasDirect = false;       // feasible 1-hop single-provider
-      let hasSplitDirect = false;  // feasible 1-hop split
-      let hasTwoHop = false;       // feasible 2-hop
-      let hasThreePlusHop = false; // feasible 3+-hop
+      let altProdOK = false;
+      let hasDirect = false;
+      let hasSplitDirect = false;
+      let hasTwoHop = false;
+      let hasThreePlusHop = false;
 
-      // Pre-filter: if no active provider has enough destination-asset liquidity
-      // for even the source amount, skip all path checks (demand is infeasible).
-      // This is conservative for multi-hop (hop2 input may differ) but exact
-      // for direct routes, and eliminates the majority of infeasible demands.
       if (amt > maxDstLiquidity) continue;
 
-      // Tier 1: 1-hop paths (direct). Check until we find single + split
-      // (full mode) or until prodOK (total mode).
+      // Tier 1: 1-hop paths (direct).
       for (const path of hop1Paths) {
-        const feas = checkPathFeasibility(path, amt, rt, world, saRiskCache, cpRiskCache);
-        if (!feas) continue;
-        if (feas.liqFeasible) liqOK = true;
-        if (feas.prodFeasible) {
+        const staged = checkPathFeasibilityStaged(path, amt, rt, world, saRiskCache, cpRiskCache);
+        if (!staged) continue;
+        if (staged.capacityFeasible) capOK = true;
+        if (staged.liquidityFeasible) liqOK = true;
+        if (staged.inventoryFeasible) invOK = true;
+        if (staged.productionFeasible) {
           prodOK = true;
           if (needBreakdown) {
-            if (feas.split) hasSplitDirect = true;
+            if (staged.split) hasSplitDirect = true;
             else hasDirect = true;
           }
         }
-        // Stop: total mode once prodOK; full mode once both single+split found.
-        if (!needBreakdown && prodOK) break;
+        if (staged.alternativeProductionFeasible) altProdOK = true;
+        if (!needBreakdown && prodOK && altProdOK) break;
         if (needBreakdown && hasDirect && hasSplitDirect) break;
       }
 
-      // Tier 2: 2-hop paths. Skip if total mode and already prodOK.
-      // Full mode: check until first feasible 2-hop. Total mode: until prodOK.
-      if (needBreakdown || !prodOK) {
+      // Tier 2: 2-hop paths.
+      if (needBreakdown || !prodOK || !altProdOK) {
         for (const path of hop2Paths) {
-          const feas = checkPathFeasibility(path, amt, rt, world, saRiskCache, cpRiskCache);
-          if (!feas) continue;
-          if (feas.liqFeasible) liqOK = true;
-          if (feas.prodFeasible) {
+          const staged = checkPathFeasibilityStaged(path, amt, rt, world, saRiskCache, cpRiskCache);
+          if (!staged) continue;
+          if (staged.capacityFeasible) capOK = true;
+          if (staged.liquidityFeasible) liqOK = true;
+          if (staged.inventoryFeasible) invOK = true;
+          if (staged.productionFeasible) {
             prodOK = true;
             if (needBreakdown) hasTwoHop = true;
           }
-          if (!needBreakdown && prodOK) break;
+          if (staged.alternativeProductionFeasible) altProdOK = true;
+          if (!needBreakdown && prodOK && altProdOK) break;
           if (needBreakdown && hasTwoHop) break;
         }
       }
 
-      // Tier 3+4: 3-hop and 4-hop paths. Skip if total mode and already prodOK.
-      // Full mode: check until first feasible 3+hop. Total mode: until prodOK.
-      if (needBreakdown || !prodOK) {
+      // Tier 3+4: 3-hop and 4-hop paths.
+      if (needBreakdown || !prodOK || !altProdOK) {
         for (const path of hop3PlusPaths) {
-          const feas = checkPathFeasibility(path, amt, rt, world, saRiskCache, cpRiskCache);
-          if (!feas) continue;
-          if (feas.liqFeasible) liqOK = true;
-          if (feas.prodFeasible) {
+          const staged = checkPathFeasibilityStaged(path, amt, rt, world, saRiskCache, cpRiskCache);
+          if (!staged) continue;
+          if (staged.capacityFeasible) capOK = true;
+          if (staged.liquidityFeasible) liqOK = true;
+          if (staged.inventoryFeasible) invOK = true;
+          if (staged.productionFeasible) {
             prodOK = true;
             if (needBreakdown) hasThreePlusHop = true;
           }
-          if (!needBreakdown && prodOK) break;
+          if (staged.alternativeProductionFeasible) altProdOK = true;
+          if (!needBreakdown && prodOK && altProdOK) break;
           if (needBreakdown && hasThreePlusHop) break;
         }
       }
 
+      if (capOK) capacityExecutableWeight += demand.weight;
       if (liqOK) liqExecutableWeight += demand.weight;
+      if (invOK) inventoryExecutableWeight += demand.weight;
       if (prodOK) {
         prodExecutableWeight += demand.weight;
         if (hasDirect) directWeight += demand.weight;
@@ -957,11 +1372,15 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
         if (hasTwoHop) twoHopWeight += demand.weight;
         if (hasThreePlusHop) threePlusHopWeight += demand.weight;
       }
+      if (altProdOK) altProductionExecutableWeight += demand.weight;
     }
 
     // Amount-weighted reachability for this corridor.
+    if (capacityExecutableWeight > 0) capacityExecutableVolume += capacityExecutableWeight;
     if (liqExecutableWeight > 0) { liqExecutableReachablePairs++; liqExecutableVolume += liqExecutableWeight; }
+    if (inventoryExecutableWeight > 0) inventoryExecutableVolume += inventoryExecutableWeight;
     if (prodExecutableWeight > 0) { prodExecutableReachablePairs++; prodExecutableVolume += prodExecutableWeight; }
+    if (altProductionExecutableWeight > 0) altProductionExecutableVolume += altProductionExecutableWeight;
     directReachableVolume += directWeight;
     splitDirectReachableVolume += splitDirectWeight;
     twoHopReachableVolume += twoHopWeight;
@@ -970,8 +1389,11 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
 
   const assetReachablePct = totalDemandWeight > 0 ? (assetReachableVolume / totalDemandWeight) * 100 : 0;
   const corridorReachablePct = totalDemandWeight > 0 ? (corridorReachableVolume / totalDemandWeight) * 100 : 0;
+  const capExecutablePct = totalDemandWeight > 0 ? (capacityExecutableVolume / totalDemandWeight) * 100 : 0;
   const liqExecutablePct = totalDemandWeight > 0 ? (liqExecutableVolume / totalDemandWeight) * 100 : 0;
+  const invExecutablePct = totalDemandWeight > 0 ? (inventoryExecutableVolume / totalDemandWeight) * 100 : 0;
   const prodExecutablePct = totalDemandWeight > 0 ? (prodExecutableVolume / totalDemandWeight) * 100 : 0;
+  const altProdExecutablePct = totalDemandWeight > 0 ? (altProductionExecutableVolume / totalDemandWeight) * 100 : 0;
   const directPct = totalDemandWeight > 0 ? (directReachableVolume / totalDemandWeight) * 100 : 0;
   const splitDirectPct = totalDemandWeight > 0 ? (splitDirectReachableVolume / totalDemandWeight) * 100 : 0;
   const twoHopPct = totalDemandWeight > 0 ? (twoHopReachableVolume / totalDemandWeight) * 100 : 0;
@@ -992,8 +1414,11 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
     executionAttemptRate: intents.length > 0 ? (intents.filter((i: any) => i.status === "COMPLETED" || i.status === "EXECUTING" || i.status === "FAILED").length / intents.length) * 100 : 0,
     assetReachablePct: Math.round(assetReachablePct * 100) / 100,
     corridorReachablePct: Math.round(corridorReachablePct * 100) / 100,
+    capacityExecutableReachabilityPct: Math.round(capExecutablePct * 100) / 100,
     liquidityExecutableReachabilityPct: Math.round(liqExecutablePct * 100) / 100,
+    inventoryExecutableReachabilityPct: Math.round(invExecutablePct * 100) / 100,
     productionExecutableReachabilityPct: Math.round(prodExecutablePct * 100) / 100,
+    alternativeProductionExecutableReachabilityPct: Math.round(altProdExecutablePct * 100) / 100,
     directReachablePct: Math.round(directPct * 100) / 100,
     splitDirectReachablePct: Math.round(splitDirectPct * 100) / 100,
     twoHopReachablePct: Math.round(twoHopPct * 100) / 100,
@@ -1195,34 +1620,38 @@ function printResults(results: Result[]) {
     console.log(`| ${r.density} | ${r.topology} | ${statsLabel(rp)} | ${statsLabel(tp)} | ${statsLabel(mr)} |`);
   }
 
-  // Conclusion: Topology / Depletion / Execution / Composition decomposition
-  console.log("\n### Conclusion: Topology / Depletion / Execution / Composition Decomposition\n");
+  // Conclusion: Production routing opportunity
+  console.log("\n### Conclusion: Production Routing Opportunity (P4.8.8N)\n");
   for (const topo of TOPOLOGIES) {
     const r100 = results.find(r => r.density === 100 && r.topology === topo);
     if (r100) {
-      const medInitial = percentile(r100.metrics.map(m => (m as any).initialProdExecReach ?? 0), 0.5);
-      const medFinal = percentile(r100.metrics.map(m => (m as any).finalProdExecReach ?? 0), 0.5);
-      const medMean = percentile(r100.metrics.map(m => (m as any).meanProdExecReach ?? 0), 0.5);
-      const medDepletion = percentile(r100.metrics.map(m => (m as any).depletionPct ?? 0), 0.5);
+      const medCorridor = percentile(r100.metrics.map(m => m.corridorReachablePct), 0.5);
+      const medCap = percentile(r100.metrics.map(m => m.capacityExecutableReachabilityPct), 0.5);
+      const medLiq = percentile(r100.metrics.map(m => m.liquidityExecutableReachabilityPct), 0.5);
+      const medInv = percentile(r100.metrics.map(m => m.inventoryExecutableReachabilityPct), 0.5);
+      const medProd = percentile(r100.metrics.map(m => m.productionExecutableReachabilityPct), 0.5);
+      const medAltProd = percentile(r100.metrics.map(m => m.alternativeProductionExecutableReachabilityPct), 0.5);
       const medComp = percentile(r100.metrics.map(m => m.completionRate), 0.5);
       const medMultiHop = percentile(r100.metrics.map(m => m.multiHopPercentage), 0.5);
-      const medDirect = percentile(r100.metrics.map(m => m.directReachablePct), 0.5);
-      const medSplit = percentile(r100.metrics.map(m => m.splitDirectReachablePct), 0.5);
-      const med2hop = percentile(r100.metrics.map(m => m.twoHopReachablePct), 0.5);
-      const med3plus = percentile(r100.metrics.map(m => m.threePlusHopReachablePct), 0.5);
-      const medProd = percentile(r100.metrics.map(m => m.productionExecutableReachabilityPct), 0.5);
+
+      const liquidityAvailabilityGain = medInv - medLiq;
+      const productionRoutingGain = medAltProd - medProd;
+
       console.log(`  ${topo} @ 100:`);
-      console.log(`    Topology effect:    initial prod-exec = ${medInitial.toFixed(1)}%`);
-      console.log(`    Depletion effect:   final prod-exec = ${medFinal.toFixed(1)}% (decline ${medDepletion.toFixed(1)}%)`);
-      console.log(`    Time-averaged:      mean prod-exec = ${medMean.toFixed(1)}%`);
-      console.log(`    Execution effect:   completion = ${medComp.toFixed(1)}%`);
-      console.log(`    Multi-hop share:    ${medMultiHop.toFixed(1)}%`);
-      console.log(`    Route composition (demand-weighted % reachable):`);
-      console.log(`      Direct (single):  ${medDirect.toFixed(1)}%`);
-      console.log(`      Split direct:     ${medSplit.toFixed(1)}%`);
-      console.log(`      2-hop:            ${med2hop.toFixed(1)}%`);
-      console.log(`      3+-hop:           ${med3plus.toFixed(1)}%`);
-      console.log(`      Total prod-exec:  ${medProd.toFixed(1)}%`);
+      console.log(`    Reachability ladder (demand-weighted %):`);
+      console.log(`      A. Structural (4-hop graph):    ${medCorridor.toFixed(1)}%`);
+      console.log(`      B. + Capacity:                  ${medCap.toFixed(1)}%`);
+      console.log(`      C. + Greedy liquidity:          ${medLiq.toFixed(1)}%`);
+      console.log(`      C'. + Inventory-feasible:       ${medInv.toFixed(1)}%  (SOME assignment has liquidity)`);
+      console.log(`      D. + Greedy production:         ${medProd.toFixed(1)}%  (greedy coverAmount + risk)`);
+      console.log(`      D'. + Alternative production:   ${medAltProd.toFixed(1)}%  (SOME assignment satisfies ALL constraints)`);
+      console.log(`    Gains from inventory-aware routing:`);
+      console.log(`      Liquidity availability gain (C→C'):  ${liquidityAvailabilityGain.toFixed(1)} pp  (more demand has SOME liquidity)`);
+      console.log(`      Production routing gain (D→D'):      ${productionRoutingGain.toFixed(1)} pp  (more demand is production-executable)`);
+      console.log(`      NOTE: Only the production routing gain is addressable by changing the router.`);
+      console.log(`    Realized execution (separate population — NOT subtracted from D):`);
+      console.log(`      Completion rate:               ${medComp.toFixed(1)}%`);
+      console.log(`      Multi-hop share of completions: ${medMultiHop.toFixed(1)}%`);
     }
   }
 }
