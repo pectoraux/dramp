@@ -118,12 +118,22 @@ async function main() {
     if (r.reliabilityProfile.fastRate !== f.reliabilityProfile.fastRate || r.reliabilityProfile.fastRate !== b.reliabilityProfile.fastRate) {
       economicsShared = false; break;
     }
-    // Check that bridge offer economics use canonical values (not rng.int(3,10) or rate:1.0).
-    for (const os of b.offerSpecs) {
-      if (os.feeBps !== r.offerSpecs[0]?.feeBps && os.feeBps !== r.offerSpecs[0]?.feeBps) {
-        // Bridge offers should use the same feeBps as the canonical economics.
-        // (If this fails, the bridge treatment is changing economics, not just topology.)
-      }
+    // Check FROZEN liquidity/treasury are identical across topologies.
+    const rLiq = JSON.stringify([...r.liquidityBalances.entries()].sort());
+    const fLiq = JSON.stringify([...f.liquidityBalances.entries()].sort());
+    const bLiq = JSON.stringify([...b.liquidityBalances.entries()].sort());
+    if (rLiq !== fLiq || rLiq !== bLiq) {
+      economicsShared = false;
+      console.error(`  Provider ${i} liquidityBalances differ across topologies`);
+      break;
+    }
+    const rTrs = JSON.stringify([...r.treasuryBalances.entries()].sort());
+    const fTrs = JSON.stringify([...f.treasuryBalances.entries()].sort());
+    const bTrs = JSON.stringify([...b.treasuryBalances.entries()].sort());
+    if (rTrs !== fTrs || rTrs !== bTrs) {
+      economicsShared = false;
+      console.error(`  Provider ${i} treasuryBalances differ across topologies`);
+      break;
     }
   }
   assert(economicsShared, "Provider economics (ALL fields) identical across RANDOM/CORRIDOR_FOCUSED/BRIDGED");

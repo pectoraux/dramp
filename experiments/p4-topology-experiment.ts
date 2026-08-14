@@ -149,9 +149,11 @@ export function deriveDemandCorridors(users: SimUser[]): Array<[string, string, 
 }
 
 // ---- Generate immutable provider ECONOMICS (shared across topologies) ----
-// Provider type, strategy, collateral, reliability, etc. are generated ONCE
-// per seed and are IDENTICAL across all topology treatments.
+// Provider type, strategy, collateral, reliability, pricing, AND initial liquidity/treasury
+// are generated ONCE per seed and are IDENTICAL across all topology treatments.
 // Only the corridor/offer assignment differs by topology.
+// Starting liquidity is generated from a FIXED set of assets (not topology-dependent)
+// so that topology is the ONLY treatment difference.
 interface ProviderEconomics {
   id: string;
   name: string;
@@ -162,17 +164,21 @@ interface ProviderEconomics {
   usableCollateral: number;
   maxExposure: number;
   reliabilityProfile: SettlementReliabilityProfile;
-  // Pricing parameters shared across topology treatments.
   feeBps: number;
   rate: number;
   capacity: number;
   expectedExecutionSeconds: number;
+  // FIXED starting liquidity/treasury (same across topologies).
+  liquidityBalances: Map<string, number>;
+  treasuryBalances: Map<string, number>;
 }
 
 function generateProviderEconomics(seed: number, count: number, settlementAssets: Map<string, SimSettlementAsset>): ProviderEconomics[] {
   const rng = new SeededRNG(seed);
   const economics: ProviderEconomics[] = [];
   const stableAssetList = [...settlementAssets.values()].filter(a => a.isEligibleCollateral);
+  // Fixed set of assets for initial liquidity (same for all topologies).
+  const allAssetSymbols = [...ASSETS, ...stableAssetList.map(a => a.symbol)];
 
   for (let i = 0; i < count; i++) {
     const providerType = rng.pick(PROVIDER_TYPES);
@@ -193,11 +199,30 @@ function generateProviderEconomics(seed: number, count: number, settlementAssets
       failureRate: Math.max(0, baseProfile.failureRate - variation * 0.2),
     };
 
+    // Generate FIXED liquidity/treasury (independent of topology).
+    // Each provider gets liquidity in 2-4 random assets + 1-2 settlement assets.
+    const liquidityBalances = new Map<string, number>();
+    const treasuryBalances = new Map<string, number>();
+    const numAssets = rng.int(2, 4);
+    const usedAssets = new Set<string>();
+    for (let a = 0; a < numAssets; a++) {
+      const asset = rng.pick(allAssetSymbols);
+      if (usedAssets.has(asset)) continue;
+      usedAssets.add(asset);
+      liquidityBalances.set(asset, collateral * rng.float(0.1, 0.4));
+      treasuryBalances.set(asset, collateral * rng.float(0.3, 0.8));
+    }
+    // Also add some settlement-asset liquidity.
+    const sa = rng.pick(stableAssetList);
+    liquidityBalances.set(sa.symbol, (liquidityBalances.get(sa.symbol) ?? 0) + collateral * 0.2);
+    treasuryBalances.set(sa.symbol, (treasuryBalances.get(sa.symbol) ?? 0) + collateral * 0.5);
+
     economics.push({
       id: `prov_${i}`, name, providerType, trustModel, strategy,
       collateral, usableCollateral, maxExposure, reliabilityProfile,
       feeBps: rng.int(5, 35), rate: rng.float(0.8, 1.2),
       capacity: rng.float(5000, 50000), expectedExecutionSeconds: rng.int(10, 120),
+      liquidityBalances, treasuryBalances,
     });
   }
   return economics;
@@ -278,18 +303,9 @@ export function generateCanonicalSpecs(
       }
     }
 
-    // Build liquidity from corridors (same formula across topologies).
-    const liquidityBalances = new Map<string, number>();
-    const treasuryBalances = new Map<string, number>();
-    for (const corridor of corridors) {
-      const parts = corridor.split(":");
-      if (parts.length < 4) continue;
-      const srcAsset = parts[0], dstAsset = parts[2];
-      liquidityBalances.set(srcAsset, (liquidityBalances.get(srcAsset) ?? 0) + econ.collateral * 0.4);
-      liquidityBalances.set(dstAsset, (liquidityBalances.get(dstAsset) ?? 0) + econ.collateral * 0.15);
-      treasuryBalances.set(srcAsset, (treasuryBalances.get(srcAsset) ?? 0) + econ.collateral * 0.8);
-      treasuryBalances.set(dstAsset, (treasuryBalances.get(dstAsset) ?? 0) + econ.collateral * 0.3);
-    }
+    // Use FROZEN liquidity/treasury from shared economics (not corridor-derived).
+    const liquidityBalances = new Map(econ.liquidityBalances);
+    const treasuryBalances = new Map(econ.treasuryBalances);
 
     specs.push({
       id: econ.id, name: econ.name, providerType: econ.providerType, trustModel: econ.trustModel,
@@ -523,89 +539,83 @@ function extractMetrics(world: any): RunMetrics {
     }
     if (liqExecutable) { liqExecutableReachablePairs++; liqExecutableVolume += weight; }
 
-    // 4. PRODUCTION-EXECUTABLE reachability (full hard constraints from shared economics).
-    // Checks: active provider, settlement-asset risk ceiling, counterparty risk ceiling,
-    // min/max amount, capacity, destination liquidity. Uses shared pure functions.
-    let prodExecutable = false;
-    const amount = 100; // representative transaction amount for reachability check
-    // Direct.
-    for (const o of directCorridor) {
-      const provider = world.providers.get(o.providerId);
-      if (!provider || provider.status !== "ACTIVE") continue;
-      if (o.availableCapacity < amount) continue;
-      if (amount < o.minimumAmount || amount > o.maximumAmount) continue;
-      if ((provider.liquidity.balances.get(dstAsset) ?? 0) < amount) continue;
-      // Settlement-asset risk ceiling (use BALANCED as representative).
-      if (o.settlementAssetId) {
-        const sa = world.assets.get(o.settlementAssetId);
-        if (sa) {
-          const saRisk = settlementAssetRisk({
-            assetType: sa.assetType, volatilityScore: sa.volatilityScore,
-            liquidityScore: sa.liquidityScore, pegQuality: sa.pegQuality,
-            status: sa.status, incentiveRate: sa.incentiveRate,
-          });
-          if (saRisk > assetRiskCeiling("BALANCED")) continue;
-        }
+    // 4. PRODUCTION-EXECUTABLE reachability (demand-weighted, full hard constraints).
+    // For each corridor, test against the ACTUAL demand amounts from users in that corridor.
+    // Uses shared pure economics functions for risk ceilings.
+    // Returns amount-weighted executable demand %.
+    // Collect actual demand amounts for this corridor.
+    const corridorDemandAmounts: Array<{ amount: number; weight: number }> = [];
+    for (const u of world.users.values()) {
+      if (u.sourceAsset === srcAsset && u.sourceCountry === srcCountry &&
+          u.destinationAsset === dstAsset && u.destinationCountry === dstCountry) {
+        corridorDemandAmounts.push({ amount: u.typicalAmount, weight: u.frequency * u.typicalAmount });
       }
-      // Counterparty risk ceiling.
-      const cpRisk = providerCounterpartyRisk({
-        trustModel: provider.trustModel, providerType: provider.providerType,
-        reputationScore: provider.reputationScore, status: provider.status,
-      });
-      if (cpRisk > counterpartyRiskCeiling("BALANCED")) continue;
-      prodExecutable = true; break;
     }
-    // Multi-hop: check ALL hard constraints for BOTH hops.
-    if (!prodExecutable) {
-      for (const sa of settlementAssetSymbols) {
-        const hop1 = activeOffers.filter(o =>
-          o.sourceAsset === srcAsset && o.sourceCountry === srcCountry &&
-          o.destinationAsset === sa && o.destinationCountry === "GLOBAL");
-        const hop2 = activeOffers.filter(o =>
-          o.sourceAsset === sa && o.sourceCountry === "GLOBAL" &&
-          o.destinationAsset === dstAsset && o.destinationCountry === dstCountry);
-        if (hop1.length === 0 || hop2.length === 0) continue;
-        // Check settlement-asset risk for the bridge asset.
-        const saObj = [...world.assets.values()].find((a: any) => a.symbol === sa);
-        if (saObj) {
-          const saRisk = settlementAssetRisk({
-            assetType: saObj.assetType, volatilityScore: saObj.volatilityScore,
-            liquidityScore: saObj.liquidityScore, pegQuality: saObj.pegQuality,
-            status: saObj.status, incentiveRate: saObj.incentiveRate,
-          });
-          if (saRisk > assetRiskCeiling("BALANCED")) continue;
-        }
-        // Find a valid hop1 + hop2 pair.
-        for (const o1 of hop1) {
-          const p1 = world.providers.get(o1.providerId);
-          if (!p1 || p1.status !== "ACTIVE") continue;
-          if (o1.availableCapacity < amount) continue;
-          if (amount < o1.minimumAmount || amount > o1.maximumAmount) continue;
-          if ((p1.liquidity.balances.get(sa) ?? 0) < amount) continue;
-          const cpRisk1 = providerCounterpartyRisk({
-            trustModel: p1.trustModel, providerType: p1.providerType,
-            reputationScore: p1.reputationScore, status: p1.status,
-          });
-          if (cpRisk1 > counterpartyRiskCeiling("BALANCED")) continue;
-          for (const o2 of hop2) {
-            const p2 = world.providers.get(o2.providerId);
-            if (!p2 || p2.status !== "ACTIVE") continue;
-            if (o2.availableCapacity < amount) continue;
-            if (amount < o2.minimumAmount || amount > o2.maximumAmount) continue;
-            if ((p2.liquidity.balances.get(dstAsset) ?? 0) < amount) continue;
-            const cpRisk2 = providerCounterpartyRisk({
-              trustModel: p2.trustModel, providerType: p2.providerType,
-              reputationScore: p2.reputationScore, status: p2.status,
-            });
-            if (cpRisk2 > counterpartyRiskCeiling("BALANCED")) continue;
-            prodExecutable = true; break;
+    const corridorDemandTotal = corridorDemandAmounts.reduce((s, d) => s + d.weight, 0);
+    let corridorDemandExecutable = 0;
+
+    for (const demand of corridorDemandAmounts) {
+      const amt = demand.amount;
+      let canExecute = false;
+      // Direct.
+      for (const o of directCorridor) {
+        const provider = world.providers.get(o.providerId);
+        if (!provider || provider.status !== "ACTIVE") continue;
+        if (o.availableCapacity < amt) continue;
+        if (amt < o.minimumAmount || amt > o.maximumAmount) continue;
+        if ((provider.liquidity.balances.get(dstAsset) ?? 0) < amt) continue;
+        if (o.settlementAssetId) {
+          const saObj = world.assets.get(o.settlementAssetId);
+          if (saObj) {
+            const saRisk = settlementAssetRisk({ assetType: saObj.assetType, volatilityScore: saObj.volatilityScore, liquidityScore: saObj.liquidityScore, pegQuality: saObj.pegQuality, status: saObj.status, incentiveRate: saObj.incentiveRate });
+            if (saRisk > assetRiskCeiling("BALANCED")) continue;
           }
-          if (prodExecutable) break;
         }
-        if (prodExecutable) break;
+        const cpRisk = providerCounterpartyRisk({ trustModel: provider.trustModel, providerType: provider.providerType, reputationScore: provider.reputationScore, status: provider.status });
+        if (cpRisk > counterpartyRiskCeiling("BALANCED")) continue;
+        canExecute = true; break;
       }
+      // Multi-hop.
+      if (!canExecute) {
+        for (const sa of settlementAssetSymbols) {
+          const hop1 = activeOffers.filter(o => o.sourceAsset === srcAsset && o.sourceCountry === srcCountry && o.destinationAsset === sa && o.destinationCountry === "GLOBAL");
+          const hop2 = activeOffers.filter(o => o.sourceAsset === sa && o.sourceCountry === "GLOBAL" && o.destinationAsset === dstAsset && o.destinationCountry === dstCountry);
+          if (hop1.length === 0 || hop2.length === 0) continue;
+          const saObj = [...world.assets.values()].find((a: any) => a.symbol === sa);
+          if (saObj) {
+            const saRisk = settlementAssetRisk({ assetType: saObj.assetType, volatilityScore: saObj.volatilityScore, liquidityScore: saObj.liquidityScore, pegQuality: saObj.pegQuality, status: saObj.status, incentiveRate: saObj.incentiveRate });
+            if (saRisk > assetRiskCeiling("BALANCED")) continue;
+          }
+          for (const o1 of hop1) {
+            const p1 = world.providers.get(o1.providerId);
+            if (!p1 || p1.status !== "ACTIVE") continue;
+            if (o1.availableCapacity < amt) continue;
+            if (amt < o1.minimumAmount || amt > o1.maximumAmount) continue;
+            if ((p1.liquidity.balances.get(sa) ?? 0) < amt) continue;
+            const cpRisk1 = providerCounterpartyRisk({ trustModel: p1.trustModel, providerType: p1.providerType, reputationScore: p1.reputationScore, status: p1.status });
+            if (cpRisk1 > counterpartyRiskCeiling("BALANCED")) continue;
+            for (const o2 of hop2) {
+              const p2 = world.providers.get(o2.providerId);
+              if (!p2 || p2.status !== "ACTIVE") continue;
+              if (o2.availableCapacity < amt) continue;
+              if (amt < o2.minimumAmount || amt > o2.maximumAmount) continue;
+              if ((p2.liquidity.balances.get(dstAsset) ?? 0) < amt) continue;
+              const cpRisk2 = providerCounterpartyRisk({ trustModel: p2.trustModel, providerType: p2.providerType, reputationScore: p2.reputationScore, status: p2.status });
+              if (cpRisk2 > counterpartyRiskCeiling("BALANCED")) continue;
+              canExecute = true; break;
+            }
+            if (canExecute) break;
+          }
+          if (canExecute) break;
+        }
+      }
+      if (canExecute) corridorDemandExecutable += demand.weight;
     }
-    if (prodExecutable) { prodExecutableReachablePairs++; prodExecutableVolume += weight; }
+    // Amount-weighted executable demand for this corridor.
+    if (corridorDemandTotal > 0 && corridorDemandExecutable > 0) {
+      prodExecutableReachablePairs++;
+      prodExecutableVolume += (corridorDemandExecutable / corridorDemandTotal) * weight;
+    }
   }
 
   const assetReachablePct = totalDemandWeight > 0 ? (assetReachableVolume / totalDemandWeight) * 100 : 0;
@@ -713,13 +723,37 @@ function runExperiment() {
         // Build world with deep-cloned providers (fresh state per run).
         const world = buildWorld(seed, density, topology, demandPopulation, canonicalSpecs, config);
 
-        // Run simulation.
+        // Capture INITIAL reachability (before simulation).
+        const initialMetrics = extractMetrics(world);
+
+        // Run simulation, capturing reachability every 10 steps.
         const rng = new SeededRNG(seed);
+        const timeSeriesMetrics: RunMetrics[] = [initialMetrics];
         for (let step = 0; step < config.totalSteps; step++) {
           simulateStep(world, rng);
+          if ((step + 1) % 10 === 0 || step === config.totalSteps - 1) {
+            timeSeriesMetrics.push(extractMetrics(world));
+          }
         }
 
-        metrics.push(extractMetrics(world));
+        // Final metrics + time-series summary.
+        const finalMetrics = extractMetrics(world);
+        // Add time-series fields to finalMetrics.
+        const tsAsset = timeSeriesMetrics.map(m => m.assetReachablePct);
+        const tsCorridor = timeSeriesMetrics.map(m => m.corridorReachablePct);
+        const tsLiqExec = timeSeriesMetrics.map(m => m.liquidityExecutableReachabilityPct);
+        const tsProdExec = timeSeriesMetrics.map(m => m.productionExecutableReachabilityPct);
+        (finalMetrics as any).initialAssetReach = tsAsset[0];
+        (finalMetrics as any).initialCorridorReach = tsCorridor[0];
+        (finalMetrics as any).initialProdExecReach = tsProdExec[0];
+        (finalMetrics as any).meanProdExecReach = tsProdExec.reduce((s, v) => s + v, 0) / tsProdExec.length;
+        (finalMetrics as any).p10ProdExecReach = percentile(tsProdExec, 0.1);
+        (finalMetrics as any).p50ProdExecReach = percentile(tsProdExec, 0.5);
+        (finalMetrics as any).p90ProdExecReach = percentile(tsProdExec, 0.9);
+        (finalMetrics as any).finalProdExecReach = tsProdExec[tsProdExec.length - 1];
+        (finalMetrics as any).depletionPct = tsProdExec[0] > 0 ? ((tsProdExec[0] - tsProdExec[tsProdExec.length - 1]) / tsProdExec[0]) * 100 : 0;
+
+        metrics.push(finalMetrics);
       }
       results.push({ density, topology, metrics });
       process.stderr.write(`  Done: ${density} providers / ${topology} (${NUM_SEEDS} seeds)\n`);
@@ -781,19 +815,23 @@ function printResults(results: Result[]) {
     console.log(`| ${r.density} | ${r.topology} | ${statsLabel(rp)} | ${statsLabel(tp)} | ${statsLabel(mr)} |`);
   }
 
-  // Conclusion
-  console.log("\n### Conclusion (Preliminary)\n");
+  // Conclusion: Topology / Depletion / Execution decomposition
+  console.log("\n### Conclusion: Topology / Depletion / Execution Decomposition\n");
   for (const topo of TOPOLOGIES) {
     const r100 = results.find(r => r.density === 100 && r.topology === topo);
     if (r100) {
-      const medAsset = percentile(r100.metrics.map(m => m.assetReachablePct), 0.5);
-      const medCorridor = percentile(r100.metrics.map(m => m.corridorReachablePct), 0.5);
-      const medLiqExec = percentile(r100.metrics.map(m => m.liquidityExecutableReachabilityPct), 0.5);
-      const medProdExec = percentile(r100.metrics.map(m => m.productionExecutableReachabilityPct), 0.5);
+      const medInitial = percentile(r100.metrics.map(m => (m as any).initialProdExecReach ?? 0), 0.5);
+      const medFinal = percentile(r100.metrics.map(m => (m as any).finalProdExecReach ?? 0), 0.5);
+      const medMean = percentile(r100.metrics.map(m => (m as any).meanProdExecReach ?? 0), 0.5);
+      const medDepletion = percentile(r100.metrics.map(m => (m as any).depletionPct ?? 0), 0.5);
       const medComp = percentile(r100.metrics.map(m => m.completionRate), 0.5);
-      const medEff300 = percentile(r100.metrics.map(m => m.effectiveCost300Bps), 0.5);
       const medMultiHop = percentile(r100.metrics.map(m => m.multiHopPercentage), 0.5);
-      console.log(`  ${topo} @ 100: asset=${medAsset.toFixed(1)}%, corridor=${medCorridor.toFixed(1)}%, liq_exec=${medLiqExec.toFixed(1)}%, prod_exec=${medProdExec.toFixed(1)}%, completion=${medComp.toFixed(1)}%, eff(300)=${medEff300.toFixed(1)}bps, multi-hop=${medMultiHop.toFixed(1)}%`);
+      console.log(`  ${topo} @ 100:`);
+      console.log(`    Topology effect:    initial prod-exec = ${medInitial.toFixed(1)}%`);
+      console.log(`    Depletion effect:   final prod-exec = ${medFinal.toFixed(1)}% (decline ${medDepletion.toFixed(1)}%)`);
+      console.log(`    Time-averaged:      mean prod-exec = ${medMean.toFixed(1)}%`);
+      console.log(`    Execution effect:   completion = ${medComp.toFixed(1)}%`);
+      console.log(`    Multi-hop share:    ${medMultiHop.toFixed(1)}%`);
     }
   }
 }
