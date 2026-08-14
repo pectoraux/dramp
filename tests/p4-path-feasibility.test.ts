@@ -36,7 +36,7 @@ async function main() {
   const Decimal = (await import("decimal.js")).default;
   const { computeHopOutput, coverAmount, enumeratePaths, settlementAssetRisk, providerCounterpartyRisk, counterpartyRiskCeiling } = await import("../src/lib/economics/shared");
   const { createWorld, createDefaultConfig } = await import("../src/lib/simulator/world");
-  const { checkPathFeasibility, toProductionCapacity, productionUsable } = await import("../experiments/p4-topology-experiment");
+  const { checkPathFeasibilityStaged, toProductionCapacity, productionUsable } = await import("../experiments/p4-topology-experiment");
   type SimOffer = import("../src/lib/simulator/world").SimOffer;
   type SimWorld = import("../src/lib/simulator/world").SimWorld;
   type SimProvider = import("../src/lib/simulator/world").SimProvider;
@@ -262,7 +262,7 @@ async function main() {
     // Provider P3: EURC→NGN (has NGN liquidity)
     const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { USDC: 50000 });
     const p2 = makeProvider("p2", "COLLATERALIZED", "BANK", 0.9, { EURC: 50000 });
-    const p3 = makeProvider("p3", "COLLATERALIZED", "BANK", 0.9, { NGN: 50000 });
+    const p3 = makeProvider("p3", "COLLATERALIZED", "BANK", 0.9, { NGN: 5000000 });
     const o1 = makeOffer("o1", "p1", "USD", "US", "USDC", "GLOBAL", 1.0, 10, 50000, "asset_usdc");
     const o2 = makeOffer("o2", "p2", "USDC", "GLOBAL", "EURC", "GLOBAL", 1.08, 10, 50000, "asset_eurc");
     const o3 = makeOffer("o3", "p3", "EURC", "GLOBAL", "NGN", "NG", 0.00065, 10, 50000, "asset_usdc");
@@ -283,11 +283,11 @@ async function main() {
 
     // Check feasibility of the 3-hop path.
     const amt = 1000;
-    const feas = checkPathFeasibility(threeHopPaths[0], amt, "BALANCED", world, sa, cp);
-    assert(feas !== null, "3-hop path is structurally feasible (coverAmount succeeds)");
-    assert(feas!.liqFeasible === true, "3-hop path is liquidity-feasible");
-    assert(feas!.prodFeasible === true, "3-hop path is production-feasible (passes risk ceilings)");
-    assert(feas!.split === false, "3-hop path does not require split (each offer has 50k capacity)");
+    const staged = checkPathFeasibilityStaged(threeHopPaths[0], amt, "BALANCED", world, sa, cp);
+    assert(staged !== null, "3-hop path is structurally feasible (coverAmount succeeds)");
+    assert(staged!.liquidityFeasible === true, "3-hop path is liquidity-feasible");
+    assert(staged!.productionFeasible === true, "3-hop path is production-feasible (passes risk ceilings)");
+    assert(staged!.split === false, "3-hop path does not require split (each offer has 50k capacity)");
   }
 
   // --- 5. 4-hop path is reachable ---
@@ -297,7 +297,7 @@ async function main() {
     const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { USDC: 50000 });
     const p2 = makeProvider("p2", "COLLATERALIZED", "BANK", 0.9, { EURC: 50000 });
     const p3 = makeProvider("p3", "COLLATERALIZED", "BANK", 0.9, { GBP: 50000 });
-    const p4 = makeProvider("p4", "COLLATERALIZED", "BANK", 0.9, { NGN: 50000 });
+    const p4 = makeProvider("p4", "COLLATERALIZED", "BANK", 0.9, { NGN: 5000000 });
     const o1 = makeOffer("o1", "p1", "USD", "US", "USDC", "GLOBAL", 1.0, 10, 50000, "asset_usdc");
     const o2 = makeOffer("o2", "p2", "USDC", "GLOBAL", "EURC", "GLOBAL", 1.08, 10, 50000, "asset_eurc");
     const o3 = makeOffer("o3", "p3", "EURC", "GLOBAL", "GBP", "GLOBAL", 0.85, 10, 50000, "asset_usdc");
@@ -317,10 +317,10 @@ async function main() {
     assert(fourHopPaths.length > 0, "4-hop path USD→USDC→EURC→GBP→NGN is discovered");
 
     const amt = 1000;
-    const feas = checkPathFeasibility(fourHopPaths[0], amt, "BALANCED", world, sa, cp);
-    assert(feas !== null, "4-hop path is structurally feasible");
-    assert(feas!.liqFeasible === true, "4-hop path is liquidity-feasible");
-    assert(feas!.prodFeasible === true, "4-hop path is production-feasible");
+    const staged = checkPathFeasibilityStaged(fourHopPaths[0], amt, "BALANCED", world, sa, cp);
+    assert(staged !== null, "4-hop path is structurally feasible");
+    assert(staged!.liquidityFeasible === true, "4-hop path is liquidity-feasible");
+    assert(staged!.productionFeasible === true, "4-hop path is production-feasible");
   }
 
   // --- 6. Per-user risk tolerance changes production reachability ---
@@ -330,7 +330,7 @@ async function main() {
     // cpRisk ≈ 0.40 (base) + 0.08 (DEX) + (1-0.3)*0.2 = 0.40 + 0.08 + 0.14 = 0.62
     // MAX_RELIABILITY ceiling = 0.30 → 0.62 > 0.30 → REJECTED
     // LOWEST_COST ceiling = 0.80 → 0.62 < 0.80 → ACCEPTED
-    const riskyProvider = makeProvider("risky", "NON_CUSTODIAL", "DEX", 0.3, { NGN: 50000 });
+    const riskyProvider = makeProvider("risky", "NON_CUSTODIAL", "DEX", 0.3, { NGN: 5000000 });
     const offer = makeOffer("offer_risky", "risky", "USD", "US", "NGN", "NG", 500, 10, 50000, "asset_usdc");
     const world = buildTestWorld([riskyProvider], [offer], [stableAsset]);
     const { sa, cp } = buildRiskCaches(world);
@@ -341,16 +341,16 @@ async function main() {
     }];
 
     const amt = 1000;
-    const feasMaxRel = checkPathFeasibility(path, amt, "MAX_RELIABILITY", world, sa, cp);
-    const feasLowCost = checkPathFeasibility(path, amt, "LOWEST_COST", world, sa, cp);
+    const stagedMaxRel = checkPathFeasibilityStaged(path, amt, "MAX_RELIABILITY", world, sa, cp);
+    const stagedLowCost = checkPathFeasibilityStaged(path, amt, "LOWEST_COST", world, sa, cp);
 
-    assert(feasMaxRel !== null, "Risky provider: structurally feasible for MAX_RELIABILITY");
-    assert(feasMaxRel!.liqFeasible === true, "Risky provider: liquidity-feasible for MAX_RELIABILITY");
-    assert(feasMaxRel!.prodFeasible === false, "Risky provider: NOT production-feasible for MAX_RELIABILITY (risk > ceiling)");
+    assert(stagedMaxRel !== null, "Risky provider: structurally feasible for MAX_RELIABILITY");
+    assert(stagedMaxRel!.liquidityFeasible === true, "Risky provider: liquidity-feasible for MAX_RELIABILITY");
+    assert(stagedMaxRel!.productionFeasible === false, "Risky provider: NOT production-feasible for MAX_RELIABILITY (risk > ceiling)");
 
-    assert(feasLowCost !== null, "Risky provider: structurally feasible for LOWEST_COST");
-    assert(feasLowCost!.liqFeasible === true, "Risky provider: liquidity-feasible for LOWEST_COST");
-    assert(feasLowCost!.prodFeasible === true, "Risky provider: production-feasible for LOWEST_COST (risk < ceiling)");
+    assert(stagedLowCost !== null, "Risky provider: structurally feasible for LOWEST_COST");
+    assert(stagedLowCost!.liquidityFeasible === true, "Risky provider: liquidity-feasible for LOWEST_COST");
+    assert(stagedLowCost!.productionFeasible === true, "Risky provider: production-feasible for LOWEST_COST (risk < ceiling)");
 
     // Verify the risk values explicitly.
     const cpRisk = cp.get("risky")!;
@@ -362,8 +362,8 @@ async function main() {
   console.log("\n== 7. Split direct route classification ==");
   {
     // Two providers, each with $6k / $4k capacity. Demand $10k → split.
-    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 50000 });
-    const p2 = makeProvider("p2", "COLLATERALIZED", "BANK", 0.9, { NGN: 50000 });
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 5000000 });
+    const p2 = makeProvider("p2", "COLLATERALIZED", "BANK", 0.9, { NGN: 5000000 });
     const o1 = makeOffer("o1", "p1", "USD", "US", "NGN", "NG", 500, 10, 6000, "asset_usdc");
     const o2 = makeOffer("o2", "p2", "USD", "US", "NGN", "NG", 500, 10, 4000, "asset_usdc");
     const world = buildTestWorld([p1, p2], [o1, o2], [stableAsset]);
@@ -375,17 +375,17 @@ async function main() {
     }];
 
     const amt = 10000;
-    const feas = checkPathFeasibility(path, amt, "BALANCED", world, sa, cp);
-    assert(feas !== null, "Split direct: structurally feasible (6k + 4k covers 10k)");
-    assert(feas!.liqFeasible === true, "Split direct: liquidity-feasible");
-    assert(feas!.prodFeasible === true, "Split direct: production-feasible");
-    assert(feas!.split === true, "Split direct: classified as split (split: true)");
+    const staged = checkPathFeasibilityStaged(path, amt, "BALANCED", world, sa, cp);
+    assert(staged !== null, "Split direct: structurally feasible (6k + 4k covers 10k)");
+    assert(staged!.liquidityFeasible === true, "Split direct: liquidity-feasible");
+    assert(staged!.productionFeasible === true, "Split direct: production-feasible");
+    assert(staged!.split === true, "Split direct: classified as split (split: true)");
 
     // Verify with $5k demand → single offer (o1 has 6k ≥ 5k) → not split.
-    const feas5k = checkPathFeasibility(path, 5000, "BALANCED", world, sa, cp);
-    assert(feas5k !== null, "5k demand: structurally feasible");
-    assert(feas5k!.split === false, "5k demand: not a split (single offer o1 covers it)");
-    assert(feas5k!.prodFeasible === true, "5k demand: production-feasible");
+    const staged5k = checkPathFeasibilityStaged(path, 5000, "BALANCED", world, sa, cp);
+    assert(staged5k !== null, "5k demand: structurally feasible");
+    assert(staged5k!.split === false, "5k demand: not a split (single offer o1 covers it)");
+    assert(staged5k!.productionFeasible === true, "5k demand: production-feasible");
   }
 
   // --- 8. Liquidity failure: provider lacks destination-asset balance ---
@@ -400,10 +400,10 @@ async function main() {
     const path: { fromNode: string; toNode: string; edges: SimOffer[] }[] = [{
       fromNode: "USD:US", toNode: "NGN:NG", edges: [offer],
     }];
-    const feas = checkPathFeasibility(path, 1000, "BALANCED", world, sa, cp);
-    assert(feas !== null, "No-liquidity: structurally feasible (capacity exists)");
-    assert(feas!.liqFeasible === false, "No-liquidity: NOT liquidity-feasible (no NGN balance)");
-    assert(feas!.prodFeasible === false, "No-liquidity: NOT production-feasible (liq fails → prod fails)");
+    const staged = checkPathFeasibilityStaged(path, 1000, "BALANCED", world, sa, cp);
+    assert(staged !== null, "No-liquidity: structurally feasible (capacity exists)");
+    assert(staged!.liquidityFeasible === false, "No-liquidity: NOT liquidity-feasible (no NGN balance)");
+    assert(staged!.productionFeasible === false, "No-liquidity: NOT production-feasible (liq fails → prod fails)");
   }
 
   // =========================================================================
@@ -448,7 +448,7 @@ async function main() {
   {
     // SimOffer with 6000 available (unreserved) + 4000 reserved = 10000 total.
     // Provider has 50000 NGN liquidity (plenty).
-    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 50000 });
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 5000000 });
     // Create offer with simulator semantics: available=6000, reserved=4000.
     const offer = makeOffer("o1", "p1", "USD", "US", "NGN", "NG", 500, 10, 10000, "asset_usdc");
     offer.availableCapacity = 6000; // simulator: currently unreserved
@@ -463,16 +463,16 @@ async function main() {
     // Demand = 5000: simulator available = 6000 ≥ 5000 → FEASIBLE.
     // With adapter: coverAmount sees total=10000, reserved=4000, usable=6000 ≥ 5000. ✓
     // WITHOUT adapter: coverAmount sees avail=6000, reserved=4000, usable=2000 < 5000. ✗ (BUG)
-    const feas5k = checkPathFeasibility(path, 5000, "BALANCED", world, sa, cp);
-    assert(feas5k !== null, "Reserved offer (6k avail/4k reserved): structurally feasible for 5k");
-    assert(feas5k!.liqFeasible === true, "Reserved offer (6k avail/4k reserved): 5k IS liquidity-feasible (adapter gives usable=6k ≥ 5k)");
-    assert(feas5k!.prodFeasible === true, "Reserved offer (6k avail/4k reserved): 5k IS production-feasible");
+    const staged5k = checkPathFeasibilityStaged(path, 5000, "BALANCED", world, sa, cp);
+    assert(staged5k !== null, "Reserved offer (6k avail/4k reserved): structurally feasible for 5k");
+    assert(staged5k!.liquidityFeasible === true, "Reserved offer (6k avail/4k reserved): 5k IS liquidity-feasible (adapter gives usable=6k ≥ 5k)");
+    assert(staged5k!.productionFeasible === true, "Reserved offer (6k avail/4k reserved): 5k IS production-feasible");
 
     // Demand = 8000: simulator available = 6000 < 8000 → NOT feasible.
     // With adapter: coverAmount sees usable=6000 < 8000. ✗ (correct)
     // WITHOUT adapter: coverAmount sees usable=2000 < 8000. ✗ (also rejects, but for wrong reason)
-    const feas8k = checkPathFeasibility(path, 8000, "BALANCED", world, sa, cp);
-    assert(feas8k === null || feas8k.liqFeasible === false,
+    const staged8k = checkPathFeasibilityStaged(path, 8000, "BALANCED", world, sa, cp);
+    assert(staged8k === null || staged8k.liquidityFeasible === false,
       "Reserved offer (6k avail/4k reserved): 8k NOT feasible (usable=6k < 8k)");
   }
 
@@ -480,8 +480,8 @@ async function main() {
   // Wait — 6k+6k=12k usable ≥ 10k → should split.
   // But each offer has only 6k usable, so neither can cover 10k alone → split.
   {
-    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 50000 });
-    const p2 = makeProvider("p2", "COLLATERALIZED", "BANK", 0.9, { NGN: 50000 });
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 5000000 });
+    const p2 = makeProvider("p2", "COLLATERALIZED", "BANK", 0.9, { NGN: 5000000 });
     // Two offers, each with simulator semantics: available=6000, reserved=4000, total=10000.
     const o1 = makeOffer("o1", "p1", "USD", "US", "NGN", "NG", 500, 10, 10000, "asset_usdc");
     o1.availableCapacity = 6000; o1.reservedCapacity = 4000;
@@ -497,11 +497,11 @@ async function main() {
     // Demand = 10000: each offer has usable=6000. Neither can cover 10k alone.
     // Split: 6000 + 4000 = 10000. ✓ (with adapter)
     // WITHOUT adapter: each offer has buggy usable=2000. 2000+2000=4000 < 10000 → infeasible (BUG).
-    const feas = checkPathFeasibility(path, 10000, "BALANCED", world, sa, cp);
-    assert(feas !== null, "Split with reservations: structurally feasible (6k+6k usable ≥ 10k)");
-    assert(feas!.liqFeasible === true, "Split with reservations: liquidity-feasible (adapter gives each 6k usable, split 6k+4k)");
-    assert(feas!.prodFeasible === true, "Split with reservations: production-feasible");
-    assert(feas!.split === true, "Split with reservations: classified as split (neither offer covers 10k alone)");
+    const staged = checkPathFeasibilityStaged(path, 10000, "BALANCED", world, sa, cp);
+    assert(staged !== null, "Split with reservations: structurally feasible (6k+6k usable ≥ 10k)");
+    assert(staged!.liquidityFeasible === true, "Split with reservations: liquidity-feasible (adapter gives each 6k usable, split 6k+4k)");
+    assert(staged!.productionFeasible === true, "Split with reservations: production-feasible");
+    assert(staged!.split === true, "Split with reservations: classified as split (neither offer covers 10k alone)");
   }
 
   // 9e. No reservations (reservedCapacity=0): adapter is a no-op.
@@ -518,7 +518,7 @@ async function main() {
   // =========================================================================
   console.log("\n== 10. Downstream-constrained 5k/5k split (4.8.8N) ==");
 
-  const { checkPathFeasibilityStaged, checkAlternativeProductionFeasibility } = await import("../experiments/p4-topology-experiment");
+  const { checkAlternativeProductionFeasibility } = await import("../experiments/p4-topology-experiment");
 
   // The critical counterexample: demand 10k, hop 1 has A (mult 2.0) and B (mult 1.0).
   // Hop 2 requires exactly 15k input (min=max=15k). Only A=5k, B=5k works:

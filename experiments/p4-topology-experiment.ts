@@ -868,127 +868,110 @@ export function productionUsable(prod: ProductionCapacity): number {
   return prod.availableCapacity - prod.reservedCapacity;
 }
 
-export function checkPathFeasibility(
-  path: PathStep<SimOffer>[],
-  amount: number,
-  riskTolerance: string,
-  world: SimWorld,
-  saRiskCache: Map<string, number>,
-  cpRiskCache: Map<string, number>,
-): PathFeasibility | null {
-  let currentAmount = amount;
-  let split = false;
-  let liqFeasible = true;
-  let prodFeasible = true;
+// (Prompt 4.8.8Q) Legacy checkPathFeasibility DELETED.
+// The staged version (checkPathFeasibilityStaged) is the ONLY feasibility checker.
+// The legacy version had a source-vs-destination liquidity bug (dstLiquidity < a.amount
+// instead of dstLiquidity < hopResult.output) that was fixed in the staged version
+// but never removed from the legacy one. Keeping both was dangerous.
 
-  for (let i = 0; i < path.length; i++) {
-    const step = path[i];
-    // Convert SimOffers to CoverOffers for shared coverAmount.
-    // CRITICAL: apply the capacity-semantics adapter (Prompt 4.8.8A).
-    // Simulator availableCapacity = unreserved; production availableCapacity = total.
-    // Without the adapter, coverAmount would double-subtract reservations.
-    const coverOffers: CoverOffer[] = step.edges.map((o) => {
-      const prodCap = toProductionCapacity({
-        availableCapacity: o.availableCapacity,
-        reservedCapacity: o.reservedCapacity,
-      });
-      return {
-        id: o.id,
-        channelType: o.channelType,
-        feeBps: o.feeBps,
-        availableCapacity: prodCap.availableCapacity,
-        reservedCapacity: prodCap.reservedCapacity,
-        minimumAmount: o.minimumAmount,
-      };
-    });
-
-    const cover = coverAmount(coverOffers, currentAmount);
-    if (!cover) return null; // structural infeasibility: insufficient combined capacity
-    if (cover.split) split = true;
-
-    let hopOutputTotal = 0;
-    for (const a of cover.assignments) {
-      const offer = step.edges.find((e) => e.id === a.offerId);
-      if (!offer) return null; // shouldn't happen
-      const provider = world.providers.get(offer.providerId);
-      // Provider status (production hard filter via buildGraph).
-      if (!provider || provider.status !== "ACTIVE") {
-        liqFeasible = false; prodFeasible = false; return { liqFeasible, prodFeasible, split };
-      }
-      // Min/max limits (production checks min in coverAmount; max is an additional
-      // feasibility constraint the experiment applies for executability).
-      if (a.amount < offer.minimumAmount || a.amount > offer.maximumAmount) {
-        liqFeasible = false; prodFeasible = false; return { liqFeasible, prodFeasible, split };
-      }
-      // Destination liquidity: provider must hold enough of THIS hop's destination asset.
-      // (Production checks this at execution time; the experiment checks for feasibility.)
-      const hopDstAsset = offer.destinationAsset;
-      const dstLiquidity = provider.liquidity.balances.get(hopDstAsset) ?? 0;
-      if (dstLiquidity < a.amount) {
-        liqFeasible = false; prodFeasible = false; return { liqFeasible, prodFeasible, split };
-      }
-      // Settlement-asset risk ceiling (production hard filter, per user risk tolerance).
-      // Uses cached risk value (precomputed once per extractMetrics call).
-      if (offer.settlementAssetId) {
-        const saRisk = saRiskCache.get(offer.settlementAssetId);
-        if (saRisk !== undefined && saRisk > assetRiskCeiling(riskTolerance)) {
-          prodFeasible = false; // liq still OK (risk doesn't affect liquidity feasibility)
-        }
-      }
-      // Counterparty risk ceiling (production hard filter, per user risk tolerance).
-      // Uses cached risk value (precomputed once per extractMetrics call).
-      const cpRisk = cpRiskCache.get(provider.id);
-      if (cpRisk !== undefined && cpRisk > counterpartyRiskCeiling(riskTolerance)) {
-        prodFeasible = false;
-      }
-      // Propagate amount via shared computeHopOutput (canonical hop economics).
-      const hopResult = computeHopOutput(a.amount, {
-        feeBps: offer.feeBps,
-        rate: offer.rate,
-        incentiveBps: offer.incentiveBps ?? 0,
-      });
-      hopOutputTotal += hopResult.output;
-    }
-    currentAmount = hopOutputTotal;
-  }
-
-  return { liqFeasible, prodFeasible, split };
-}
-
-// (Prompt 4.8.8P) Check if sufficient AGGREGATE capacity exists across parallel
+// (Prompt 4.8.8Q) Check if sufficient AGGREGATE capacity exists across parallel
 // offers on each hop, ignoring liquidity/risk/min-max. This is a physical
 // capacity check, NOT a greedy assignment check.
-// Returns true if the sum of usable capacities across all active offers on
-// each hop is sufficient to cover the propagated amount.
+//
+// For multi-hop paths with heterogeneous FX rates, the output of a hop depends
+// on how capacity is allocated across offers. We compute the feasible output
+// RANGE [minOutput, maxOutput] given the available capacities, then check if
+// SOME output in that range can be absorbed by the next hop's aggregate capacity.
+//
+// minOutput: all capacity through the lowest-multiplier offer
+// maxOutput: all capacity through the highest-multiplier offer
+// (For mixed allocations, any output in [minOutput, maxOutput] is achievable
+// by adjusting the split between offers.)
 export function checkAggregateCapacityFeasible(
   path: PathStep<SimOffer>[],
   amount: number,
   world: SimWorld,
 ): boolean {
-  let currentAmount = amount;
+  // State: the set of possible current amounts that can reach this hop.
+  // Initially just {amount}. After each hop, we compute the set of possible
+  // outputs. For efficiency, we track [minAmount, maxAmount] range.
+  let minAmount = amount;
+  let maxAmount = amount;
+
   for (let i = 0; i < path.length; i++) {
     const step = path[i];
-    let totalUsableCap = 0;
+    // Collect active offers with their usable capacity and output multiplier.
+    const offers: { usableCap: number; outputMultiplier: number }[] = [];
     for (const o of step.edges) {
       const provider = world.providers.get(o.providerId);
       if (!provider || provider.status !== "ACTIVE") continue;
       const prodCap = toProductionCapacity({ availableCapacity: o.availableCapacity, reservedCapacity: o.reservedCapacity });
       const usableCap = prodCap.availableCapacity - prodCap.reservedCapacity;
-      totalUsableCap += usableCap;
+      if (usableCap <= 0) continue;
+      const outputMultiplier = (1 - o.feeBps / 10000) * o.rate * (1 + (o.incentiveBps ?? 0) / 10000);
+      offers.push({ usableCap, outputMultiplier });
     }
-    if (totalUsableCap < currentAmount) return false;
-    // Propagate: use the FIRST offer's economics as representative for output
-    // (aggregate capacity doesn't depend on which specific offers are used).
-    const firstOffer = step.edges.find((o) => {
-      const p = world.providers.get(o.providerId);
-      return p && p.status === "ACTIVE";
-    });
-    if (firstOffer) {
-      const hopResult = computeHopOutput(currentAmount, {
-        feeBps: firstOffer.feeBps, rate: firstOffer.rate, incentiveBps: firstOffer.incentiveBps ?? 0,
-      });
-      currentAmount = hopResult.output;
+    if (offers.length === 0) return false;
+
+    const totalUsableCap = offers.reduce((s, o) => s + o.usableCap, 0);
+
+    // For each possible input amount in [minAmount, maxAmount], we need to check
+    // if total capacity is sufficient AND compute the output range.
+    // The minimum input we need to handle is minAmount.
+    // The maximum input we need to handle is maxAmount.
+    if (totalUsableCap < minAmount) return false;
+
+    // Compute output range for the feasible input range.
+    // minOutput: allocate as much as possible to the lowest-multiplier offer.
+    // maxOutput: allocate as much as possible to the highest-multiplier offer.
+    const sortedByMult = [...offers].sort((a, b) => a.outputMultiplier - b.outputMultiplier);
+    const minMult = sortedByMult[0].outputMultiplier;
+    const maxMult = sortedByMult[sortedByMult.length - 1].outputMultiplier;
+
+    // For minAmount input:
+    //   If totalCap >= minAmount, we can route minAmount through the lowest-mult offer
+    //   (up to its capacity), rest through others. Output ≥ minAmount * minMult.
+    //   But we want the MINIMUM output, so route everything through lowest-mult.
+    //   minOutput = minAmount * minMult (if lowest-mult offer has enough capacity)
+    //   Otherwise, split: some through higher-mult.
+    // For simplicity (and correctness as a bound):
+    //   minOutput = minAmount * minMult (lower bound on output)
+    //   maxOutput = maxAmount * maxMult (upper bound on output)
+    // But we also need to account for capacity constraints. If the lowest-mult
+    // offer has capacity < minAmount, some must go through higher-mult offers,
+    // increasing the minimum output.
+    //
+    // Exact min output: allocate to lowest-mult first, then next, etc.
+    function computeMinOutput(input: number): number {
+      let remaining = input;
+      let output = 0;
+      for (const o of sortedByMult) {
+        if (remaining <= 0) break;
+        const take = Math.min(remaining, o.usableCap);
+        output += take * o.outputMultiplier;
+        remaining -= take;
+      }
+      return remaining > 0 ? Infinity : output; // not enough capacity
     }
+    function computeMaxOutput(input: number): number {
+      let remaining = input;
+      let output = 0;
+      for (const o of [...sortedByMult].reverse()) {
+        if (remaining <= 0) break;
+        const take = Math.min(remaining, o.usableCap);
+        output += take * o.outputMultiplier;
+        remaining -= take;
+      }
+      return remaining > 0 ? -Infinity : output; // not enough capacity
+    }
+
+    const minOut = computeMinOutput(minAmount);
+    const maxOut = computeMaxOutput(maxAmount);
+    if (minOut === Infinity || maxOut === -Infinity) return false;
+
+    // The next hop can receive any amount in [minOut, maxOut].
+    minAmount = minOut;
+    maxAmount = maxOut;
   }
   return true;
 }
@@ -1040,7 +1023,7 @@ export interface RunMetrics {
 // The graph structure (which nodes are connected) doesn't change during a run
 // (no providers exit), so paths are enumerated ONCE and reused across all
 // extractMetrics calls. Only offer attributes (capacity, liquidity) change.
-export type PathCache = Map<string, { hop1: PathStep<SimOffer>[][]; hop2: PathStep<SimOffer>[][]; hop3: PathStep<SimOffer>[][]; hop4: PathStep<SimOffer>[][]; hop3Plus: PathStep<SimOffer>[][] }>;
+export type PathCache = Map<string, { hop1: PathStep<SimOffer>[][]; hop2: PathStep<SimOffer>[][]; hop3: PathStep<SimOffer>[][]; hop4: PathStep<SimOffer>[][] }>;
 
 export function buildPathCache(world: SimWorld): PathCache {
   const cache: PathCache = new Map();
@@ -1084,7 +1067,6 @@ export function buildPathCache(world: SimWorld): PathCache {
       hop2: (byHop.get(2) ?? []).slice(0, MAX_PATHS_PER_TIER),
       hop3: (byHop.get(3) ?? []).slice(0, MAX_PATHS_PER_TIER),
       hop4: (byHop.get(4) ?? []).slice(0, MAX_PATHS_PER_TIER),
-      hop3Plus: [...(byHop.get(3) ?? []), ...(byHop.get(4) ?? [])].slice(0, MAX_PATHS_PER_TIER),
     });
   }
   return cache;
@@ -1249,13 +1231,15 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
     // run). Otherwise, enumerate fresh (for standalone/test calls).
     let hop1Paths: PathStep<SimOffer>[][];
     let hop2Paths: PathStep<SimOffer>[][];
-    let hop3PlusPaths: PathStep<SimOffer>[][];
+    let hop3Paths: PathStep<SimOffer>[][];
+    let hop4Paths: PathStep<SimOffer>[][];
     const pathKey = `${source}→${dest}`;
     if (pathCache && pathCache.has(pathKey)) {
       const cached = pathCache.get(pathKey)!;
       hop1Paths = cached.hop1;
       hop2Paths = cached.hop2;
-      hop3PlusPaths = cached.hop3Plus;
+      hop3Paths = cached.hop3;
+      hop4Paths = cached.hop4;
     } else {
       const allPaths = enumeratePaths(adj, source, dest, MAX_HOPS);
       const seenSequences = new Set<string>();
@@ -1275,10 +1259,9 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
       }
       hop1Paths = (pathsByHop.get(1) ?? []).slice(0, MAX_PATHS_PER_TIER);
       hop2Paths = (pathsByHop.get(2) ?? []).slice(0, MAX_PATHS_PER_TIER);
-      // (Prompt 4.8.8P) hop3 and hop4 are now SEPARATE (not combined into shared bucket).
-      const hop3 = (pathsByHop.get(3) ?? []).slice(0, MAX_PATHS_PER_TIER);
-      const hop4 = (pathsByHop.get(4) ?? []).slice(0, MAX_PATHS_PER_TIER);
-      hop3PlusPaths = [...hop3, ...hop4];
+      // (Prompt 4.8.8Q) hop3 and hop4 evaluated SEPARATELY — no combined hop3Plus bucket.
+      hop3Paths = (pathsByHop.get(3) ?? []).slice(0, MAX_PATHS_PER_TIER);
+      hop4Paths = (pathsByHop.get(4) ?? []).slice(0, MAX_PATHS_PER_TIER);
     }
 
     // (Prompt 4.8.8O) REMOVED the invalid source-vs-destination liquidity
@@ -1379,13 +1362,32 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
         }
       }
 
-      // Tier 3+4: 3-hop and 4-hop paths.
+      // (Prompt 4.8.8Q) Tier 3: 3-hop paths (evaluated SEPARATELY from 4-hop).
       if (needBreakdown || !prodOK || !altProdOK) {
-        for (const path of hop3PlusPaths) {
+        for (const path of hop3Paths) {
           const staged = checkPathFeasibilityStaged(path, amt, rt, world, saRiskCache, cpRiskCache);
           if (!staged) continue;
           if (staged.capacityFeasible) capOK = true;
-        if (!aggCapOK && checkAggregateCapacityFeasible(path, amt, world)) aggCapOK = true;
+          if (!aggCapOK && checkAggregateCapacityFeasible(path, amt, world)) aggCapOK = true;
+          if (staged.liquidityFeasible) liqOK = true;
+          if (staged.inventoryFeasible) invOK = true;
+          if (staged.productionFeasible) {
+            prodOK = true;
+            if (needBreakdown) hasThreePlusHop = true;
+          }
+          if (staged.alternativeProductionFeasible) altProdOK = true;
+          if (!needBreakdown && prodOK && altProdOK) break;
+          if (needBreakdown && hasThreePlusHop) break;
+        }
+      }
+
+      // (Prompt 4.8.8Q) Tier 4: 4-hop paths (evaluated SEPARATELY from 3-hop).
+      if (needBreakdown || !prodOK || !altProdOK) {
+        for (const path of hop4Paths) {
+          const staged = checkPathFeasibilityStaged(path, amt, rt, world, saRiskCache, cpRiskCache);
+          if (!staged) continue;
+          if (staged.capacityFeasible) capOK = true;
+          if (!aggCapOK && checkAggregateCapacityFeasible(path, amt, world)) aggCapOK = true;
           if (staged.liquidityFeasible) liqOK = true;
           if (staged.inventoryFeasible) invOK = true;
           if (staged.productionFeasible) {
