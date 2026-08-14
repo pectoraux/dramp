@@ -60,13 +60,11 @@ const MAX_HOPS = 4;
 // evenly-spaced sampling captures the feasibility threshold accurately.
 const MAX_DEMANDS_FULL = 8;   // full mode (breakdown): 8 samples per corridor
 const MAX_DEMANDS_TOTAL = 4;  // total mode (time-series): 4 samples per corridor
-// Path limit per tier: cap the number of paths checked per hop-count tier.
-// With maxHops=4 on a 100-provider graph, enumeratePaths can generate hundreds
-// of paths per corridor. For infeasible demands (the majority), all paths get
-// checked. Capping at 15 per tier bounds the worst case while still finding
-// feasible paths in virtually all real cases (the shortest 15 paths are checked
-// first, sorted by hop count).
-const MAX_PATHS_PER_TIER = 15;
+// (Prompt 4.8.8P) Path limit per tier: high enough to cover all paths in
+// practice. Previous cap of 15 per tier could hide feasible paths. Now set
+// to 10000 (effectively unlimited for the experiment's graph sizes).
+// The path cache still deduplicates by node sequence and sorts by hop count.
+const MAX_PATHS_PER_TIER = 10000;
 
 let idCounter = 0;
 function nextId(prefix: string): string { return `${prefix}_${++idCounter}`; }
@@ -957,13 +955,52 @@ export function checkPathFeasibility(
   return { liqFeasible, prodFeasible, split };
 }
 
+// (Prompt 4.8.8P) Check if sufficient AGGREGATE capacity exists across parallel
+// offers on each hop, ignoring liquidity/risk/min-max. This is a physical
+// capacity check, NOT a greedy assignment check.
+// Returns true if the sum of usable capacities across all active offers on
+// each hop is sufficient to cover the propagated amount.
+export function checkAggregateCapacityFeasible(
+  path: PathStep<SimOffer>[],
+  amount: number,
+  world: SimWorld,
+): boolean {
+  let currentAmount = amount;
+  for (let i = 0; i < path.length; i++) {
+    const step = path[i];
+    let totalUsableCap = 0;
+    for (const o of step.edges) {
+      const provider = world.providers.get(o.providerId);
+      if (!provider || provider.status !== "ACTIVE") continue;
+      const prodCap = toProductionCapacity({ availableCapacity: o.availableCapacity, reservedCapacity: o.reservedCapacity });
+      const usableCap = prodCap.availableCapacity - prodCap.reservedCapacity;
+      totalUsableCap += usableCap;
+    }
+    if (totalUsableCap < currentAmount) return false;
+    // Propagate: use the FIRST offer's economics as representative for output
+    // (aggregate capacity doesn't depend on which specific offers are used).
+    const firstOffer = step.edges.find((o) => {
+      const p = world.providers.get(o.providerId);
+      return p && p.status === "ACTIVE";
+    });
+    if (firstOffer) {
+      const hopResult = computeHopOutput(currentAmount, {
+        feeBps: firstOffer.feeBps, rate: firstOffer.rate, incentiveBps: firstOffer.incentiveBps ?? 0,
+      });
+      currentAmount = hopResult.output;
+    }
+  }
+  return true;
+}
+
 // ---- Metrics ----
 export interface RunMetrics {
   executionAttemptRate: number;
   // Five-level reachability ladder (each stricter than the last).
   assetReachablePct: number;                    // Abstract asset path (ignores countries)
-  corridorReachablePct: number;                 // Asset + country match
-  capacityExecutableReachabilityPct: number;    // B: + coverAmount succeeds
+  corridorReachablePct: number;                 // Asset + country match (4-hop graph)
+  aggregateCapacityReachabilityPct: number;     // B-physical: sufficient aggregate capacity exists (not greedy)
+  capacityExecutableReachabilityPct: number;    // B-greedy: coverAmount succeeds
   liquidityExecutableReachabilityPct: number;   // C: + dest liquidity (greedy coverAmount, output-aware)
   inventoryExecutableReachabilityPct: number;   // C': SOME assignment has liquidity (ignores risk)
   productionExecutableReachabilityPct: number;  // D: + risk ceilings, min/max, provider status (greedy)
@@ -1003,7 +1040,7 @@ export interface RunMetrics {
 // The graph structure (which nodes are connected) doesn't change during a run
 // (no providers exit), so paths are enumerated ONCE and reused across all
 // extractMetrics calls. Only offer attributes (capacity, liquidity) change.
-export type PathCache = Map<string, { hop1: PathStep<SimOffer>[][]; hop2: PathStep<SimOffer>[][]; hop3Plus: PathStep<SimOffer>[][] }>;
+export type PathCache = Map<string, { hop1: PathStep<SimOffer>[][]; hop2: PathStep<SimOffer>[][]; hop3: PathStep<SimOffer>[][]; hop4: PathStep<SimOffer>[][]; hop3Plus: PathStep<SimOffer>[][] }>;
 
 export function buildPathCache(world: SimWorld): PathCache {
   const cache: PathCache = new Map();
@@ -1045,6 +1082,8 @@ export function buildPathCache(world: SimWorld): PathCache {
     cache.set(key, {
       hop1: (byHop.get(1) ?? []).slice(0, MAX_PATHS_PER_TIER),
       hop2: (byHop.get(2) ?? []).slice(0, MAX_PATHS_PER_TIER),
+      hop3: (byHop.get(3) ?? []).slice(0, MAX_PATHS_PER_TIER),
+      hop4: (byHop.get(4) ?? []).slice(0, MAX_PATHS_PER_TIER),
       hop3Plus: [...(byHop.get(3) ?? []), ...(byHop.get(4) ?? [])].slice(0, MAX_PATHS_PER_TIER),
     });
   }
@@ -1159,6 +1198,7 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
   let assetReachableVolume = 0;
   let corridorReachableVolume = 0;
   let capacityExecutableVolume = 0;
+  let aggregateCapacityVolume = 0;
   let liqExecutableVolume = 0;
   let inventoryExecutableVolume = 0;
   let prodExecutableVolume = 0;
@@ -1235,7 +1275,10 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
       }
       hop1Paths = (pathsByHop.get(1) ?? []).slice(0, MAX_PATHS_PER_TIER);
       hop2Paths = (pathsByHop.get(2) ?? []).slice(0, MAX_PATHS_PER_TIER);
-      hop3PlusPaths = [...(pathsByHop.get(3) ?? []), ...(pathsByHop.get(4) ?? [])].slice(0, MAX_PATHS_PER_TIER);
+      // (Prompt 4.8.8P) hop3 and hop4 are now SEPARATE (not combined into shared bucket).
+      const hop3 = (pathsByHop.get(3) ?? []).slice(0, MAX_PATHS_PER_TIER);
+      const hop4 = (pathsByHop.get(4) ?? []).slice(0, MAX_PATHS_PER_TIER);
+      hop3PlusPaths = [...hop3, ...hop4];
     }
 
     // (Prompt 4.8.8O) REMOVED the invalid source-vs-destination liquidity
@@ -1246,6 +1289,7 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
     // before comparing against the provider's balance.
 
     let capacityExecutableWeight = 0;
+    let aggregateCapacityWeight = 0;
     let liqExecutableWeight = 0;
     let inventoryExecutableWeight = 0;
     let prodExecutableWeight = 0;
@@ -1283,6 +1327,7 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
       const amt = demand.amount;
       const rt = demand.riskTolerance;
       let capOK = false;
+      let aggCapOK = false;
       let liqOK = false;
       let invOK = false;
       let prodOK = false;
@@ -1300,6 +1345,7 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
         const staged = checkPathFeasibilityStaged(path, amt, rt, world, saRiskCache, cpRiskCache);
         if (!staged) continue;
         if (staged.capacityFeasible) capOK = true;
+        if (!aggCapOK && checkAggregateCapacityFeasible(path, amt, world)) aggCapOK = true;
         if (staged.liquidityFeasible) liqOK = true;
         if (staged.inventoryFeasible) invOK = true;
         if (staged.productionFeasible) {
@@ -1320,6 +1366,7 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
           const staged = checkPathFeasibilityStaged(path, amt, rt, world, saRiskCache, cpRiskCache);
           if (!staged) continue;
           if (staged.capacityFeasible) capOK = true;
+        if (!aggCapOK && checkAggregateCapacityFeasible(path, amt, world)) aggCapOK = true;
           if (staged.liquidityFeasible) liqOK = true;
           if (staged.inventoryFeasible) invOK = true;
           if (staged.productionFeasible) {
@@ -1338,6 +1385,7 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
           const staged = checkPathFeasibilityStaged(path, amt, rt, world, saRiskCache, cpRiskCache);
           if (!staged) continue;
           if (staged.capacityFeasible) capOK = true;
+        if (!aggCapOK && checkAggregateCapacityFeasible(path, amt, world)) aggCapOK = true;
           if (staged.liquidityFeasible) liqOK = true;
           if (staged.inventoryFeasible) invOK = true;
           if (staged.productionFeasible) {
@@ -1351,6 +1399,7 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
       }
 
       if (capOK) capacityExecutableWeight += demand.weight;
+      if (aggCapOK) aggregateCapacityWeight += demand.weight;
       if (liqOK) liqExecutableWeight += demand.weight;
       if (invOK) inventoryExecutableWeight += demand.weight;
       if (prodOK) {
@@ -1365,6 +1414,7 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
 
     // Amount-weighted reachability for this corridor.
     if (capacityExecutableWeight > 0) capacityExecutableVolume += capacityExecutableWeight;
+    if (aggregateCapacityWeight > 0) aggregateCapacityVolume += aggregateCapacityWeight;
     if (liqExecutableWeight > 0) { liqExecutableReachablePairs++; liqExecutableVolume += liqExecutableWeight; }
     if (inventoryExecutableWeight > 0) inventoryExecutableVolume += inventoryExecutableWeight;
     if (prodExecutableWeight > 0) { prodExecutableReachablePairs++; prodExecutableVolume += prodExecutableWeight; }
@@ -1377,6 +1427,7 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
 
   const assetReachablePct = totalDemandWeight > 0 ? (assetReachableVolume / totalDemandWeight) * 100 : 0;
   const corridorReachablePct = totalDemandWeight > 0 ? (corridorReachableVolume / totalDemandWeight) * 100 : 0;
+  const aggCapPct = totalDemandWeight > 0 ? (aggregateCapacityVolume / totalDemandWeight) * 100 : 0;
   const capExecutablePct = totalDemandWeight > 0 ? (capacityExecutableVolume / totalDemandWeight) * 100 : 0;
   const liqExecutablePct = totalDemandWeight > 0 ? (liqExecutableVolume / totalDemandWeight) * 100 : 0;
   const invExecutablePct = totalDemandWeight > 0 ? (inventoryExecutableVolume / totalDemandWeight) * 100 : 0;
@@ -1402,6 +1453,7 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
     executionAttemptRate: intents.length > 0 ? (intents.filter((i: any) => i.status === "COMPLETED" || i.status === "EXECUTING" || i.status === "FAILED").length / intents.length) * 100 : 0,
     assetReachablePct: Math.round(assetReachablePct * 100) / 100,
     corridorReachablePct: Math.round(corridorReachablePct * 100) / 100,
+    aggregateCapacityReachabilityPct: Math.round(aggCapPct * 100) / 100,
     capacityExecutableReachabilityPct: Math.round(capExecutablePct * 100) / 100,
     liquidityExecutableReachabilityPct: Math.round(liqExecutablePct * 100) / 100,
     inventoryExecutableReachabilityPct: Math.round(invExecutablePct * 100) / 100,
@@ -1608,38 +1660,41 @@ function printResults(results: Result[]) {
     console.log(`| ${r.density} | ${r.topology} | ${statsLabel(rp)} | ${statsLabel(tp)} | ${statsLabel(mr)} |`);
   }
 
-  // Conclusion: Production routing opportunity
-  console.log("\n### Conclusion: Production Routing Opportunity (P4.8.8N)\n");
+  // Conclusion: Final routing diagnostic (Prompt 4.8.8P)
+  console.log("\n### Conclusion: Final Routing Diagnostic (P4.8.8P)\n");
   for (const topo of TOPOLOGIES) {
     const r100 = results.find(r => r.density === 100 && r.topology === topo);
     if (r100) {
       const medCorridor = percentile(r100.metrics.map(m => m.corridorReachablePct), 0.5);
+      const medAggCap = percentile(r100.metrics.map(m => m.aggregateCapacityReachabilityPct), 0.5);
       const medCap = percentile(r100.metrics.map(m => m.capacityExecutableReachabilityPct), 0.5);
       const medLiq = percentile(r100.metrics.map(m => m.liquidityExecutableReachabilityPct), 0.5);
       const medInv = percentile(r100.metrics.map(m => m.inventoryExecutableReachabilityPct), 0.5);
       const medProd = percentile(r100.metrics.map(m => m.productionExecutableReachabilityPct), 0.5);
       const medAltProd = percentile(r100.metrics.map(m => m.alternativeProductionExecutableReachabilityPct), 0.5);
       const medComp = percentile(r100.metrics.map(m => m.completionRate), 0.5);
-      const medMultiHop = percentile(r100.metrics.map(m => m.multiHopPercentage), 0.5);
 
-      const liquidityAvailabilityGain = medInv - medLiq;
-      const productionRoutingGain = medAltProd - medProd;
+      const capacityGap = medAggCap - medCap;
+      const inventoryGap = medCap - medInv;
+      const routingGainLowerBound = medAltProd - medProd;
+      const trueInventoryGap = medAggCap - medAltProd;
 
       console.log(`  ${topo} @ 100:`);
-      console.log(`    Reachability ladder (demand-weighted %):`);
-      console.log(`      A. Structural (4-hop graph):    ${medCorridor.toFixed(1)}%`);
-      console.log(`      B. + Capacity:                  ${medCap.toFixed(1)}%`);
-      console.log(`      C. + Greedy liquidity:          ${medLiq.toFixed(1)}%`);
-      console.log(`      C'. + Inventory-feasible:       ${medInv.toFixed(1)}%  (SOME assignment has liquidity)`);
-      console.log(`      D. + Greedy production:         ${medProd.toFixed(1)}%  (greedy coverAmount + risk)`);
-      console.log(`      D'. + Alternative production:   ${medAltProd.toFixed(1)}%  (SOME assignment satisfies ALL constraints)`);
-      console.log(`    Gains from inventory-aware routing:`);
-      console.log(`      Liquidity availability gain (C→C'):  ${liquidityAvailabilityGain.toFixed(1)} pp  (more demand has SOME liquidity)`);
-      console.log(`      Production routing gain (D→D'):      ${productionRoutingGain.toFixed(1)} pp  (more demand is production-executable)`);
-      console.log(`      NOTE: Only the production routing gain is addressable by changing the router.`);
-      console.log(`    Realized execution (separate population — NOT subtracted from D):`);
-      console.log(`      Completion rate:               ${medComp.toFixed(1)}%`);
-      console.log(`      Multi-hop share of completions: ${medMultiHop.toFixed(1)}%`);
+      console.log(`    Reachability ladder (demand-weighted %, medians):`);
+      console.log(`      A.  Structural (4-hop graph):     ${medCorridor.toFixed(1)}%`);
+      console.log(`      Bp. + Aggregate capacity:         ${medAggCap.toFixed(1)}%  (physical capacity exists)`);
+      console.log(`      Bg. + Greedy capacity:            ${medCap.toFixed(1)}%  (coverAmount assignment)`);
+      console.log(`      C.  + Greedy liquidity:           ${medLiq.toFixed(1)}%`);
+      console.log(`      C'. + Alt inventory (LOWER_BOUND): ${medInv.toFixed(1)}%`);
+      console.log(`      D.  + Greedy production:          ${medProd.toFixed(1)}%`);
+      console.log(`      D'. + Alt production (LOWER_BOUND):${medAltProd.toFixed(1)}%`);
+      console.log(`    Decomposition (where demand is lost):`);
+      console.log(`      Structural loss:        ${(100 - medCorridor).toFixed(1)} pp`);
+      console.log(`      Capacity-assignment loss (Bp→Bg):  ${capacityGap.toFixed(1)} pp  (greedy coverAmount failure)`);
+      console.log(`      Inventory gap (Bg→C'):             ${inventoryGap.toFixed(1)} pp  (destination liquidity missing)`);
+      console.log(`      True inventory gap (Bp→D'):        ${trueInventoryGap.toFixed(1)} pp  (after alt routing)`);
+      console.log(`      Routing gain LOWER_BOUND (D→D'):   ${routingGainLowerBound.toFixed(1)} pp  (addressable by router change)`);
+      console.log(`    Completion (separate population):   ${medComp.toFixed(1)}%`);
     }
   }
 }
