@@ -1177,49 +1177,40 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
     const [dstAsset, dstCountry] = dstPart.split(":");
     const weight = demands.reduce((s, d) => s + d.weight, 0);
 
-    // 1. ASSET reachability (ignores countries) — structural graph check.
-    let assetReachable = false;
-    let routeCount = 0;
-    const directAsset = activeOffers.filter(o => o.sourceAsset === srcAsset && o.destinationAsset === dstAsset);
-    if (directAsset.length > 0) { assetReachable = true; routeCount += directAsset.length; }
-    for (const sa of settlementAssetSymbols) {
-      const hop1 = activeOffers.filter(o => o.sourceAsset === srcAsset && o.destinationAsset === sa);
-      const hop2 = activeOffers.filter(o => o.sourceAsset === sa && o.destinationAsset === dstAsset);
-      if (hop1.length > 0 && hop2.length > 0) { assetReachable = true; routeCount += Math.min(hop1.length, hop2.length); }
+    // (Prompt 4.8.8O) Structural reachability now uses the SAME 4-hop graph
+    // as production-faithful feasibility. Previously this only checked direct
+    // + single settlement-asset hop (2-hop max), which was a lower bound on
+    // actual graph connectivity. Now uses enumeratePaths(MAX_HOPS=4).
+    //
+    // Build asset-level adjacency (ignores countries) for asset reachability.
+    const assetAdj = new Map<string, AdjacencyEdge<SimOffer>[]>();
+    for (const o of activeOffers) {
+      const provider = world.providers.get(o.providerId);
+      if (!provider || provider.status !== "ACTIVE") continue;
+      if (!assetAdj.has(o.sourceAsset)) assetAdj.set(o.sourceAsset, []);
+      assetAdj.get(o.sourceAsset)!.push({ to: o.destinationAsset, edge: o });
     }
+    const assetPaths = enumeratePaths(assetAdj, srcAsset, dstAsset, MAX_HOPS);
+    const assetReachable = assetPaths.length > 0;
+    const routeCount = assetPaths.length;
     if (assetReachable) { assetReachablePairs++; assetReachableVolume += weight; }
 
-    // 2. CORRIDOR reachability (matches asset AND country) — structural graph check.
-    let corridorReachable = false;
-    let corridorRouteCount = 0;
-    const directCorridor = activeOffers.filter(o =>
-      o.sourceAsset === srcAsset && o.sourceCountry === srcCountry &&
-      o.destinationAsset === dstAsset && o.destinationCountry === dstCountry);
-    if (directCorridor.length > 0) { corridorReachable = true; corridorRouteCount += directCorridor.length; }
-    for (const sa of settlementAssetSymbols) {
-      const hop1 = activeOffers.filter(o =>
-        o.sourceAsset === srcAsset && o.sourceCountry === srcCountry &&
-        o.destinationAsset === sa && o.destinationCountry === "GLOBAL");
-      const hop2 = activeOffers.filter(o =>
-        o.sourceAsset === sa && o.sourceCountry === "GLOBAL" &&
-        o.destinationAsset === dstAsset && o.destinationCountry === dstCountry);
-      if (hop1.length > 0 && hop2.length > 0) {
-        corridorReachable = true;
-        corridorRouteCount += Math.min(hop1.length, hop2.length);
-      }
-    }
+    // 2. CORRIDOR reachability (matches asset AND country) — full 4-hop graph check.
+    const source = `${srcAsset}:${srcCountry}`;
+    const dest = `${dstAsset}:${dstCountry}`;
+    const corridorPaths = enumeratePaths(adj, source, dest, MAX_HOPS);
+    const corridorReachable = corridorPaths.length > 0;
+    const corridorRouteCount = corridorPaths.length;
     if (corridorReachable) { corridorReachablePairs++; corridorReachableVolume += weight; }
     if (corridorRouteCount >= 2) corridorsWithMultipleRoutes++;
 
     // 3+4. Production-faithful path feasibility (Prompt 4.8.8).
     // Use cached paths if available (graph structure doesn't change during a
     // run). Otherwise, enumerate fresh (for standalone/test calls).
-    const source = `${srcAsset}:${srcCountry}`;
-    const dest = `${dstAsset}:${dstCountry}`;
-    const pathKey = `${source}→${dest}`;
     let hop1Paths: PathStep<SimOffer>[][];
     let hop2Paths: PathStep<SimOffer>[][];
     let hop3PlusPaths: PathStep<SimOffer>[][];
+    const pathKey = `${source}→${dest}`;
     if (pathCache && pathCache.has(pathKey)) {
       const cached = pathCache.get(pathKey)!;
       hop1Paths = cached.hop1;
@@ -1247,16 +1238,12 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
       hop3PlusPaths = [...(pathsByHop.get(3) ?? []), ...(pathsByHop.get(4) ?? [])].slice(0, MAX_PATHS_PER_TIER);
     }
 
-    // Pre-filter: compute the max destination-asset liquidity across all active
-    // providers. If a demand's amount exceeds this, no direct route can pay out
-    // (the provider needs dstLiquidity ≥ amount). This eliminates obviously
-    // infeasible demands without checking any paths.
-    let maxDstLiquidity = 0;
-    for (const p of world.providers.values()) {
-      if (p.status !== "ACTIVE") continue;
-      const liq = p.liquidity.balances.get(dstAsset) ?? 0;
-      if (liq > maxDstLiquidity) maxDstLiquidity = liq;
-    }
+    // (Prompt 4.8.8O) REMOVED the invalid source-vs-destination liquidity
+    // pre-filter (amt > maxDstLiquidity). It compared source-asset input
+    // against destination-asset liquidity, which is invalid whenever FX ≠ 1.
+    // The correct check happens inside checkPathFeasibilityStaged, where
+    // computeHopOutput() converts the input to destination-asset terms
+    // before comparing against the provider's balance.
 
     let capacityExecutableWeight = 0;
     let liqExecutableWeight = 0;
@@ -1305,7 +1292,8 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
       let hasTwoHop = false;
       let hasThreePlusHop = false;
 
-      if (amt > maxDstLiquidity) continue;
+      // (Prompt 4.8.8O) No source-amount pre-filter. The correct output-aware
+      // liquidity check happens inside checkPathFeasibilityStaged.
 
       // Tier 1: 1-hop paths (direct).
       for (const path of hop1Paths) {

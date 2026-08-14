@@ -665,8 +665,74 @@ async function main() {
     }
   }
 
+  // =========================================================================
+  // 11. (4.8.8O) Prefilter removal regression + 3-hop structural reachability
+  // =========================================================================
+  console.log("\n== 11. Prefilter removal + 3-hop structural (4.8.8O) ==");
+
+  // Test: rate=2.0, source 10k, destination liquidity 15k.
+  // Old prefilter: 10k > 15k? No, so this would pass the prefilter anyway.
+  // But with rate=0.5: source 10k, output ~5k, destination liquidity 6k.
+  // Old prefilter: 10k > 6k? Yes → SKIP. But output is only 5k ≤ 6k → FEASIBLE.
+  {
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 6000 });
+    const offer = makeOffer("o1", "p1", "USD", "US", "NGN", "NG", 0.5, 0, 50000, "asset_usdc");
+    const world = buildTestWorld([p1], [offer], [stableAsset]);
+    const { sa, cp } = buildRiskCaches(world);
+    const path: { fromNode: string; toNode: string; edges: SimOffer[] }[] = [{
+      fromNode: "USD:US", toNode: "NGN:NG", edges: [offer],
+    }];
+    // Output = 10000 * 0.5 = 5000. Liquidity = 6000. 5000 ≤ 6000 → FEASIBLE.
+    const staged = checkPathFeasibilityStaged(path, 10000, "BALANCED", world, sa, cp);
+    assert(staged !== null, "Prefilter removal (rate 0.5): structurally feasible");
+    assert(staged!.liquidityFeasible === true, "Prefilter removal (rate 0.5): liquidity FEASIBLE (output 5k ≤ 6k NGN) — old prefilter would skip this");
+    assert(staged!.productionFeasible === true, "Prefilter removal (rate 0.5): production FEASIBLE");
+  }
+
+  // Test: rate=2.0, source 10k, destination liquidity 15k.
+  // Output = 20k. Liquidity = 15k. 20k > 15k → INFEASIBLE.
+  // But must still be EVALUATED (not skipped by prefilter).
+  {
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 15000 });
+    const offer = makeOffer("o1", "p1", "USD", "US", "NGN", "NG", 2.0, 0, 50000, "asset_usdc");
+    const world = buildTestWorld([p1], [offer], [stableAsset]);
+    const { sa, cp } = buildRiskCaches(world);
+    const path: { fromNode: string; toNode: string; edges: SimOffer[] }[] = [{
+      fromNode: "USD:US", toNode: "NGN:NG", edges: [offer],
+    }];
+    const staged = checkPathFeasibilityStaged(path, 10000, "BALANCED", world, sa, cp);
+    assert(staged !== null, "Prefilter removal (rate 2.0): structurally feasible");
+    assert(staged!.liquidityFeasible === false, "Prefilter removal (rate 2.0): liquidity INFEASIBLE (output 20k > 15k NGN) — correctly evaluated, not skipped");
+  }
+
+  // Test: 3-hop-only structural reachability.
+  // USD → USDC → EURC → NGN (3 hops, no direct or 2-hop path).
+  // Structural reachability must be true (path exists in 4-hop graph).
+  {
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { USDC: 100000, EURC: 100000, NGN: 100000 });
+    const o1 = makeOffer("o1", "p1", "USD", "US", "USDC", "GLOBAL", 1.0, 0, 50000, "asset_usdc");
+    const o2 = makeOffer("o2", "p1", "USDC", "GLOBAL", "EURC", "GLOBAL", 1.0, 0, 50000, "asset_usdc");
+    const o3 = makeOffer("o3", "p1", "EURC", "GLOBAL", "NGN", "NG", 1.0, 0, 50000, "asset_usdc");
+    const world = buildTestWorld([p1], [o1, o2, o3], [stableAsset, stableAsset2]);
+    const { sa, cp } = buildRiskCaches(world);
+    const adj = new Map<string, { to: string; edge: SimOffer }[]>();
+    for (const o of [o1, o2, o3]) {
+      const from = `${o.sourceAsset}:${o.sourceCountry}`;
+      const to = `${o.destinationAsset}:${o.destinationCountry}`;
+      if (!adj.has(from)) adj.set(from, []);
+      adj.get(from)!.push({ to, edge: o });
+    }
+    const paths = enumeratePaths(adj, "USD:US", "NGN:NG", 4);
+    const threeHop = paths.filter((p: any) => p.length === 3);
+    assert(threeHop.length > 0, "3-hop structural: 3-hop path discovered (USD→USDC→EURC→NGN)");
+    // Verify production feasibility.
+    const staged = checkPathFeasibilityStaged(threeHop[0], 1000, "BALANCED", world, sa, cp);
+    assert(staged !== null, "3-hop structural: structurally feasible");
+    assert(staged!.productionFeasible === true, "3-hop structural: production FEASIBLE (all hops have liquidity)");
+  }
+
   console.log(`\n========================================`);
-  console.log(`  P4.8.8N Path Feasibility: Passed: ${passed}  |  Failed: ${failed}`);
+  console.log(`  P4.8.8O Path Feasibility: Passed: ${passed}  |  Failed: ${failed}`);
   console.log(`========================================`);
   if (failed > 0) {
     console.log("\nFailures:");
