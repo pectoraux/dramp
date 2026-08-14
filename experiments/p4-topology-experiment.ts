@@ -432,21 +432,27 @@ function extractMetrics(world: any): RunMetrics {
   const multiHopCount = world.settlementTransfers.filter((t: any) => t.status === "COMPLETED").length;
   const multiHopPercentage = completed.length > 0 ? (multiHopCount / completed.length) * 100 : 0;
 
-  // ---- Three-level reachability ----
-  // 1. ASSET reachability: does an abstract asset path exist? (ignores countries)
-  // 2. CORRIDOR reachability: does a path exist matching asset AND country?
-  // 3. EXECUTABLE reachability: does a path exist with capacity, liquidity, risk?
+  // ---- Five-level reachability ladder (all demand-weighted, consistent) ----
+  // 1. ASSET: abstract asset path exists (ignores countries)
+  // 2. CORRIDOR: path matches asset AND country
+  // 3. LIQUIDITY: + capacity, destination liquidity (per actual demand amount, no risk)
+  // 4. PRODUCTION: + risk ceilings using user's ACTUAL riskTolerance, min/max, provider status
+  // 5. COMPLETION: actual simulation completion (from intent stats above)
+  // All levels 3-4 use actual user demand amounts and production hop economics.
   const settlementAssetSymbols = new Set([...world.assets.values()].map((a: any) => a.symbol));
   const activeOffers = [...world.offers.values()].filter((o: any) => o.active);
 
-  // Demanded corridors: (srcAsset, srcCountry) → (dstAsset, dstCountry)
-  const demandedCorridors = new Map<string, number>(); // key → demand weight
+  // Collect demand per corridor with per-user risk tolerance.
+  interface CorridorDemand { amount: number; weight: number; riskTolerance: string; }
+  const demandedCorridors = new Map<string, CorridorDemand[]>();
   for (const u of world.users.values()) {
     const key = `${u.sourceAsset}:${u.sourceCountry}→${u.destinationAsset}:${u.destinationCountry}`;
-    demandedCorridors.set(key, (demandedCorridors.get(key) ?? 0) + u.typicalAmount * u.frequency);
+    const arr = demandedCorridors.get(key) ?? [];
+    arr.push({ amount: u.typicalAmount, weight: u.frequency * u.typicalAmount, riskTolerance: u.riskTolerance });
+    demandedCorridors.set(key, arr);
   }
   const totalDemandPairs = demandedCorridors.size;
-  const totalDemandWeight = [...demandedCorridors.values()].reduce((s, v) => s + v, 0);
+  const totalDemandWeight = [...demandedCorridors.values()].flat().reduce((s, d) => s + d.weight, 0);
 
   let assetReachablePairs = 0;
   let corridorReachablePairs = 0;
@@ -458,10 +464,20 @@ function extractMetrics(world: any): RunMetrics {
   let prodExecutableVolume = 0;
   let corridorsWithMultipleRoutes = 0;
 
-  for (const [corridorKey, weight] of demandedCorridors) {
+  // Helper: compute hop output using production economics (fee + rate + incentive).
+  function hopOutput(inputAmount: number, offer: any): number {
+    const fee = inputAmount * offer.feeBps / 10000;
+    const afterFee = inputAmount - fee;
+    const converted = afterFee * offer.rate;
+    const incentive = converted * (offer.incentiveBps ?? 0) / 10000;
+    return converted + incentive;
+  }
+
+  for (const [corridorKey, demands] of demandedCorridors) {
     const [srcPart, dstPart] = corridorKey.split("→");
     const [srcAsset, srcCountry] = srcPart.split(":");
     const [dstAsset, dstCountry] = dstPart.split(":");
+    const weight = demands.reduce((s, d) => s + d.weight, 0);
 
     // 1. ASSET reachability (ignores countries).
     let assetReachable = false;
@@ -482,7 +498,6 @@ function extractMetrics(world: any): RunMetrics {
       o.sourceAsset === srcAsset && o.sourceCountry === srcCountry &&
       o.destinationAsset === dstAsset && o.destinationCountry === dstCountry);
     if (directCorridor.length > 0) { corridorReachable = true; corridorRouteCount += directCorridor.length; }
-    // Multi-hop: src/fiat → settlement/GLOBAL → dst/fiat
     for (const sa of settlementAssetSymbols) {
       const hop1 = activeOffers.filter(o =>
         o.sourceAsset === srcAsset && o.sourceCountry === srcCountry &&
@@ -498,65 +513,17 @@ function extractMetrics(world: any): RunMetrics {
     if (corridorReachable) { corridorReachablePairs++; corridorReachableVolume += weight; }
     if (corridorRouteCount >= 2) corridorsWithMultipleRoutes++;
 
-    // 3. LIQUIDITY-EXECUTABLE reachability (capacity + destination liquidity, all hops).
-    // Checks: active offer, availableCapacity ≥ 100, destination liquidity ≥ 100.
-    // For multi-hop: checks BOTH hops' capacity and BOTH providers' destination liquidity.
-    let liqExecutable = false;
-    // Direct.
-    for (const o of directCorridor) {
-      if (o.availableCapacity >= 100) {
-        const provider = world.providers.get(o.providerId);
-        if (provider && (provider.liquidity.balances.get(dstAsset) ?? 0) >= 100) {
-          liqExecutable = true; break;
-        }
-      }
-    }
-    // Multi-hop: check BOTH hops.
-    if (!liqExecutable) {
-      for (const sa of settlementAssetSymbols) {
-        const hop1 = activeOffers.filter(o =>
-          o.sourceAsset === srcAsset && o.sourceCountry === srcCountry &&
-          o.destinationAsset === sa && o.destinationCountry === "GLOBAL" && o.availableCapacity >= 100);
-        const hop2 = activeOffers.filter(o =>
-          o.sourceAsset === sa && o.sourceCountry === "GLOBAL" &&
-          o.destinationAsset === dstAsset && o.destinationCountry === dstCountry && o.availableCapacity >= 100);
-        if (hop1.length > 0 && hop2.length > 0) {
-          // Check liquidity for BOTH hops' providers.
-          for (const o1 of hop1) {
-            const p1 = world.providers.get(o1.providerId);
-            if (!p1 || (p1.liquidity.balances.get(sa) ?? 0) < 100) continue;
-            for (const o2 of hop2) {
-              const p2 = world.providers.get(o2.providerId);
-              if (p2 && (p2.liquidity.balances.get(dstAsset) ?? 0) >= 100) {
-                liqExecutable = true; break;
-              }
-            }
-            if (liqExecutable) break;
-          }
-          if (liqExecutable) break;
-        }
-      }
-    }
-    if (liqExecutable) { liqExecutableReachablePairs++; liqExecutableVolume += weight; }
+    // 3+4. Demand-weighted liquidity and production reachability.
+    // For each demand amount: test liquidity (no risk) then production (with risk).
+    let liqExecutableWeight = 0;
+    let prodExecutableWeight = 0;
 
-    // 4. PRODUCTION-EXECUTABLE reachability (demand-weighted, full hard constraints).
-    // For each corridor, test against the ACTUAL demand amounts from users in that corridor.
-    // Uses shared pure economics functions for risk ceilings.
-    // Returns amount-weighted executable demand %.
-    // Collect actual demand amounts for this corridor.
-    const corridorDemandAmounts: Array<{ amount: number; weight: number }> = [];
-    for (const u of world.users.values()) {
-      if (u.sourceAsset === srcAsset && u.sourceCountry === srcCountry &&
-          u.destinationAsset === dstAsset && u.destinationCountry === dstCountry) {
-        corridorDemandAmounts.push({ amount: u.typicalAmount, weight: u.frequency * u.typicalAmount });
-      }
-    }
-    const corridorDemandTotal = corridorDemandAmounts.reduce((s, d) => s + d.weight, 0);
-    let corridorDemandExecutable = 0;
-
-    for (const demand of corridorDemandAmounts) {
+    for (const demand of demands) {
       const amt = demand.amount;
-      let canExecute = false;
+      const rt = demand.riskTolerance; // actual user risk tolerance
+      let liqOK = false;
+      let prodOK = false;
+
       // Direct.
       for (const o of directCorridor) {
         const provider = world.providers.get(o.providerId);
@@ -564,58 +531,76 @@ function extractMetrics(world: any): RunMetrics {
         if (o.availableCapacity < amt) continue;
         if (amt < o.minimumAmount || amt > o.maximumAmount) continue;
         if ((provider.liquidity.balances.get(dstAsset) ?? 0) < amt) continue;
+        liqOK = true;
+        // Production: check risk using user's ACTUAL risk tolerance.
         if (o.settlementAssetId) {
           const saObj = world.assets.get(o.settlementAssetId);
           if (saObj) {
             const saRisk = settlementAssetRisk({ assetType: saObj.assetType, volatilityScore: saObj.volatilityScore, liquidityScore: saObj.liquidityScore, pegQuality: saObj.pegQuality, status: saObj.status, incentiveRate: saObj.incentiveRate });
-            if (saRisk > assetRiskCeiling("BALANCED")) continue;
+            if (saRisk > assetRiskCeiling(rt)) { continue; } // risk rejected
           }
         }
         const cpRisk = providerCounterpartyRisk({ trustModel: provider.trustModel, providerType: provider.providerType, reputationScore: provider.reputationScore, status: provider.status });
-        if (cpRisk > counterpartyRiskCeiling("BALANCED")) continue;
-        canExecute = true; break;
+        if (cpRisk > counterpartyRiskCeiling(rt)) { continue; } // risk rejected
+        prodOK = true;
+        break;
       }
-      // Multi-hop.
-      if (!canExecute) {
+
+      // Multi-hop: use production hop economics for hop2 amount.
+      if (!liqOK) {
         for (const sa of settlementAssetSymbols) {
-          const hop1 = activeOffers.filter(o => o.sourceAsset === srcAsset && o.sourceCountry === srcCountry && o.destinationAsset === sa && o.destinationCountry === "GLOBAL");
-          const hop2 = activeOffers.filter(o => o.sourceAsset === sa && o.sourceCountry === "GLOBAL" && o.destinationAsset === dstAsset && o.destinationCountry === dstCountry);
+          const hop1 = activeOffers.filter(o =>
+            o.sourceAsset === srcAsset && o.sourceCountry === srcCountry &&
+            o.destinationAsset === sa && o.destinationCountry === "GLOBAL");
+          const hop2 = activeOffers.filter(o =>
+            o.sourceAsset === sa && o.sourceCountry === "GLOBAL" &&
+            o.destinationAsset === dstAsset && o.destinationCountry === dstCountry);
           if (hop1.length === 0 || hop2.length === 0) continue;
-          const saObj = [...world.assets.values()].find((a: any) => a.symbol === sa);
-          if (saObj) {
-            const saRisk = settlementAssetRisk({ assetType: saObj.assetType, volatilityScore: saObj.volatilityScore, liquidityScore: saObj.liquidityScore, pegQuality: saObj.pegQuality, status: saObj.status, incentiveRate: saObj.incentiveRate });
-            if (saRisk > assetRiskCeiling("BALANCED")) continue;
-          }
+
           for (const o1 of hop1) {
             const p1 = world.providers.get(o1.providerId);
             if (!p1 || p1.status !== "ACTIVE") continue;
             if (o1.availableCapacity < amt) continue;
             if (amt < o1.minimumAmount || amt > o1.maximumAmount) continue;
             if ((p1.liquidity.balances.get(sa) ?? 0) < amt) continue;
-            const cpRisk1 = providerCounterpartyRisk({ trustModel: p1.trustModel, providerType: p1.providerType, reputationScore: p1.reputationScore, status: p1.status });
-            if (cpRisk1 > counterpartyRiskCeiling("BALANCED")) continue;
+
+            // Compute hop2 input amount using production hop economics.
+            const hop2Input = hopOutput(amt, o1);
+
             for (const o2 of hop2) {
               const p2 = world.providers.get(o2.providerId);
               if (!p2 || p2.status !== "ACTIVE") continue;
-              if (o2.availableCapacity < amt) continue;
-              if (amt < o2.minimumAmount || amt > o2.maximumAmount) continue;
-              if ((p2.liquidity.balances.get(dstAsset) ?? 0) < amt) continue;
+              if (o2.availableCapacity < hop2Input) continue;
+              if (hop2Input < o2.minimumAmount || hop2Input > o2.maximumAmount) continue;
+              if ((p2.liquidity.balances.get(dstAsset) ?? 0) < hop2Input) continue;
+              liqOK = true;
+
+              // Production: check risk using user's ACTUAL risk tolerance.
+              const saObj = [...world.assets.values()].find((a: any) => a.symbol === sa);
+              if (saObj) {
+                const saRisk = settlementAssetRisk({ assetType: saObj.assetType, volatilityScore: saObj.volatilityScore, liquidityScore: saObj.liquidityScore, pegQuality: saObj.pegQuality, status: saObj.status, incentiveRate: saObj.incentiveRate });
+                if (saRisk > assetRiskCeiling(rt)) { continue; }
+              }
+              const cpRisk1 = providerCounterpartyRisk({ trustModel: p1.trustModel, providerType: p1.providerType, reputationScore: p1.reputationScore, status: p1.status });
+              if (cpRisk1 > counterpartyRiskCeiling(rt)) { continue; }
               const cpRisk2 = providerCounterpartyRisk({ trustModel: p2.trustModel, providerType: p2.providerType, reputationScore: p2.reputationScore, status: p2.status });
-              if (cpRisk2 > counterpartyRiskCeiling("BALANCED")) continue;
-              canExecute = true; break;
+              if (cpRisk2 > counterpartyRiskCeiling(rt)) { continue; }
+              prodOK = true;
+              break;
             }
-            if (canExecute) break;
+            if (liqOK) break;
           }
-          if (canExecute) break;
+          if (liqOK) break;
         }
       }
-      if (canExecute) corridorDemandExecutable += demand.weight;
+
+      if (liqOK) liqExecutableWeight += demand.weight;
+      if (prodOK) prodExecutableWeight += demand.weight;
     }
-    // Amount-weighted executable demand for this corridor.
-    if (corridorDemandTotal > 0 && corridorDemandExecutable > 0) {
-      prodExecutableReachablePairs++;
-      prodExecutableVolume += (corridorDemandExecutable / corridorDemandTotal) * weight;
-    }
+
+    // Amount-weighted reachability for this corridor.
+    if (liqExecutableWeight > 0) { liqExecutableReachablePairs++; liqExecutableVolume += liqExecutableWeight; }
+    if (prodExecutableWeight > 0) { prodExecutableReachablePairs++; prodExecutableVolume += prodExecutableWeight; }
   }
 
   const assetReachablePct = totalDemandWeight > 0 ? (assetReachableVolume / totalDemandWeight) * 100 : 0;
