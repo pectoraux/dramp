@@ -731,8 +731,117 @@ async function main() {
     assert(staged!.productionFeasible === true, "3-hop structural: production FEASIBLE (all hops have liquidity)");
   }
 
+  // =========================================================================
+  // 12. (4.8.8R) Aggregate capacity monotonicity invariant + adversarial tests
+  // =========================================================================
+  console.log("\n== 12. Aggregate capacity invariant (4.8.8R) ==");
+
+  const { checkAggregateCapacityFeasible } = await import("../experiments/p4-topology-experiment");
+
+  // Test: monotonicity invariant — greedy capacity feasible => aggregate feasible.
+  // For every test world above where staged.capacityFeasible was true, aggregate
+  // must also be true.
+  {
+    // 3-hop path (from section 4): capacityFeasible=true, so aggregate must be true.
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { USDC: 100000, EURC: 100000, NGN: 100000 });
+    const o1 = makeOffer("o1", "p1", "USD", "US", "USDC", "GLOBAL", 1.0, 0, 50000, "asset_usdc");
+    const o2 = makeOffer("o2", "p1", "USDC", "GLOBAL", "EURC", "GLOBAL", 1.0, 0, 50000, "asset_usdc");
+    const o3 = makeOffer("o3", "p1", "EURC", "GLOBAL", "NGN", "NG", 1.0, 0, 50000, "asset_usdc");
+    const world = buildTestWorld([p1], [o1, o2, o3], [stableAsset, stableAsset2]);
+    const adj = new Map<string, { to: string; edge: SimOffer }[]>();
+    for (const o of [o1, o2, o3]) {
+      const from = `${o.sourceAsset}:${o.sourceCountry}`;
+      const to = `${o.destinationAsset}:${o.destinationCountry}`;
+      if (!adj.has(from)) adj.set(from, []);
+      adj.get(from)!.push({ to, edge: o });
+    }
+    const paths = enumeratePaths(adj, "USD:US", "NGN:NG", 4);
+    const threeHop = paths.filter((p: any) => p.length === 3);
+    const sa = new Map([["asset_usdc", 0.018], ["asset_eurc", 0.085]]);
+    const cp = new Map([["p1", 0.12]]);
+    const staged = checkPathFeasibilityStaged(threeHop[0], 1000, "BALANCED", world, sa, cp);
+    assert(staged !== null && staged.capacityFeasible === true, "Invariant: greedy capacity feasible on 3-hop");
+    const aggResult = checkAggregateCapacityFeasible(threeHop[0], 1000, world);
+    assert(aggResult === true, "Invariant: aggregate capacity feasible when greedy is feasible (3-hop)");
+  }
+
+  // Test: heterogeneous FX rates — aggregate must not depend on rates.
+  {
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 100000 });
+    // Offer with rate 2.0, capacity 10k
+    const o1 = makeOffer("o1", "p1", "USD", "US", "NGN", "NG", 2.0, 0, 10000, "asset_usdc");
+    const world = buildTestWorld([p1], [o1], [stableAsset]);
+    const path: { fromNode: string; toNode: string; edges: SimOffer[] }[] = [{
+      fromNode: "USD:US", toNode: "NGN:NG", edges: [o1],
+    }];
+    // Demand 5k: capacity 10k >= 5k → aggregate true, regardless of rate.
+    const aggResult = checkAggregateCapacityFeasible(path, 5000, world);
+    assert(aggResult === true, "Heterogeneous FX: aggregate capacity true (cap 10k >= 5k, rate irrelevant)");
+    // Demand 15k: capacity 10k < 15k → aggregate false.
+    const aggResult2 = checkAggregateCapacityFeasible(path, 15000, world);
+    assert(aggResult2 === false, "Heterogeneous FX: aggregate capacity false (cap 10k < 15k)");
+  }
+
+  // Test: split capacity — aggregate sums across offers.
+  {
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 100000 });
+    const p2 = makeProvider("p2", "COLLATERALIZED", "BANK", 0.9, { NGN: 100000 });
+    const o1 = makeOffer("o1", "p1", "USD", "US", "NGN", "NG", 2.0, 0, 6000, "asset_usdc");
+    const o2 = makeOffer("o2", "p2", "USD", "US", "NGN", "NG", 0.5, 0, 4000, "asset_usdc");
+    const world = buildTestWorld([p1, p2], [o1, o2], [stableAsset]);
+    const path: { fromNode: string; toNode: string; edges: SimOffer[] }[] = [{
+      fromNode: "USD:US", toNode: "NGN:NG", edges: [o1, o2],
+    }];
+    // Demand 10k: aggregate 6k+4k=10k >= 10k → true.
+    const aggResult = checkAggregateCapacityFeasible(path, 10000, world);
+    assert(aggResult === true, "Split: aggregate capacity true (6k+4k=10k >= 10k)");
+    // Demand 11k: aggregate 10k < 11k → false.
+    const aggResult2 = checkAggregateCapacityFeasible(path, 11000, world);
+    assert(aggResult2 === false, "Split: aggregate capacity false (10k < 11k)");
+  }
+
+  // Test: 2-hop with different rates — aggregate ignores FX.
+  {
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { USDC: 100000, NGN: 100000 });
+    const o1 = makeOffer("o1", "p1", "USD", "US", "USDC", "GLOBAL", 2.0, 0, 5000, "asset_usdc");
+    const o2 = makeOffer("o2", "p1", "USDC", "GLOBAL", "NGN", "NG", 0.5, 0, 3000, "asset_usdc");
+    const world = buildTestWorld([p1], [o1, o2], [stableAsset]);
+    const adj = new Map<string, { to: string; edge: SimOffer }[]>();
+    for (const o of [o1, o2]) {
+      const from = `${o.sourceAsset}:${o.sourceCountry}`;
+      const to = `${o.destinationAsset}:${o.destinationCountry}`;
+      if (!adj.has(from)) adj.set(from, []);
+      adj.get(from)!.push({ to, edge: o });
+    }
+    const paths = enumeratePaths(adj, "USD:US", "NGN:NG", 4);
+    const twoHop = paths.filter((p: any) => p.length === 2);
+    // Demand 4k: hop1 cap 5k >= 4k, hop2 cap 3k < 4k → aggregate false.
+    const aggResult = checkAggregateCapacityFeasible(twoHop[0], 4000, world);
+    assert(aggResult === false, "2-hop: aggregate false (hop2 cap 3k < 4k demand)");
+    // Demand 3k: hop1 cap 5k >= 3k, hop2 cap 3k >= 3k → aggregate true.
+    const aggResult2 = checkAggregateCapacityFeasible(twoHop[0], 3000, world);
+    assert(aggResult2 === true, "2-hop: aggregate true (both hops have enough capacity)");
+  }
+
+  // Test: reserved capacity — adapter correctly computes usable.
+  {
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 100000 });
+    const o1 = makeOffer("o1", "p1", "USD", "US", "NGN", "NG", 1.0, 0, 10000, "asset_usdc");
+    o1.availableCapacity = 6000; o1.reservedCapacity = 4000;
+    const world = buildTestWorld([p1], [o1], [stableAsset]);
+    const path: { fromNode: string; toNode: string; edges: SimOffer[] }[] = [{
+      fromNode: "USD:US", toNode: "NGN:NG", edges: [o1],
+    }];
+    // Usable = 10000 - 4000 = 6000. Demand 5k → true.
+    const aggResult = checkAggregateCapacityFeasible(path, 5000, world);
+    assert(aggResult === true, "Reserved: aggregate true (usable 6k >= 5k)");
+    // Demand 7k → false (6k < 7k).
+    const aggResult2 = checkAggregateCapacityFeasible(path, 7000, world);
+    assert(aggResult2 === false, "Reserved: aggregate false (usable 6k < 7k)");
+  }
+
   console.log(`\n========================================`);
-  console.log(`  P4.8.8O Path Feasibility: Passed: ${passed}  |  Failed: ${failed}`);
+  console.log(`  P4.8.8R Path Feasibility: Passed: ${passed}  |  Failed: ${failed}`);
   console.log(`========================================`);
   if (failed > 0) {
     console.log("\nFailures:");

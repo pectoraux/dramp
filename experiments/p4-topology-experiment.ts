@@ -874,104 +874,39 @@ export function productionUsable(prod: ProductionCapacity): number {
 // instead of dstLiquidity < hopResult.output) that was fixed in the staged version
 // but never removed from the legacy one. Keeping both was dangerous.
 
-// (Prompt 4.8.8Q) Check if sufficient AGGREGATE capacity exists across parallel
-// offers on each hop, ignoring liquidity/risk/min-max. This is a physical
-// capacity check, NOT a greedy assignment check.
+// (Prompt 4.8.8R) PURE aggregate capacity check.
+// Ignores: liquidity, risk, provider status, fees, rates, incentives,
+// downstream FX economics, min/max constraints.
 //
-// For multi-hop paths with heterogeneous FX rates, the output of a hop depends
-// on how capacity is allocated across offers. We compute the feasible output
-// RANGE [minOutput, maxOutput] given the available capacities, then check if
-// SOME output in that range can be absorbed by the next hop's aggregate capacity.
+// Answers ONE question: Is there sufficient aggregate usable capacity
+// to cover the demand amount at every hop?
 //
-// minOutput: all capacity through the lowest-multiplier offer
-// maxOutput: all capacity through the highest-multiplier offer
-// (For mixed allocations, any output in [minOutput, maxOutput] is achievable
-// by adjusting the split between offers.)
+// For each hop: sum(usableCapacity across all offers) >= amount.
+// The amount is NOT propagated through FX — it stays constant across hops.
+// This is a pure physical-capacity diagnostic.
+//
+// INVARIANT: If greedy coverAmount succeeds (capacityFeasible=true), then
+// aggregateCapacityFeasible MUST be true, because coverAmount's assignment
+// is a valid allocation that uses a subset of the available capacity.
+// Therefore: aggregateCapacity >= greedyCapacity always holds.
 export function checkAggregateCapacityFeasible(
   path: PathStep<SimOffer>[],
   amount: number,
   world: SimWorld,
 ): boolean {
-  // State: the set of possible current amounts that can reach this hop.
-  // Initially just {amount}. After each hop, we compute the set of possible
-  // outputs. For efficiency, we track [minAmount, maxAmount] range.
-  let minAmount = amount;
-  let maxAmount = amount;
-
   for (let i = 0; i < path.length; i++) {
     const step = path[i];
-    // Collect active offers with their usable capacity and output multiplier.
-    const offers: { usableCap: number; outputMultiplier: number }[] = [];
+    let totalUsableCap = 0;
     for (const o of step.edges) {
-      const provider = world.providers.get(o.providerId);
-      if (!provider || provider.status !== "ACTIVE") continue;
+      // (Prompt 4.8.8R) Ignore provider status — this is pure capacity.
+      // Even inactive providers' capacity counts as physical capacity.
+      // The capacity-semantics adapter still applies (simulator vs production).
       const prodCap = toProductionCapacity({ availableCapacity: o.availableCapacity, reservedCapacity: o.reservedCapacity });
       const usableCap = prodCap.availableCapacity - prodCap.reservedCapacity;
-      if (usableCap <= 0) continue;
-      const outputMultiplier = (1 - o.feeBps / 10000) * o.rate * (1 + (o.incentiveBps ?? 0) / 10000);
-      offers.push({ usableCap, outputMultiplier });
+      if (usableCap > 0) totalUsableCap += usableCap;
     }
-    if (offers.length === 0) return false;
-
-    const totalUsableCap = offers.reduce((s, o) => s + o.usableCap, 0);
-
-    // For each possible input amount in [minAmount, maxAmount], we need to check
-    // if total capacity is sufficient AND compute the output range.
-    // The minimum input we need to handle is minAmount.
-    // The maximum input we need to handle is maxAmount.
-    if (totalUsableCap < minAmount) return false;
-
-    // Compute output range for the feasible input range.
-    // minOutput: allocate as much as possible to the lowest-multiplier offer.
-    // maxOutput: allocate as much as possible to the highest-multiplier offer.
-    const sortedByMult = [...offers].sort((a, b) => a.outputMultiplier - b.outputMultiplier);
-    const minMult = sortedByMult[0].outputMultiplier;
-    const maxMult = sortedByMult[sortedByMult.length - 1].outputMultiplier;
-
-    // For minAmount input:
-    //   If totalCap >= minAmount, we can route minAmount through the lowest-mult offer
-    //   (up to its capacity), rest through others. Output ≥ minAmount * minMult.
-    //   But we want the MINIMUM output, so route everything through lowest-mult.
-    //   minOutput = minAmount * minMult (if lowest-mult offer has enough capacity)
-    //   Otherwise, split: some through higher-mult.
-    // For simplicity (and correctness as a bound):
-    //   minOutput = minAmount * minMult (lower bound on output)
-    //   maxOutput = maxAmount * maxMult (upper bound on output)
-    // But we also need to account for capacity constraints. If the lowest-mult
-    // offer has capacity < minAmount, some must go through higher-mult offers,
-    // increasing the minimum output.
-    //
-    // Exact min output: allocate to lowest-mult first, then next, etc.
-    function computeMinOutput(input: number): number {
-      let remaining = input;
-      let output = 0;
-      for (const o of sortedByMult) {
-        if (remaining <= 0) break;
-        const take = Math.min(remaining, o.usableCap);
-        output += take * o.outputMultiplier;
-        remaining -= take;
-      }
-      return remaining > 0 ? Infinity : output; // not enough capacity
-    }
-    function computeMaxOutput(input: number): number {
-      let remaining = input;
-      let output = 0;
-      for (const o of [...sortedByMult].reverse()) {
-        if (remaining <= 0) break;
-        const take = Math.min(remaining, o.usableCap);
-        output += take * o.outputMultiplier;
-        remaining -= take;
-      }
-      return remaining > 0 ? -Infinity : output; // not enough capacity
-    }
-
-    const minOut = computeMinOutput(minAmount);
-    const maxOut = computeMaxOutput(maxAmount);
-    if (minOut === Infinity || maxOut === -Infinity) return false;
-
-    // The next hop can receive any amount in [minOut, maxOut].
-    minAmount = minOut;
-    maxAmount = maxOut;
+    if (totalUsableCap < amount) return false;
+    // Amount stays constant — no FX propagation in pure capacity check.
   }
   return true;
 }
@@ -1017,6 +952,8 @@ export interface RunMetrics {
   protocolRevenue: number;
   demandServedPct: number;
   corridorsWithMultipleRoutes: number;
+  pathCapHitCount: number;     // (4.8.8R) corridors where path count hit the cap
+  maxPathsObserved: number;   // (4.8.8R) maximum paths observed in any corridor/tier
 }
 
 // Path cache: enumerated paths per corridor, keyed by "source→dest".
@@ -1186,6 +1123,8 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
   let prodExecutableVolume = 0;
   let altProductionExecutableVolume = 0;
   let corridorsWithMultipleRoutes = 0;
+  let pathCapHitCount = 0;
+  let maxPathsObserved = 0;
   // Route-composition weights (Prompt 4.8.8). These overlap: a demand may be
   // reachable by multiple path types. totalProdExec ≤ sum of these.
   let directReachableVolume = 0;        // feasible 1-hop single-provider
@@ -1259,9 +1198,14 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
       }
       hop1Paths = (pathsByHop.get(1) ?? []).slice(0, MAX_PATHS_PER_TIER);
       hop2Paths = (pathsByHop.get(2) ?? []).slice(0, MAX_PATHS_PER_TIER);
-      // (Prompt 4.8.8Q) hop3 and hop4 evaluated SEPARATELY — no combined hop3Plus bucket.
       hop3Paths = (pathsByHop.get(3) ?? []).slice(0, MAX_PATHS_PER_TIER);
       hop4Paths = (pathsByHop.get(4) ?? []).slice(0, MAX_PATHS_PER_TIER);
+      // (Prompt 4.8.8R) Track cap hits and max paths observed.
+      for (const h of [1, 2, 3, 4]) {
+        const count = (pathsByHop.get(h) ?? []).length;
+        if (count > maxPathsObserved) maxPathsObserved = count;
+        if (count > MAX_PATHS_PER_TIER) pathCapHitCount++;
+      }
     }
 
     // (Prompt 4.8.8O) REMOVED the invalid source-vs-destination liquidity
@@ -1487,6 +1431,8 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
     protocolRevenue: Math.round(world.totalFees * 100) / 100,
     demandServedPct: totalDemandVolume > 0 ? Math.round((servedVolume / totalDemandVolume) * 10000) / 100 : 0,
     corridorsWithMultipleRoutes,
+    pathCapHitCount,
+    maxPathsObserved,
   };
 }
 
