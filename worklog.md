@@ -961,3 +961,40 @@ Stage Summary:
   - BRIDGED multi-hop share: 37% — bridge topology creates 2-hop routes that the simulator actually uses.
 - The strategic conclusion: adding more providers or changing topology has diminishing returns once graph reachability is high (~100 providers). The binding constraint is liquidity inventory — providers need to hold more destination-asset balances to actually execute transfers.
 - Pushed to GitHub (commit e9fcd36).
+
+---
+Task ID: P4.8.8A-CapacitySemanticsAdapter
+Agent: main (Z.ai Code)
+Task: Push Prompt 4.8.8 to GitHub main. Resolve the capacity-semantics mismatch between production (availableCapacity=total) and simulator (availableCapacity=unreserved) that caused double-subtraction in coverAmount. Add adapter + regression test. Re-run 300-run experiment.
+
+Work Log:
+- Verified the capacity-semantics mismatch:
+  - Production (collateral.ts:315, 322-324): `available = availableCapacity - reservedCapacity` where `availableCapacity` = TOTAL (never changes on reservation; only `reservedCapacity` is incremented).
+  - Simulator (engine-faithful.ts:150-151): `availableCapacity -= amount; reservedCapacity += amount` — so `availableCapacity` = currently-unreserved, and `total = available + reserved`.
+  - The shared `coverAmount()` (production semantics) computes `usable = available - reserved`. Feeding a simulator offer directly double-subtracts: `(total - reserved) - reserved = total - 2*reserved`.
+  - Confirmed across 6 production code paths that ALL compute `availableCapacity - reservedCapacity` (marketplace.ts:52, commitments.ts:71, market-intelligence.ts:76, collateral.ts:315, shared.ts:757,768).
+- Added capacity-semantics adapter (Prompt 4.8.8A):
+  - `toProductionCapacity(sim)`: converts `{availableCapacity: sim.avail + sim.reserved, reservedCapacity: sim.reserved}` so `coverAmount` computes `(sim.avail + sim.reserved) - sim.reserved = sim.avail` ✓
+  - `productionUsable(prod)`: returns `prod.available - prod.reserved` (the invariant check).
+  - Both exported, documented with the semantic difference and double-subtraction risk.
+  - Used in `checkPathFeasibility()`: every SimOffer is converted via `toProductionCapacity()` before being passed to `coverAmount()`.
+- Added 18 regression assertions in tests/p4-path-feasibility.test.ts (section 9):
+  - 9a: Adapter invariant — sim {6k avail, 4k reserved} → prod {10k avail, 4k reserved} → usable 6k == sim.available.
+  - 9b: Without adapter — demonstrates the double-subtraction bug (6k - 4k = 2k, wrong).
+  - 9c: checkPathFeasibility with reserved offers — 5k demand is feasible (usable 6k ≥ 5k), 8k is not (usable 6k < 8k).
+  - 9d: Split with reservations — two offers each {6k avail, 4k reserved}, demand 10k → split (6k + 4k = 10k, with adapter). Without adapter: each has buggy usable 2k, total 4k < 10k → infeasible (bug).
+  - 9e: No reservations — adapter is a no-op (reservedCapacity=0).
+- Integrity test expanded to 56 assertions (was 47): added section 11 checking adapter existence, usage in checkPathFeasibility, export, documentation of both semantics and the double-subtraction risk.
+- All tests pass: P4.2 Canonical 91, P4.8.8A Integrity 56, P4.7.1 Mechanics 124, P4.7.4 Reconciliation 10, P4.7.2 Conservation 14, P4.1 Faithful 19, P4 Simulator 21, P4.8.8A Path Feasibility 77, P4.7.2A Calibration 88, P4.8 Density 42. Total: 542 assertions. Lint clean.
+- Re-ran the full 20-seed topology experiment (300 runs) with corrected capacity semantics.
+- Pushed to GitHub main (commit a4d6a83). Remote verified.
+
+Stage Summary:
+- The capacity-semantics bug is FIXED. The adapter `toProductionCapacity()` explicitly converts simulator offers to production semantics before `coverAmount()`. The double-subtraction can no longer occur.
+- Corrected 300-run experiment results (100 providers):
+  - RANDOM: prod-exec 5.6% (was 4.6%), depletion 1.2% (was 20.9%)
+  - CORRIDOR_FOCUSED: prod-exec 2.8% (was 2.1%), depletion 14.3% (was 33.6%)
+  - BRIDGED: prod-exec 2.6% (was 2.0%), depletion 30.7% (was 41.9%)
+- The fix INCREASED production-executable reachability (less false rejection from double-subtraction) and DRAMATICALLY REDUCED apparent depletion (capacity isn't being consumed as fast as the buggy code suggested).
+- Strategic conclusion (confirmed, not changed): LIQUIDITY (destination-asset balances) is the dominant bottleneck, not topology, provider count, or capacity fragmentation. Graph reachability is 94-100% at 100 providers, but production-executable is only 2.6-5.6%. The gap is almost entirely liquidity — providers don't hold enough destination-asset balances to execute transfers. Split direct is 0% everywhere (fragmentation is not the issue). The corrected depletion numbers show capacity is NOT being rapidly consumed (1.2% for RANDOM), confirming the binding constraint is liquidity inventory, not capacity.
+- Commit SHA: a4d6a83 (pushed to GitHub main).
