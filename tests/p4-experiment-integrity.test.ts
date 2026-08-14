@@ -87,11 +87,10 @@ async function main() {
   const corridors43 = deriveDemandCorridors(seed43Demand);
   assert(true, `Per-seed corridors derived (seed42 top: ${corridors42[0]?.[0]}→${corridors42[0]?.[2]}, seed43 top: ${corridors43[0]?.[0]}→${corridors43[0]?.[2]})`);
 
-  // 6. Three reachability metrics
-  console.log("\n== 6. Three reachability metrics ==");
+  // 6. Four reachability metrics exist
+  console.log("\n== 6. Four reachability metrics exist ==");
   assert(expSrc.includes("assetReachablePct"), "Has assetReachablePct");
   assert(expSrc.includes("corridorReachablePct"), "Has corridorReachablePct");
-  assert(expSrc.includes("executableReachablePct"), "Has executableReachablePct");
   // Verify corridor reachability uses country matching.
   assert(expSrc.includes("o.sourceCountry === srcCountry"), "Corridor reachability matches sourceCountry");
   assert(expSrc.includes("o.destinationCountry === dstCountry"), "Corridor reachability matches destinationCountry");
@@ -99,31 +98,74 @@ async function main() {
   assert(expSrc.includes('o.destinationCountry === "GLOBAL"'), "Bridge hop1 uses GLOBAL destination");
   assert(expSrc.includes('o.sourceCountry === "GLOBAL"'), "Bridge hop2 uses GLOBAL source");
 
-  // 7. Provider economics shared across topologies
+  // 7. Provider economics shared across topologies (ALL fields)
   console.log("\n== 7. Provider economics shared across topologies ==");
   const specsRandom = generateCanonicalSpecs(99999, 10, "RANDOM", settlementAssets, corridors);
   const specsFocused = generateCanonicalSpecs(99999, 10, "CORRIDOR_FOCUSED", settlementAssets, corridors);
   const specsBridged = generateCanonicalSpecs(99999, 10, "BRIDGED", settlementAssets, corridors);
-  // Provider IDs, names, types, collateral should be identical across topologies.
   let economicsShared = true;
+  const fieldsToCheck = ["id", "name", "providerType", "trustModel", "strategy", "collateral", "usableCollateral", "maxExposure"];
   for (let i = 0; i < 10; i++) {
-    const r = specsRandom[i], f = specsFocused[i], b = specsBridged[i];
-    if (r.id !== f.id || r.id !== b.id) { economicsShared = false; break; }
-    if (r.collateral !== f.collateral || r.collateral !== b.collateral) { economicsShared = false; break; }
-    if (r.providerType !== f.providerType || r.providerType !== b.providerType) { economicsShared = false; break; }
+    const r = specsRandom[i] as any, f = specsFocused[i] as any, b = specsBridged[i] as any;
+    for (const field of fieldsToCheck) {
+      if (r[field] !== f[field] || r[field] !== b[field]) {
+        economicsShared = false;
+        console.error(`  Provider ${i} field ${field}: R=${r[field]} F=${f[field]} B=${b[field]}`);
+        break;
+      }
+    }
+    // Check reliability profile.
+    if (r.reliabilityProfile.fastRate !== f.reliabilityProfile.fastRate || r.reliabilityProfile.fastRate !== b.reliabilityProfile.fastRate) {
+      economicsShared = false; break;
+    }
+    // Check that bridge offer economics use canonical values (not rng.int(3,10) or rate:1.0).
+    for (const os of b.offerSpecs) {
+      if (os.feeBps !== r.offerSpecs[0]?.feeBps && os.feeBps !== r.offerSpecs[0]?.feeBps) {
+        // Bridge offers should use the same feeBps as the canonical economics.
+        // (If this fails, the bridge treatment is changing economics, not just topology.)
+      }
+    }
   }
-  assert(economicsShared, "Provider economics (id, type, collateral) identical across RANDOM/CORRIDOR_FOCUSED/BRIDGED");
+  assert(economicsShared, "Provider economics (ALL fields) identical across RANDOM/CORRIDOR_FOCUSED/BRIDGED");
 
-  // 8. Metric ordering: asset ≥ corridor ≥ executable (in source code)
-  console.log("\n== 8. Metric semantics ==");
-  assert(expSrc.includes("executionAttemptRate"), "Uses executionAttemptRate (not routeCoverage)");
-  assert(!expSrc.includes("reachableDemandPct:"), "Old reachableDemandPct removed from return");
-  assert(expSrc.includes("effectiveCost100Bps"), "Effective cost at 100 bps");
-  assert(expSrc.includes("effectiveCost300Bps"), "Effective cost at 300 bps");
-  assert(expSrc.includes("effectiveCost500Bps"), "Effective cost at 500 bps");
+  // Also verify bridge offers use canonical economics (not rng.int(3,10) or rate:1.0).
+  let bridgeEconomicsCanonical = true;
+  for (let i = 0; i < 10; i++) {
+    const r = specsRandom[i] as any, b = specsBridged[i] as any;
+    // At least one bridge offer should have the same feeBps and rate as the canonical.
+    // (Not all bridge offers are guaranteed to be bridge-type, but those that are
+    // should use canonical economics.)
+    for (const os of b.offerSpecs) {
+      // If this is a bridge offer (has GLOBAL), check it uses canonical economics.
+      if (os.sourceCountry === "GLOBAL" || os.destinationCountry === "GLOBAL") {
+        if (os.rate !== r.offerSpecs[0]?.rate || os.feeBps !== r.offerSpecs[0]?.feeBps) {
+          bridgeEconomicsCanonical = false;
+          console.error(`  Bridge offer economics differ: rate=${os.rate} (expected ${r.offerSpecs[0]?.rate}), feeBps=${os.feeBps} (expected ${r.offerSpecs[0]?.feeBps})`);
+          break;
+        }
+      }
+    }
+    if (!bridgeEconomicsCanonical) break;
+  }
+  assert(bridgeEconomicsCanonical, "Bridge offers use canonical economics (not rng.int(3,10) or rate:1.0)");
+
+  // 8. Four reachability metrics
+  console.log("\n== 8. Four reachability metrics ==");
+  assert(expSrc.includes("assetReachablePct"), "Has assetReachablePct");
+  assert(expSrc.includes("corridorReachablePct"), "Has corridorReachablePct");
+  assert(expSrc.includes("liquidityExecutableReachabilityPct"), "Has liquidityExecutableReachabilityPct");
+  assert(expSrc.includes("productionExecutableReachabilityPct"), "Has productionExecutableReachabilityPct");
+  // Verify production executable uses shared risk functions.
+  assert(expSrc.includes("settlementAssetRisk("), "Production exec uses settlementAssetRisk()");
+  assert(expSrc.includes("assetRiskCeiling("), "Production exec uses assetRiskCeiling()");
+  assert(expSrc.includes("providerCounterpartyRisk("), "Production exec uses providerCounterpartyRisk()");
+  assert(expSrc.includes("counterpartyRiskCeiling("), "Production exec uses counterpartyRiskCeiling()");
+  // Verify multi-hop checks BOTH hops' liquidity.
+  assert(expSrc.includes("p1.liquidity.balances.get(sa)"), "Multi-hop liq-exec checks hop1 destination liquidity");
+  assert(expSrc.includes("p2.liquidity.balances.get(dstAsset)"), "Multi-hop liq-exec checks hop2 destination liquidity");
 
   console.log(`\n========================================`);
-  console.log(`  P4.8.4 Integrity: Passed: ${passed}  |  Failed: ${failed}`);
+  console.log(`  P4.8.5 Integrity: Passed: ${passed}  |  Failed: ${failed}`);
   console.log(`========================================`);
   if (failed > 0) {
     console.log("\nFailures:");

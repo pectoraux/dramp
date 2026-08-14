@@ -17,7 +17,7 @@ import {
   SimLiquidityInventory, SettlementReliabilityProfile,
   DEFAULT_RELIABILITY_PROFILES,
 } from "../src/lib/simulator/world";
-import { calculateProviderEconomics } from "../src/lib/economics/shared";
+import { calculateProviderEconomics, settlementAssetRisk, assetRiskCeiling, counterpartyRiskCeiling, providerCounterpartyRisk } from "../src/lib/economics/shared";
 
 // ---- Constants ----
 const COUNTRIES = ["US", "EU", "NG", "PH", "KE", "GB", "SG", "JP", "IN", "BR"];
@@ -270,10 +270,10 @@ export function generateCanonicalSpecs(
         const fiatCountry = COUNTRIES[fiatIdx];
         if (rng.chance(0.5)) {
           corridors.push(`${fiatAsset}:${fiatCountry}:${sa.symbol}:GLOBAL`);
-          offerSpecs.push({ sourceAsset: fiatAsset, destinationAsset: sa.symbol, sourceCountry: fiatCountry, destinationCountry: "GLOBAL", rate: 1.0, feeBps: rng.int(3, 10), settlementAssetId: sa.id, availableCapacity: econ.capacity, expectedExecutionSeconds: econ.expectedExecutionSeconds });
+          offerSpecs.push({ sourceAsset: fiatAsset, destinationAsset: sa.symbol, sourceCountry: fiatCountry, destinationCountry: "GLOBAL", rate: econ.rate, feeBps: econ.feeBps, settlementAssetId: sa.id, availableCapacity: econ.capacity, expectedExecutionSeconds: econ.expectedExecutionSeconds });
         } else {
           corridors.push(`${sa.symbol}:GLOBAL:${fiatAsset}:${fiatCountry}`);
-          offerSpecs.push({ sourceAsset: sa.symbol, destinationAsset: fiatAsset, sourceCountry: "GLOBAL", destinationCountry: fiatCountry, rate: 1.0, feeBps: rng.int(3, 10), settlementAssetId: sa.id, availableCapacity: econ.capacity, expectedExecutionSeconds: econ.expectedExecutionSeconds });
+          offerSpecs.push({ sourceAsset: sa.symbol, destinationAsset: fiatAsset, sourceCountry: "GLOBAL", destinationCountry: fiatCountry, rate: econ.rate, feeBps: econ.feeBps, settlementAssetId: sa.id, availableCapacity: econ.capacity, expectedExecutionSeconds: econ.expectedExecutionSeconds });
         }
       }
     }
@@ -342,10 +342,11 @@ function buildWorld(
 // ---- Metrics ----
 interface RunMetrics {
   executionAttemptRate: number;
-  // Three reachability levels.
-  assetReachablePct: number;      // Does an abstract asset path exist? (ignores countries)
-  corridorReachablePct: number;   // Does a path exist matching asset AND country?
-  executableReachablePct: number; // Does a path exist with capacity, liquidity, risk?
+  // Four reachability levels (each stricter than the last).
+  assetReachablePct: number;                    // Abstract asset path (ignores countries)
+  corridorReachablePct: number;                 // Asset + country match
+  liquidityExecutableReachabilityPct: number;   // + capacity ≥100, dest liquidity ≥100
+  productionExecutableReachabilityPct: number;  // + risk ceilings, min/max, provider status
   assetReachablePairs: number;
   corridorReachablePairs: number;
   totalDemandPairs: number;
@@ -433,10 +434,12 @@ function extractMetrics(world: any): RunMetrics {
 
   let assetReachablePairs = 0;
   let corridorReachablePairs = 0;
-  let executableReachablePairs = 0;
+  let liqExecutableReachablePairs = 0;
+  let prodExecutableReachablePairs = 0;
   let assetReachableVolume = 0;
   let corridorReachableVolume = 0;
-  let executableReachableVolume = 0;
+  let liqExecutableVolume = 0;
+  let prodExecutableVolume = 0;
   let corridorsWithMultipleRoutes = 0;
 
   for (const [corridorKey, weight] of demandedCorridors) {
@@ -479,22 +482,21 @@ function extractMetrics(world: any): RunMetrics {
     if (corridorReachable) { corridorReachablePairs++; corridorReachableVolume += weight; }
     if (corridorRouteCount >= 2) corridorsWithMultipleRoutes++;
 
-    // 3. EXECUTABLE reachability (has capacity, liquidity, risk constraints).
-    // Check if at least one offer in a reachable route has:
-    // - sufficient capacity (availableCapacity >= some threshold, say 100)
-    // - provider has destination liquidity
-    let executableReachable = false;
-    // Direct executable.
+    // 3. LIQUIDITY-EXECUTABLE reachability (capacity + destination liquidity, all hops).
+    // Checks: active offer, availableCapacity ≥ 100, destination liquidity ≥ 100.
+    // For multi-hop: checks BOTH hops' capacity and BOTH providers' destination liquidity.
+    let liqExecutable = false;
+    // Direct.
     for (const o of directCorridor) {
       if (o.availableCapacity >= 100) {
         const provider = world.providers.get(o.providerId);
         if (provider && (provider.liquidity.balances.get(dstAsset) ?? 0) >= 100) {
-          executableReachable = true; break;
+          liqExecutable = true; break;
         }
       }
     }
-    // Multi-hop executable.
-    if (!executableReachable) {
+    // Multi-hop: check BOTH hops.
+    if (!liqExecutable) {
       for (const sa of settlementAssetSymbols) {
         const hop1 = activeOffers.filter(o =>
           o.sourceAsset === srcAsset && o.sourceCountry === srcCountry &&
@@ -503,23 +505,113 @@ function extractMetrics(world: any): RunMetrics {
           o.sourceAsset === sa && o.sourceCountry === "GLOBAL" &&
           o.destinationAsset === dstAsset && o.destinationCountry === dstCountry && o.availableCapacity >= 100);
         if (hop1.length > 0 && hop2.length > 0) {
-          // Check liquidity for hop2's provider.
-          for (const o2 of hop2) {
-            const provider = world.providers.get(o2.providerId);
-            if (provider && (provider.liquidity.balances.get(dstAsset) ?? 0) >= 100) {
-              executableReachable = true; break;
+          // Check liquidity for BOTH hops' providers.
+          for (const o1 of hop1) {
+            const p1 = world.providers.get(o1.providerId);
+            if (!p1 || (p1.liquidity.balances.get(sa) ?? 0) < 100) continue;
+            for (const o2 of hop2) {
+              const p2 = world.providers.get(o2.providerId);
+              if (p2 && (p2.liquidity.balances.get(dstAsset) ?? 0) >= 100) {
+                liqExecutable = true; break;
+              }
             }
+            if (liqExecutable) break;
           }
-          if (executableReachable) break;
+          if (liqExecutable) break;
         }
       }
     }
-    if (executableReachable) { executableReachablePairs++; executableReachableVolume += weight; }
+    if (liqExecutable) { liqExecutableReachablePairs++; liqExecutableVolume += weight; }
+
+    // 4. PRODUCTION-EXECUTABLE reachability (full hard constraints from shared economics).
+    // Checks: active provider, settlement-asset risk ceiling, counterparty risk ceiling,
+    // min/max amount, capacity, destination liquidity. Uses shared pure functions.
+    let prodExecutable = false;
+    const amount = 100; // representative transaction amount for reachability check
+    // Direct.
+    for (const o of directCorridor) {
+      const provider = world.providers.get(o.providerId);
+      if (!provider || provider.status !== "ACTIVE") continue;
+      if (o.availableCapacity < amount) continue;
+      if (amount < o.minimumAmount || amount > o.maximumAmount) continue;
+      if ((provider.liquidity.balances.get(dstAsset) ?? 0) < amount) continue;
+      // Settlement-asset risk ceiling (use BALANCED as representative).
+      if (o.settlementAssetId) {
+        const sa = world.assets.get(o.settlementAssetId);
+        if (sa) {
+          const saRisk = settlementAssetRisk({
+            assetType: sa.assetType, volatilityScore: sa.volatilityScore,
+            liquidityScore: sa.liquidityScore, pegQuality: sa.pegQuality,
+            status: sa.status, incentiveRate: sa.incentiveRate,
+          });
+          if (saRisk > assetRiskCeiling("BALANCED")) continue;
+        }
+      }
+      // Counterparty risk ceiling.
+      const cpRisk = providerCounterpartyRisk({
+        trustModel: provider.trustModel, providerType: provider.providerType,
+        reputationScore: provider.reputationScore, status: provider.status,
+      });
+      if (cpRisk > counterpartyRiskCeiling("BALANCED")) continue;
+      prodExecutable = true; break;
+    }
+    // Multi-hop: check ALL hard constraints for BOTH hops.
+    if (!prodExecutable) {
+      for (const sa of settlementAssetSymbols) {
+        const hop1 = activeOffers.filter(o =>
+          o.sourceAsset === srcAsset && o.sourceCountry === srcCountry &&
+          o.destinationAsset === sa && o.destinationCountry === "GLOBAL");
+        const hop2 = activeOffers.filter(o =>
+          o.sourceAsset === sa && o.sourceCountry === "GLOBAL" &&
+          o.destinationAsset === dstAsset && o.destinationCountry === dstCountry);
+        if (hop1.length === 0 || hop2.length === 0) continue;
+        // Check settlement-asset risk for the bridge asset.
+        const saObj = [...world.assets.values()].find((a: any) => a.symbol === sa);
+        if (saObj) {
+          const saRisk = settlementAssetRisk({
+            assetType: saObj.assetType, volatilityScore: saObj.volatilityScore,
+            liquidityScore: saObj.liquidityScore, pegQuality: saObj.pegQuality,
+            status: saObj.status, incentiveRate: saObj.incentiveRate,
+          });
+          if (saRisk > assetRiskCeiling("BALANCED")) continue;
+        }
+        // Find a valid hop1 + hop2 pair.
+        for (const o1 of hop1) {
+          const p1 = world.providers.get(o1.providerId);
+          if (!p1 || p1.status !== "ACTIVE") continue;
+          if (o1.availableCapacity < amount) continue;
+          if (amount < o1.minimumAmount || amount > o1.maximumAmount) continue;
+          if ((p1.liquidity.balances.get(sa) ?? 0) < amount) continue;
+          const cpRisk1 = providerCounterpartyRisk({
+            trustModel: p1.trustModel, providerType: p1.providerType,
+            reputationScore: p1.reputationScore, status: p1.status,
+          });
+          if (cpRisk1 > counterpartyRiskCeiling("BALANCED")) continue;
+          for (const o2 of hop2) {
+            const p2 = world.providers.get(o2.providerId);
+            if (!p2 || p2.status !== "ACTIVE") continue;
+            if (o2.availableCapacity < amount) continue;
+            if (amount < o2.minimumAmount || amount > o2.maximumAmount) continue;
+            if ((p2.liquidity.balances.get(dstAsset) ?? 0) < amount) continue;
+            const cpRisk2 = providerCounterpartyRisk({
+              trustModel: p2.trustModel, providerType: p2.providerType,
+              reputationScore: p2.reputationScore, status: p2.status,
+            });
+            if (cpRisk2 > counterpartyRiskCeiling("BALANCED")) continue;
+            prodExecutable = true; break;
+          }
+          if (prodExecutable) break;
+        }
+        if (prodExecutable) break;
+      }
+    }
+    if (prodExecutable) { prodExecutableReachablePairs++; prodExecutableVolume += weight; }
   }
 
   const assetReachablePct = totalDemandWeight > 0 ? (assetReachableVolume / totalDemandWeight) * 100 : 0;
   const corridorReachablePct = totalDemandWeight > 0 ? (corridorReachableVolume / totalDemandWeight) * 100 : 0;
-  const executableReachablePct = totalDemandWeight > 0 ? (executableReachableVolume / totalDemandWeight) * 100 : 0;
+  const liqExecutablePct = totalDemandWeight > 0 ? (liqExecutableVolume / totalDemandWeight) * 100 : 0;
+  const prodExecutablePct = totalDemandWeight > 0 ? (prodExecutableVolume / totalDemandWeight) * 100 : 0;
 
   const corridorOfferCounts = new Map<string, number>();
   for (const o of world.offers.values()) {
@@ -536,7 +628,8 @@ function extractMetrics(world: any): RunMetrics {
     executionAttemptRate: intents.length > 0 ? (intents.filter((i: any) => i.status === "COMPLETED" || i.status === "EXECUTING" || i.status === "FAILED").length / intents.length) * 100 : 0,
     assetReachablePct: Math.round(assetReachablePct * 100) / 100,
     corridorReachablePct: Math.round(corridorReachablePct * 100) / 100,
-    executableReachablePct: Math.round(executableReachablePct * 100) / 100,
+    liquidityExecutableReachabilityPct: Math.round(liqExecutablePct * 100) / 100,
+    productionExecutableReachabilityPct: Math.round(prodExecutablePct * 100) / 100,
     assetReachablePairs,
     corridorReachablePairs,
     totalDemandPairs,
@@ -642,15 +735,16 @@ function printResults(results: Result[]) {
   console.log("║  Controls: no entry/exit, no incentives, no shocks              ║");
   console.log("╚══════════════════════════════════════════════════════════════════╝");
 
-  // Table A: Three-level reachability
-  console.log("\n### Table A — Reachable Demand % (Asset / Corridor / Executable)\n");
-  console.log("| Providers | Topology | Asset reach % | Corridor reach % | Executable reach % |");
-  console.log("| --- | --- | --- | --- | --- |");
+  // Table A: Four-level reachability
+  console.log("\n### Table A — Reachable Demand % (Asset / Corridor / Liq-Exec / Prod-Exec)\n");
+  console.log("| Providers | Topology | Asset % | Corridor % | Liq-exec % | Prod-exec % |");
+  console.log("| --- | --- | --- | --- | --- | --- |");
   for (const r of results) {
     const ar = r.metrics.map(m => m.assetReachablePct);
     const cr = r.metrics.map(m => m.corridorReachablePct);
-    const er = r.metrics.map(m => m.executableReachablePct);
-    console.log(`| ${r.density} | ${r.topology} | ${statsLabel(ar)} | ${statsLabel(cr)} | ${statsLabel(er)} |`);
+    const lr = r.metrics.map(m => m.liquidityExecutableReachabilityPct);
+    const pr = r.metrics.map(m => m.productionExecutableReachabilityPct);
+    console.log(`| ${r.density} | ${r.topology} | ${statsLabel(ar)} | ${statsLabel(cr)} | ${statsLabel(lr)} | ${statsLabel(pr)} |`);
   }
 
   // Table B: Completion / Effective cost sensitivity
@@ -694,11 +788,12 @@ function printResults(results: Result[]) {
     if (r100) {
       const medAsset = percentile(r100.metrics.map(m => m.assetReachablePct), 0.5);
       const medCorridor = percentile(r100.metrics.map(m => m.corridorReachablePct), 0.5);
-      const medExec = percentile(r100.metrics.map(m => m.executableReachablePct), 0.5);
+      const medLiqExec = percentile(r100.metrics.map(m => m.liquidityExecutableReachabilityPct), 0.5);
+      const medProdExec = percentile(r100.metrics.map(m => m.productionExecutableReachabilityPct), 0.5);
       const medComp = percentile(r100.metrics.map(m => m.completionRate), 0.5);
       const medEff300 = percentile(r100.metrics.map(m => m.effectiveCost300Bps), 0.5);
       const medMultiHop = percentile(r100.metrics.map(m => m.multiHopPercentage), 0.5);
-      console.log(`  ${topo} @ 100: asset_reach=${medAsset.toFixed(1)}%, corridor_reach=${medCorridor.toFixed(1)}%, exec_reach=${medExec.toFixed(1)}%, completion=${medComp.toFixed(1)}%, eff(300)=${medEff300.toFixed(1)}bps, multi-hop=${medMultiHop.toFixed(1)}%`);
+      console.log(`  ${topo} @ 100: asset=${medAsset.toFixed(1)}%, corridor=${medCorridor.toFixed(1)}%, liq_exec=${medLiqExec.toFixed(1)}%, prod_exec=${medProdExec.toFixed(1)}%, completion=${medComp.toFixed(1)}%, eff(300)=${medEff300.toFixed(1)}bps, multi-hop=${medMultiHop.toFixed(1)}%`);
     }
   }
 }
