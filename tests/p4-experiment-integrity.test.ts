@@ -211,8 +211,26 @@ async function main() {
   // No local duplicate formula in routing.ts.
   assert(!routingSrc.includes("function computeHopOutput(inputAmount: Decimal, edge: AdjEdge): { output: Decimal; fee: Decimal; incentive: Decimal } {\n  const fee = feeForAmount"), "No local duplicate computeHopOutput formula in routing.ts");
 
+  // 11. Capacity-semantics adapter (Prompt 4.8.8A)
+  console.log("\n== 11. Capacity-semantics adapter (P4.8.8A) ==");
+  // The adapter function must exist.
+  assert(expSrc.includes("toProductionCapacity"), "Experiment defines toProductionCapacity adapter");
+  assert(expSrc.includes("productionUsable"), "Experiment defines productionUsable helper");
+  // The adapter must be USED in checkPathFeasibility (not just defined).
+  assert(expSrc.includes("const prodCap = toProductionCapacity("), "checkPathFeasibility uses toProductionCapacity adapter");
+  // The adapter must NOT pass simulator offers directly to coverAmount.
+  // (The old buggy code had: availableCapacity: o.availableCapacity, without conversion.)
+  assert(!expSrc.includes("availableCapacity: o.availableCapacity,\n      reservedCapacity: o.reservedCapacity,\n      minimumAmount: o.minimumAmount,\n    }));"), "No direct simulator-to-coverAmount conversion (adapter must be used)");
+  // The adapter must be exported (for testing).
+  assert(expSrc.includes("export function toProductionCapacity"), "toProductionCapacity is exported");
+  assert(expSrc.includes("export function productionUsable"), "productionUsable is exported");
+  // Documentation: the adapter must explain the semantic difference.
+  assert(expSrc.includes("DOUBLE-SUBTRACT"), "Adapter documents the double-subtraction risk");
+  assert(expSrc.includes("Simulator (engine-faithful.ts"), "Adapter documents simulator semantics");
+  assert(expSrc.includes("Production (collateral.ts"), "Adapter documents production semantics");
+
   console.log(`\n========================================`);
-  console.log(`  P4.8.8 Integrity: Passed: ${passed}  |  Failed: ${failed}`);
+  console.log(`  P4.8.8A Integrity: Passed: ${passed}  |  Failed: ${failed}`);
   console.log(`========================================`);
   if (failed > 0) {
     console.log("\nFailures:");

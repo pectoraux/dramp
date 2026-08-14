@@ -419,6 +419,57 @@ export interface PathFeasibility {
   split: boolean;
 }
 
+// ---- Capacity semantics adapter (Prompt 4.8.8A) ------------------------
+//
+// CRITICAL: Production and the simulator use DIFFERENT capacity conventions:
+//
+//   Production (collateral.ts, routing.ts):
+//     availableCapacity = TOTAL offer capacity (never changes on reservation)
+//     reservedCapacity  = currently reserved portion
+//     usable            = availableCapacity - reservedCapacity
+//     (reservation: only reservedCapacity is incremented)
+//
+//   Simulator (engine-faithful.ts, since P4.3):
+//     availableCapacity = currently UNRESERVED capacity (decreases on reservation)
+//     reservedCapacity  = currently reserved portion (same as production)
+//     total             = availableCapacity + reservedCapacity
+//     (reservation: availableCapacity -= amount; reservedCapacity += amount)
+//
+// The shared coverAmount() uses PRODUCTION semantics (usable = available - reserved).
+// Feeding a simulator offer directly would DOUBLE-SUBTRACT reservations:
+//   simAvailable - simReserved = (total - simReserved) - simReserved = total - 2*reserved
+//
+// This adapter converts simulator capacity to production capacity:
+//   production.availableCapacity = simAvailable + simReserved (= total)
+//   production.reservedCapacity  = simReserved (unchanged)
+//   → coverAmount computes: total - simReserved = simAvailable ✓
+//
+// This makes the experiment's capacity check exactly match what the simulator
+// itself does when it checks `availableCapacity >= amount` (simulator semantics).
+
+export interface SimulatorCapacity {
+  availableCapacity: number; // simulator: currently unreserved
+  reservedCapacity: number;  // simulator: currently reserved (same as production)
+}
+
+export interface ProductionCapacity {
+  availableCapacity: number; // production: total
+  reservedCapacity: number;  // production: reserved (same)
+}
+
+export function toProductionCapacity(sim: SimulatorCapacity): ProductionCapacity {
+  return {
+    availableCapacity: sim.availableCapacity + sim.reservedCapacity, // total
+    reservedCapacity: sim.reservedCapacity,
+  };
+}
+
+// Verify the adapter invariant: production.usable == simulator.available.
+// production.available - production.reserved == sim.available + sim.reserved - sim.reserved == sim.available
+export function productionUsable(prod: ProductionCapacity): number {
+  return prod.availableCapacity - prod.reservedCapacity;
+}
+
 export function checkPathFeasibility(
   path: PathStep<SimOffer>[],
   amount: number,
@@ -435,14 +486,23 @@ export function checkPathFeasibility(
   for (let i = 0; i < path.length; i++) {
     const step = path[i];
     // Convert SimOffers to CoverOffers for shared coverAmount.
-    const coverOffers: CoverOffer[] = step.edges.map((o) => ({
-      id: o.id,
-      channelType: o.channelType,
-      feeBps: o.feeBps,
-      availableCapacity: o.availableCapacity,
-      reservedCapacity: o.reservedCapacity,
-      minimumAmount: o.minimumAmount,
-    }));
+    // CRITICAL: apply the capacity-semantics adapter (Prompt 4.8.8A).
+    // Simulator availableCapacity = unreserved; production availableCapacity = total.
+    // Without the adapter, coverAmount would double-subtract reservations.
+    const coverOffers: CoverOffer[] = step.edges.map((o) => {
+      const prodCap = toProductionCapacity({
+        availableCapacity: o.availableCapacity,
+        reservedCapacity: o.reservedCapacity,
+      });
+      return {
+        id: o.id,
+        channelType: o.channelType,
+        feeBps: o.feeBps,
+        availableCapacity: prodCap.availableCapacity,
+        reservedCapacity: prodCap.reservedCapacity,
+        minimumAmount: o.minimumAmount,
+      };
+    });
 
     const cover = coverAmount(coverOffers, currentAmount);
     if (!cover) return null; // structural infeasibility: insufficient combined capacity

@@ -1,5 +1,5 @@
 /**
- * dRamp Prompt 4.8.8 — Production-Faithful Path Reachability Tests.
+ * dRamp Prompt 4.8.8/4.8.8A — Production-Faithful Path Reachability Tests.
  *
  * Proves:
  *   1. computeHopOutput identity: experiment (shared) and production (Decimal
@@ -11,6 +11,11 @@
  *   6. Per-user risk tolerance changes production reachability (MAX_RELIABILITY
  *      rejects a risky provider; LOWEST_COST accepts it).
  *   7. Split direct route is correctly classified (split: true, hops: 1).
+ *   8. Liquidity failure: provider lacks destination-asset balance.
+ *   9. (4.8.8A) Capacity-semantics adapter: simulator offers with reservations
+ *      are NOT double-subtracted. The adapter toProductionCapacity() converts
+ *      simulator semantics (available=unreserved) to production semantics
+ *      (available=total) so coverAmount computes the correct usable capacity.
  *
  * Usage: bun tests/p4-path-feasibility.test.ts
  */
@@ -31,7 +36,7 @@ async function main() {
   const Decimal = (await import("decimal.js")).default;
   const { computeHopOutput, coverAmount, enumeratePaths, settlementAssetRisk, providerCounterpartyRisk } = await import("../src/lib/economics/shared");
   const { createWorld, createDefaultConfig } = await import("../src/lib/simulator/world");
-  const { checkPathFeasibility } = await import("../experiments/p4-topology-experiment");
+  const { checkPathFeasibility, toProductionCapacity, productionUsable } = await import("../experiments/p4-topology-experiment");
   type SimOffer = import("../src/lib/simulator/world").SimOffer;
   type SimWorld = import("../src/lib/simulator/world").SimWorld;
   type SimProvider = import("../src/lib/simulator/world").SimProvider;
@@ -401,8 +406,115 @@ async function main() {
     assert(feas!.prodFeasible === false, "No-liquidity: NOT production-feasible (liq fails → prod fails)");
   }
 
+  // =========================================================================
+  // 9. (4.8.8A) Capacity-semantics adapter — NO double-subtraction
+  // =========================================================================
+  console.log("\n== 9. Capacity-semantics adapter (4.8.8A) ==");
+
+  // 9a. Adapter invariant: production.usable == simulator.available.
+  {
+    // Simulator state: available=6000 (unreserved), reserved=4000.
+    // Total = 10000.
+    // Adapter: production.available = 6000+4000 = 10000, production.reserved = 4000.
+    // production.usable = 10000 - 4000 = 6000 == simulator.available. ✓
+    const simCap = { availableCapacity: 6000, reservedCapacity: 4000 };
+    const prodCap = toProductionCapacity(simCap);
+    assert(prodCap.availableCapacity === 10000, `Adapter: production.available = sim.avail + sim.reserved = 10000 (got ${prodCap.availableCapacity})`);
+    assert(prodCap.reservedCapacity === 4000, `Adapter: production.reserved = sim.reserved = 4000 (got ${prodCap.reservedCapacity})`);
+    const usable = productionUsable(prodCap);
+    assert(usable === 6000, `Adapter: production.usable = 10000 - 4000 = 6000 == sim.available (got ${usable})`);
+    assert(usable === simCap.availableCapacity, "Adapter invariant: production.usable == simulator.available");
+  }
+
+  // 9b. WITHOUT adapter: double-subtraction bug.
+  {
+    // If we (incorrectly) pass simulator offers directly to coverAmount:
+    // coverAmount computes: sim.available - sim.reserved = 6000 - 4000 = 2000.
+    // That's WRONG — the actual usable capacity is 6000 (simulator.available).
+    const simAvailable = 6000;
+    const simReserved = 4000;
+    const buggyUsable = simAvailable - simReserved; // what coverAmount would compute without adapter
+    assert(buggyUsable === 2000, `Without adapter: coverAmount computes sim.avail - sim.reserved = 2000 (double-subtraction bug)`);
+    assert(buggyUsable !== simAvailable, "Without adapter: usable ≠ simulator.available (BUG)");
+    // With adapter:
+    const prodCap = toProductionCapacity({ availableCapacity: simAvailable, reservedCapacity: simReserved });
+    const correctUsable = productionUsable(prodCap);
+    assert(correctUsable === simAvailable, `With adapter: usable = ${correctUsable} == simulator.available = ${simAvailable} (CORRECT)`);
+  }
+
+  // 9c. checkPathFeasibility with RESERVED simulator offers: 6k avail + 4k reserved = 10k total.
+  // Demand = 8k should be feasible (simulator available = 6k... wait, 8k > 6k, so NOT feasible).
+  // Demand = 5k should be feasible (5k < 6k simulator available).
+  {
+    // SimOffer with 6000 available (unreserved) + 4000 reserved = 10000 total.
+    // Provider has 50000 NGN liquidity (plenty).
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 50000 });
+    // Create offer with simulator semantics: available=6000, reserved=4000.
+    const offer = makeOffer("o1", "p1", "USD", "US", "NGN", "NG", 500, 10, 10000, "asset_usdc");
+    offer.availableCapacity = 6000; // simulator: currently unreserved
+    offer.reservedCapacity = 4000;  // simulator: currently reserved
+    const world = buildTestWorld([p1], [offer], [stableAsset]);
+    const { sa, cp } = buildRiskCaches(world);
+
+    const path: { fromNode: string; toNode: string; edges: SimOffer[] }[] = [{
+      fromNode: "USD:US", toNode: "NGN:NG", edges: [offer],
+    }];
+
+    // Demand = 5000: simulator available = 6000 ≥ 5000 → FEASIBLE.
+    // With adapter: coverAmount sees total=10000, reserved=4000, usable=6000 ≥ 5000. ✓
+    // WITHOUT adapter: coverAmount sees avail=6000, reserved=4000, usable=2000 < 5000. ✗ (BUG)
+    const feas5k = checkPathFeasibility(path, 5000, "BALANCED", world, sa, cp);
+    assert(feas5k !== null, "Reserved offer (6k avail/4k reserved): structurally feasible for 5k");
+    assert(feas5k!.liqFeasible === true, "Reserved offer (6k avail/4k reserved): 5k IS liquidity-feasible (adapter gives usable=6k ≥ 5k)");
+    assert(feas5k!.prodFeasible === true, "Reserved offer (6k avail/4k reserved): 5k IS production-feasible");
+
+    // Demand = 8000: simulator available = 6000 < 8000 → NOT feasible.
+    // With adapter: coverAmount sees usable=6000 < 8000. ✗ (correct)
+    // WITHOUT adapter: coverAmount sees usable=2000 < 8000. ✗ (also rejects, but for wrong reason)
+    const feas8k = checkPathFeasibility(path, 8000, "BALANCED", world, sa, cp);
+    assert(feas8k === null || feas8k.liqFeasible === false,
+      "Reserved offer (6k avail/4k reserved): 8k NOT feasible (usable=6k < 8k)");
+  }
+
+  // 9d. Split with reservations: two providers, each 6k/4k available, demand 10k.
+  // Wait — 6k+6k=12k usable ≥ 10k → should split.
+  // But each offer has only 6k usable, so neither can cover 10k alone → split.
+  {
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 50000 });
+    const p2 = makeProvider("p2", "COLLATERALIZED", "BANK", 0.9, { NGN: 50000 });
+    // Two offers, each with simulator semantics: available=6000, reserved=4000, total=10000.
+    const o1 = makeOffer("o1", "p1", "USD", "US", "NGN", "NG", 500, 10, 10000, "asset_usdc");
+    o1.availableCapacity = 6000; o1.reservedCapacity = 4000;
+    const o2 = makeOffer("o2", "p2", "USD", "US", "NGN", "NG", 500, 10, 10000, "asset_usdc");
+    o2.availableCapacity = 6000; o2.reservedCapacity = 4000;
+    const world = buildTestWorld([p1, p2], [o1, o2], [stableAsset]);
+    const { sa, cp } = buildRiskCaches(world);
+
+    const path: { fromNode: string; toNode: string; edges: SimOffer[] }[] = [{
+      fromNode: "USD:US", toNode: "NGN:NG", edges: [o1, o2],
+    }];
+
+    // Demand = 10000: each offer has usable=6000. Neither can cover 10k alone.
+    // Split: 6000 + 4000 = 10000. ✓ (with adapter)
+    // WITHOUT adapter: each offer has buggy usable=2000. 2000+2000=4000 < 10000 → infeasible (BUG).
+    const feas = checkPathFeasibility(path, 10000, "BALANCED", world, sa, cp);
+    assert(feas !== null, "Split with reservations: structurally feasible (6k+6k usable ≥ 10k)");
+    assert(feas!.liqFeasible === true, "Split with reservations: liquidity-feasible (adapter gives each 6k usable, split 6k+4k)");
+    assert(feas!.prodFeasible === true, "Split with reservations: production-feasible");
+    assert(feas!.split === true, "Split with reservations: classified as split (neither offer covers 10k alone)");
+  }
+
+  // 9e. No reservations (reservedCapacity=0): adapter is a no-op.
+  {
+    const simCap = { availableCapacity: 10000, reservedCapacity: 0 };
+    const prodCap = toProductionCapacity(simCap);
+    assert(prodCap.availableCapacity === 10000, "No reservations: adapter availableCapacity unchanged (10000)");
+    assert(prodCap.reservedCapacity === 0, "No reservations: adapter reservedCapacity unchanged (0)");
+    assert(productionUsable(prodCap) === 10000, "No reservations: usable = 10000 (no double-subtraction possible)");
+  }
+
   console.log(`\n========================================`);
-  console.log(`  P4.8.8 Path Feasibility: Passed: ${passed}  |  Failed: ${failed}`);
+  console.log(`  P4.8.8A Path Feasibility: Passed: ${passed}  |  Failed: ${failed}`);
   console.log(`========================================`);
   if (failed > 0) {
     console.log("\nFailures:");
