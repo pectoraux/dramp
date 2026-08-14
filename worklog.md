@@ -1116,3 +1116,22 @@ Stage Summary:
   3. No legacy contradictory feasibility function
   4. All metrics labeled LOWER_BOUND where appropriate
 - Commit SHA: dbd61fe (pushed to GitHub main).
+
+---
+Task ID: P4.8.8R-FixAggregateCapacitySemantics
+Agent: main (Z.ai Code)
+Task: Rewrite checkAggregateCapacityFeasible as pure physical capacity (no FX propagation). Add monotonicity invariant test. Add path cap tracking. Run full experiment.
+
+Work Log:
+- Rewrote checkAggregateCapacityFeasible() as a PURE physical capacity check. Ignores liquidity, risk, provider status, fees, rates, incentives, FX. For each hop: sum(usableCapacity) >= amount. Amount stays constant across hops (no FX propagation). This guarantees the monotonicity invariant: aggregateCapacity >= greedyCapacity.
+- Previous version used output-range propagation which violated the invariant (aggregate 87.8% < greedy 100% for RANDOM). The pure capacity definition correctly produces: aggregate 100% >= greedy 100%.
+- Added pathCapHitCount and maxPathsObserved metrics to RunMetrics. Tracks whether the 10,000-path cap is ever hit. If pathCapHitCount > 0, production metrics are lower bounds.
+- Added 10 monotonicity/adversarial tests: invariant (greedy feasible => aggregate feasible), heterogeneous FX (aggregate ignores rates), split capacity (aggregate sums), 2-hop (aggregate ignores FX), reserved capacity (adapter correctly computes usable).
+- All tests pass: 584 total (124 path-feasibility). Lint clean.
+- 5-seed experiment (n=100, medians):
+  - RANDOM: struct 100%, aggCap 100%, greedyCap 100%, greedyLiq 7%, altInv 19.1%, greedyProd 6.5%, altProd 18.9%
+  - CORRIDOR_FOCUSED: struct 100%, aggCap 100%, greedyCap 100%, greedyLiq 2.8%, altInv 24.6%, greedyProd 2.1%, altProd 29.6%
+  - BRIDGED: struct 100%, aggCap 54.5%, greedyCap 54.5%, greedyLiq 2.4%, altInv 4.8%, greedyProd 0.7%, altProd 3.9%
+- Monotonicity holds: structural >= aggCap >= greedyCap >= greedyLiq >= greedyProd ✓
+- Routing gain LOWER_BOUND: RANDOM 12.4pp, CORRIDOR_FOCUSED 27.5pp, BRIDGED 3.2pp
+- Pushed to GitHub main (commit 5a8149e).
