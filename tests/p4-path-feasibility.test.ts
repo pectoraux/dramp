@@ -1,0 +1,417 @@
+/**
+ * dRamp Prompt 4.8.8 — Production-Faithful Path Reachability Tests.
+ *
+ * Proves:
+ *   1. computeHopOutput identity: experiment (shared) and production (Decimal
+ *      wrapper around shared) return identical values.
+ *   2. coverAmount split-capacity: 6k + 4k satisfies 10k demand.
+ *   3. enumeratePaths discovers 2-hop, 3-hop, and 4-hop paths.
+ *   4. checkPathFeasibility: 3-hop bridge is reachable.
+ *   5. checkPathFeasibility: 4-hop path is reachable.
+ *   6. Per-user risk tolerance changes production reachability (MAX_RELIABILITY
+ *      rejects a risky provider; LOWEST_COST accepts it).
+ *   7. Split direct route is correctly classified (split: true, hops: 1).
+ *
+ * Usage: bun tests/p4-path-feasibility.test.ts
+ */
+
+let passed = 0;
+let failed = 0;
+const failures: string[] = [];
+function assert(cond: boolean, label: string) {
+  if (cond) passed++; else { failed++; failures.push(label); console.error(`  ✗ ${label}`); }
+}
+function approxEq(a: number, b: number, eps = 1e-9): boolean {
+  return Math.abs(a - b) < eps;
+}
+
+async function main() {
+  console.log("dRamp P4.8.8 — Production-Faithful Path Reachability Tests");
+
+  const Decimal = (await import("decimal.js")).default;
+  const { computeHopOutput, coverAmount, enumeratePaths, settlementAssetRisk, providerCounterpartyRisk } = await import("../src/lib/economics/shared");
+  const { createWorld, createDefaultConfig } = await import("../src/lib/simulator/world");
+  const { checkPathFeasibility } = await import("../experiments/p4-topology-experiment");
+  type SimOffer = import("../src/lib/simulator/world").SimOffer;
+  type SimWorld = import("../src/lib/simulator/world").SimWorld;
+  type SimProvider = import("../src/lib/simulator/world").SimProvider;
+  type SimSettlementAsset = import("../src/lib/simulator/world").SimSettlementAsset;
+
+  // =========================================================================
+  // 1. computeHopOutput identity: shared (number) == old production (Decimal)
+  // =========================================================================
+  console.log("\n== 1. computeHopOutput identity ==");
+
+  // The shared function IS the canonical formula. Production routing.ts calls
+  // it via a Decimal→number→Decimal wrapper. Verify the shared function
+  // produces the same numeric result as the OLD production Decimal formula.
+  const testCases: Array<{ amount: number; feeBps: number; rate: number; incentiveBps: number }> = [
+    { amount: 1000, feeBps: 25, rate: 1.08, incentiveBps: 5 },
+    { amount: 10000, feeBps: 10, rate: 1.0, incentiveBps: 0 },
+    { amount: 500, feeBps: 50, rate: 0.95, incentiveBps: 20 },
+    { amount: 100000, feeBps: 5, rate: 1.5, incentiveBps: 100 },
+    { amount: 50, feeBps: 30, rate: 0.00065, incentiveBps: 0 }, // small amount, exotic rate
+  ];
+
+  for (const tc of testCases) {
+    // Shared (number) — what the experiment calls.
+    const sharedResult = computeHopOutput(tc.amount, {
+      feeBps: tc.feeBps, rate: tc.rate, incentiveBps: tc.incentiveBps,
+    });
+
+    // Old production formula (Decimal) — what routing.ts USED to do before
+    // delegating to shared. We replicate it here to prove equivalence.
+    const fee = new Decimal(tc.amount).times(tc.feeBps).div(10000);
+    const afterFee = new Decimal(tc.amount).minus(fee);
+    const converted = afterFee.times(tc.rate);
+    const incentive = converted.times(tc.incentiveBps).div(10000);
+    const output = converted.plus(incentive);
+
+    assert(approxEq(sharedResult.output, output.toNumber(), 1e-9),
+      `computeHopOutput output matches Decimal formula (amount=${tc.amount}, feeBps=${tc.feeBps}, rate=${tc.rate})`);
+    assert(approxEq(sharedResult.fee, fee.toNumber(), 1e-9),
+      `computeHopOutput fee matches Decimal formula (amount=${tc.amount})`);
+    assert(approxEq(sharedResult.incentive, incentive.toNumber(), 1e-9),
+      `computeHopOutput incentive matches Decimal formula (amount=${tc.amount})`);
+  }
+
+  // =========================================================================
+  // 2. coverAmount split-capacity: 6k + 4k satisfies 10k demand
+  // =========================================================================
+  console.log("\n== 2. coverAmount split-capacity ==");
+
+  // Two offers: A has $6k, B has $4k. Demand = $10k. Should split.
+  const splitOffers = [
+    { id: "offerA", channelType: "AUTOMATIC", feeBps: 10, availableCapacity: 6000, reservedCapacity: 0, minimumAmount: 10 },
+    { id: "offerB", channelType: "AUTOMATIC", feeBps: 10, availableCapacity: 4000, reservedCapacity: 0, minimumAmount: 10 },
+  ];
+  const splitResult = coverAmount(splitOffers, 10000);
+  assert(splitResult !== null, "6k + 4k covers 10k demand (not null)");
+  assert(splitResult!.split === true, "6k + 4k is a split (split: true)");
+  assert(splitResult!.assignments.length === 2, "Split has 2 assignments");
+  const totalAssigned = splitResult!.assignments.reduce((s, a) => s + a.amount, 0);
+  assert(approxEq(totalAssigned, 10000, 1e-9), `Split assignments sum to 10k (got ${totalAssigned})`);
+
+  // Single offer that can cover the full amount.
+  const singleOffers = [
+    { id: "offerC", channelType: "AUTOMATIC", feeBps: 10, availableCapacity: 15000, reservedCapacity: 0, minimumAmount: 10 },
+  ];
+  const singleResult = coverAmount(singleOffers, 10000);
+  assert(singleResult !== null, "15k offer covers 10k demand (not null)");
+  assert(singleResult!.split === false, "Single offer is not a split (split: false)");
+  assert(singleResult!.assignments.length === 1, "Single offer has 1 assignment");
+
+  // Insufficient combined capacity.
+  const insufficientOffers = [
+    { id: "offerD", channelType: "AUTOMATIC", feeBps: 10, availableCapacity: 3000, reservedCapacity: 0, minimumAmount: 10 },
+    { id: "offerE", channelType: "AUTOMATIC", feeBps: 10, availableCapacity: 2000, reservedCapacity: 0, minimumAmount: 10 },
+  ];
+  const insufficientResult = coverAmount(insufficientOffers, 10000);
+  assert(insufficientResult === null, "3k + 2k cannot cover 10k demand (null)");
+
+  // Reserved capacity reduces available.
+  const reservedOffers = [
+    { id: "offerF", channelType: "AUTOMATIC", feeBps: 10, availableCapacity: 10000, reservedCapacity: 5000, minimumAmount: 10 },
+  ];
+  const reservedResult = coverAmount(reservedOffers, 8000);
+  assert(reservedResult === null, "10k offer with 5k reserved cannot cover 8k demand (null)");
+
+  // =========================================================================
+  // 3. enumeratePaths discovers 2-hop, 3-hop, and 4-hop paths
+  // =========================================================================
+  console.log("\n== 3. enumeratePaths discovers multi-hop paths ==");
+
+  // Build a graph: A → B → C → D → E
+  //   1-hop: A→E (direct)
+  //   2-hop: A→B→E
+  //   3-hop: A→B→C→E
+  //   4-hop: A→B→C→D→E
+  const adj4 = new Map<string, { to: string; edge: string }[]>([
+    ["A", [{ to: "B", edge: "AB" }, { to: "E", edge: "AE" }]],
+    ["B", [{ to: "C", edge: "BC" }, { to: "E", edge: "BE" }]],
+    ["C", [{ to: "D", edge: "CD" }, { to: "E", edge: "CE" }]],
+    ["D", [{ to: "E", edge: "DE" }]],
+    ["E", []],
+  ]);
+
+  const paths4 = enumeratePaths(adj4, "A", "E", 4);
+  const hopCounts = paths4.map(p => p.length).sort((a, b) => a - b);
+  assert(hopCounts.includes(1), "enumeratePaths finds 1-hop path A→E");
+  assert(hopCounts.includes(2), "enumeratePaths finds 2-hop path A→B→E");
+  assert(hopCounts.includes(3), "enumeratePaths finds 3-hop path A→B→C→E");
+  assert(hopCounts.includes(4), "enumeratePaths finds 4-hop path A→B→C→D→E");
+
+  // maxHops=2 should NOT find 3-hop or 4-hop paths.
+  const paths2 = enumeratePaths(adj4, "A", "E", 2);
+  const hopCounts2 = paths2.map(p => p.length);
+  assert(!hopCounts2.includes(3), "maxHops=2 does not find 3-hop paths");
+  assert(!hopCounts2.includes(4), "maxHops=2 does not find 4-hop paths");
+  assert(hopCounts2.includes(1) && hopCounts2.includes(2), "maxHops=2 still finds 1-hop and 2-hop paths");
+
+  // No path exists.
+  const adjNoPath = new Map<string, { to: string; edge: string }[]>([
+    ["A", [{ to: "B", edge: "AB" }]],
+    ["B", [{ to: "A", edge: "BA" }]], // cycle, no path to C
+    ["C", []],
+  ]);
+  const noPaths = enumeratePaths(adjNoPath, "A", "C", 4);
+  assert(noPaths.length === 0, "No path A→C returns empty array");
+
+  // =========================================================================
+  // 4-7. checkPathFeasibility with controlled SimWorld
+  // =========================================================================
+  console.log("\n== 4-7. checkPathFeasibility with controlled worlds ==");
+
+  // Helper: build a minimal SimWorld with given providers, offers, and assets.
+  function buildTestWorld(
+    providers: SimProvider[],
+    offers: SimOffer[],
+    assets: SimSettlementAsset[],
+  ): SimWorld {
+    const config = createDefaultConfig();
+    const world = createWorld(config) as SimWorld;
+    for (const a of assets) world.assets.set(a.id, a);
+    for (const p of providers) world.providers.set(p.id, p);
+    for (const o of offers) world.offers.set(o.id, o);
+    return world;
+  }
+
+  function makeProvider(
+    id: string, trustModel: string, providerType: string,
+    reputationScore: number, liquidityBalances: Record<string, number>,
+  ): SimProvider {
+    return {
+      id, name: id, providerType, trustModel,
+      reputationScore, tier: "VERIFIED", status: "ACTIVE", exitReason: null,
+      strategy: "AGGRESSIVE", collateral: 100000, usableCollateral: 90000,
+      lockedCollateral: 0, maxExposure: 60000, corridors: [],
+      liquidity: { balances: new Map(Object.entries(liquidityBalances)) },
+      encumbered: { balances: new Map() },
+      treasury: { balances: new Map() },
+      totalReplenished: 0,
+      reliabilityProfile: { fastRate: 0.95, delayedRate: 0.04, retryRate: 0.005, failureRate: 0.005 },
+      totalVolume: 0, totalEarnings: 0, totalIncentives: 0, totalPenalties: 0, totalSlashing: 0,
+      executionsCompleted: 0, executionsFailed: 0,
+      settlementsFast: 0, settlementsDelayed: 0, settlementsRetried: 0, settlementsFailed: 0,
+      utilization: 0, peakUtilization: 0, utilizationTimeSteps: 0,
+      entryStep: 0, exitStep: null, totalDeployedCapitalSteps: 0, currentDeployedCapital: 0,
+      executionHistory: [],
+    } as SimProvider;
+  }
+
+  function makeOffer(
+    id: string, providerId: string,
+    sourceAsset: string, sourceCountry: string,
+    destinationAsset: string, destinationCountry: string,
+    rate: number, feeBps: number, availableCapacity: number,
+    settlementAssetId: string | null = null,
+  ): SimOffer {
+    return {
+      id, providerId, capability: "FIAT_IN",
+      sourceAsset, destinationAsset, sourceCountry, destinationCountry,
+      rate, feeBps, minimumAmount: 10, maximumAmount: 1000000000,
+      availableCapacity, reservedCapacity: 0,
+      settlementAssetId, channelType: "AUTOMATIC",
+      expectedExecutionSeconds: 60, incentiveBps: 0, active: true, version: 1,
+      settlementDurationSteps: 1,
+    } as SimOffer;
+  }
+
+  const stableAsset: SimSettlementAsset = {
+    id: "asset_usdc", symbol: "USDC", assetType: "STABLECOIN",
+    volatilityScore: 0.02, liquidityScore: 0.95, pegQuality: 0.99,
+    incentiveRate: 0, collateralHaircut: 0.05, isEligibleCollateral: true, status: "ACTIVE",
+  };
+  const stableAsset2: SimSettlementAsset = {
+    id: "asset_eurc", symbol: "EURC", assetType: "STABLECOIN",
+    volatilityScore: 0.05, liquidityScore: 0.7, pegQuality: 0.95,
+    incentiveRate: 0, collateralHaircut: 0.1, isEligibleCollateral: true, status: "ACTIVE",
+  };
+
+  // Build risk caches manually (mirrors extractMetrics precomputation).
+  function buildRiskCaches(world: SimWorld): { sa: Map<string, number>; cp: Map<string, number> } {
+    const sa = new Map<string, number>();
+    for (const [id, a] of world.assets.entries()) {
+      sa.set(id, settlementAssetRisk({
+        assetType: a.assetType, volatilityScore: a.volatilityScore,
+        liquidityScore: a.liquidityScore, pegQuality: a.pegQuality,
+        status: a.status, incentiveRate: a.incentiveRate,
+      }));
+    }
+    const cp = new Map<string, number>();
+    for (const [id, p] of world.providers.entries()) {
+      cp.set(id, providerCounterpartyRisk({
+        trustModel: p.trustModel, providerType: p.providerType,
+        reputationScore: p.reputationScore, status: p.status,
+      }));
+    }
+    return { sa, cp };
+  }
+
+  // --- 4. 3-hop bridge is reachable ---
+  console.log("\n== 4. 3-hop bridge reachable ==");
+  {
+    // Path: USD:US → USDC:GLOBAL → EURC:GLOBAL → NGN:NG
+    // Provider P1: USD→USDC (has USDC liquidity)
+    // Provider P2: USDC→EURC (has EURC liquidity)
+    // Provider P3: EURC→NGN (has NGN liquidity)
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { USDC: 50000 });
+    const p2 = makeProvider("p2", "COLLATERALIZED", "BANK", 0.9, { EURC: 50000 });
+    const p3 = makeProvider("p3", "COLLATERALIZED", "BANK", 0.9, { NGN: 50000 });
+    const o1 = makeOffer("o1", "p1", "USD", "US", "USDC", "GLOBAL", 1.0, 10, 50000, "asset_usdc");
+    const o2 = makeOffer("o2", "p2", "USDC", "GLOBAL", "EURC", "GLOBAL", 1.08, 10, 50000, "asset_eurc");
+    const o3 = makeOffer("o3", "p3", "EURC", "GLOBAL", "NGN", "NG", 0.00065, 10, 50000, "asset_usdc");
+    const world = buildTestWorld([p1, p2, p3], [o1, o2, o3], [stableAsset, stableAsset2]);
+    const { sa, cp } = buildRiskCaches(world);
+
+    // Build adjacency and enumerate paths.
+    const adj = new Map<string, { to: string; edge: SimOffer }[]>();
+    for (const o of [o1, o2, o3]) {
+      const from = `${o.sourceAsset}:${o.sourceCountry}`;
+      const to = `${o.destinationAsset}:${o.destinationCountry}`;
+      if (!adj.has(from)) adj.set(from, []);
+      adj.get(from)!.push({ to, edge: o });
+    }
+    const paths = enumeratePaths(adj, "USD:US", "NGN:NG", 4);
+    const threeHopPaths = paths.filter(p => p.length === 3);
+    assert(threeHopPaths.length > 0, "3-hop path USD→USDC→EURC→NGN is discovered");
+
+    // Check feasibility of the 3-hop path.
+    const amt = 1000;
+    const feas = checkPathFeasibility(threeHopPaths[0], amt, "BALANCED", world, sa, cp);
+    assert(feas !== null, "3-hop path is structurally feasible (coverAmount succeeds)");
+    assert(feas!.liqFeasible === true, "3-hop path is liquidity-feasible");
+    assert(feas!.prodFeasible === true, "3-hop path is production-feasible (passes risk ceilings)");
+    assert(feas!.split === false, "3-hop path does not require split (each offer has 50k capacity)");
+  }
+
+  // --- 5. 4-hop path is reachable ---
+  console.log("\n== 5. 4-hop path reachable ==");
+  {
+    // Path: USD:US → USDC:GLOBAL → EURC:GLOBAL → GBP:GLOBAL → NGN:NG
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { USDC: 50000 });
+    const p2 = makeProvider("p2", "COLLATERALIZED", "BANK", 0.9, { EURC: 50000 });
+    const p3 = makeProvider("p3", "COLLATERALIZED", "BANK", 0.9, { GBP: 50000 });
+    const p4 = makeProvider("p4", "COLLATERALIZED", "BANK", 0.9, { NGN: 50000 });
+    const o1 = makeOffer("o1", "p1", "USD", "US", "USDC", "GLOBAL", 1.0, 10, 50000, "asset_usdc");
+    const o2 = makeOffer("o2", "p2", "USDC", "GLOBAL", "EURC", "GLOBAL", 1.08, 10, 50000, "asset_eurc");
+    const o3 = makeOffer("o3", "p3", "EURC", "GLOBAL", "GBP", "GLOBAL", 0.85, 10, 50000, "asset_usdc");
+    const o4 = makeOffer("o4", "p4", "GBP", "GLOBAL", "NGN", "NG", 500, 10, 50000, "asset_usdc");
+    const world = buildTestWorld([p1, p2, p3, p4], [o1, o2, o3, o4], [stableAsset, stableAsset2]);
+    const { sa, cp } = buildRiskCaches(world);
+
+    const adj = new Map<string, { to: string; edge: SimOffer }[]>();
+    for (const o of [o1, o2, o3, o4]) {
+      const from = `${o.sourceAsset}:${o.sourceCountry}`;
+      const to = `${o.destinationAsset}:${o.destinationCountry}`;
+      if (!adj.has(from)) adj.set(from, []);
+      adj.get(from)!.push({ to, edge: o });
+    }
+    const paths = enumeratePaths(adj, "USD:US", "NGN:NG", 4);
+    const fourHopPaths = paths.filter(p => p.length === 4);
+    assert(fourHopPaths.length > 0, "4-hop path USD→USDC→EURC→GBP→NGN is discovered");
+
+    const amt = 1000;
+    const feas = checkPathFeasibility(fourHopPaths[0], amt, "BALANCED", world, sa, cp);
+    assert(feas !== null, "4-hop path is structurally feasible");
+    assert(feas!.liqFeasible === true, "4-hop path is liquidity-feasible");
+    assert(feas!.prodFeasible === true, "4-hop path is production-feasible");
+  }
+
+  // --- 6. Per-user risk tolerance changes production reachability ---
+  console.log("\n== 6. Per-user risk tolerance changes reachability ==");
+  {
+    // Provider with NON_CUSTODIAL trust model + DEX type + low reputation → high risk.
+    // cpRisk ≈ 0.40 (base) + 0.08 (DEX) + (1-0.3)*0.2 = 0.40 + 0.08 + 0.14 = 0.62
+    // MAX_RELIABILITY ceiling = 0.30 → 0.62 > 0.30 → REJECTED
+    // LOWEST_COST ceiling = 0.80 → 0.62 < 0.80 → ACCEPTED
+    const riskyProvider = makeProvider("risky", "NON_CUSTODIAL", "DEX", 0.3, { NGN: 50000 });
+    const offer = makeOffer("offer_risky", "risky", "USD", "US", "NGN", "NG", 500, 10, 50000, "asset_usdc");
+    const world = buildTestWorld([riskyProvider], [offer], [stableAsset]);
+    const { sa, cp } = buildRiskCaches(world);
+
+    // Build the 1-hop path.
+    const path: { fromNode: string; toNode: string; edges: SimOffer[] }[] = [{
+      fromNode: "USD:US", toNode: "NGN:NG", edges: [offer],
+    }];
+
+    const amt = 1000;
+    const feasMaxRel = checkPathFeasibility(path, amt, "MAX_RELIABILITY", world, sa, cp);
+    const feasLowCost = checkPathFeasibility(path, amt, "LOWEST_COST", world, sa, cp);
+
+    assert(feasMaxRel !== null, "Risky provider: structurally feasible for MAX_RELIABILITY");
+    assert(feasMaxRel!.liqFeasible === true, "Risky provider: liquidity-feasible for MAX_RELIABILITY");
+    assert(feasMaxRel!.prodFeasible === false, "Risky provider: NOT production-feasible for MAX_RELIABILITY (risk > ceiling)");
+
+    assert(feasLowCost !== null, "Risky provider: structurally feasible for LOWEST_COST");
+    assert(feasLowCost!.liqFeasible === true, "Risky provider: liquidity-feasible for LOWEST_COST");
+    assert(feasLowCost!.prodFeasible === true, "Risky provider: production-feasible for LOWEST_COST (risk < ceiling)");
+
+    // Verify the risk values explicitly.
+    const cpRisk = cp.get("risky")!;
+    assert(cpRisk > 0.30, `Risky provider cpRisk (${cpRisk.toFixed(3)}) > MAX_RELIABILITY ceiling (0.30)`);
+    assert(cpRisk < 0.80, `Risky provider cpRisk (${cpRisk.toFixed(3)}) < LOWEST_COST ceiling (0.80)`);
+  }
+
+  // --- 7. Split direct route is correctly classified ---
+  console.log("\n== 7. Split direct route classification ==");
+  {
+    // Two providers, each with $6k / $4k capacity. Demand $10k → split.
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 50000 });
+    const p2 = makeProvider("p2", "COLLATERALIZED", "BANK", 0.9, { NGN: 50000 });
+    const o1 = makeOffer("o1", "p1", "USD", "US", "NGN", "NG", 500, 10, 6000, "asset_usdc");
+    const o2 = makeOffer("o2", "p2", "USD", "US", "NGN", "NG", 500, 10, 4000, "asset_usdc");
+    const world = buildTestWorld([p1, p2], [o1, o2], [stableAsset]);
+    const { sa, cp } = buildRiskCaches(world);
+
+    // Build the 1-hop path with parallel edges (both offers go USD:US → NGN:NG).
+    const path: { fromNode: string; toNode: string; edges: SimOffer[] }[] = [{
+      fromNode: "USD:US", toNode: "NGN:NG", edges: [o1, o2],
+    }];
+
+    const amt = 10000;
+    const feas = checkPathFeasibility(path, amt, "BALANCED", world, sa, cp);
+    assert(feas !== null, "Split direct: structurally feasible (6k + 4k covers 10k)");
+    assert(feas!.liqFeasible === true, "Split direct: liquidity-feasible");
+    assert(feas!.prodFeasible === true, "Split direct: production-feasible");
+    assert(feas!.split === true, "Split direct: classified as split (split: true)");
+
+    // Verify with $5k demand → single offer (o1 has 6k ≥ 5k) → not split.
+    const feas5k = checkPathFeasibility(path, 5000, "BALANCED", world, sa, cp);
+    assert(feas5k !== null, "5k demand: structurally feasible");
+    assert(feas5k!.split === false, "5k demand: not a split (single offer o1 covers it)");
+    assert(feas5k!.prodFeasible === true, "5k demand: production-feasible");
+  }
+
+  // --- 8. Liquidity failure: provider lacks destination-asset balance ---
+  console.log("\n== 8. Liquidity failure ==");
+  {
+    // Provider has capacity but NO destination liquidity.
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, {}); // no NGN balance
+    const offer = makeOffer("o1", "p1", "USD", "US", "NGN", "NG", 500, 10, 50000, "asset_usdc");
+    const world = buildTestWorld([p1], [offer], [stableAsset]);
+    const { sa, cp } = buildRiskCaches(world);
+
+    const path: { fromNode: string; toNode: string; edges: SimOffer[] }[] = [{
+      fromNode: "USD:US", toNode: "NGN:NG", edges: [offer],
+    }];
+    const feas = checkPathFeasibility(path, 1000, "BALANCED", world, sa, cp);
+    assert(feas !== null, "No-liquidity: structurally feasible (capacity exists)");
+    assert(feas!.liqFeasible === false, "No-liquidity: NOT liquidity-feasible (no NGN balance)");
+    assert(feas!.prodFeasible === false, "No-liquidity: NOT production-feasible (liq fails → prod fails)");
+  }
+
+  console.log(`\n========================================`);
+  console.log(`  P4.8.8 Path Feasibility: Passed: ${passed}  |  Failed: ${failed}`);
+  console.log(`========================================`);
+  if (failed > 0) {
+    console.log("\nFailures:");
+    failures.forEach((f) => console.log(`  - ${f}`));
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+main().catch((err) => { console.error("Fatal:", err); process.exit(1); });
+
+export {};

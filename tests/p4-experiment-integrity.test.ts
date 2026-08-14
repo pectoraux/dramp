@@ -170,12 +170,49 @@ async function main() {
   assert(expSrc.includes("assetRiskCeiling("), "Production exec uses assetRiskCeiling()");
   assert(expSrc.includes("providerCounterpartyRisk("), "Production exec uses providerCounterpartyRisk()");
   assert(expSrc.includes("counterpartyRiskCeiling("), "Production exec uses counterpartyRiskCeiling()");
-  // Verify multi-hop checks BOTH hops' liquidity.
-  assert(expSrc.includes("p1.liquidity.balances.get(sa)"), "Multi-hop liq-exec checks hop1 destination liquidity");
-  assert(expSrc.includes("p2.liquidity.balances.get(dstAsset)"), "Multi-hop liq-exec checks hop2 destination liquidity");
+  // Verify multi-hop checks EACH hop's destination liquidity (general pattern,
+  // not hard-coded to a specific settlement asset / final destination).
+  assert(expSrc.includes("provider.liquidity.balances.get(hopDstAsset)"), "Path feasibility checks each hop's destination liquidity");
+
+  // 9. Production-faithful path search (Prompt 4.8.8)
+  console.log("\n== 9. Production-faithful path search (P4.8.8) ==");
+  // Imports shared canonical functions — no duplicate formula.
+  assert(expSrc.includes("computeHopOutput"), "Experiment imports shared computeHopOutput");
+  assert(expSrc.includes("coverAmount"), "Experiment imports shared coverAmount");
+  assert(expSrc.includes("enumeratePaths"), "Experiment imports shared enumeratePaths");
+  // No local duplicate hopOutput formula.
+  assert(!expSrc.includes("function hopOutput("), "No local duplicate hopOutput() function");
+  // Uses maxHops=4 (same as production findRoutes default).
+  assert(expSrc.includes("MAX_HOPS = 4"), "Uses MAX_HOPS=4 (production default)");
+  assert(expSrc.includes("enumeratePaths(adj, source, dest, MAX_HOPS)"), "Calls enumeratePaths with MAX_HOPS");
+  // Route-composition metrics.
+  assert(expSrc.includes("directReachablePct"), "Has directReachablePct metric");
+  assert(expSrc.includes("splitDirectReachablePct"), "Has splitDirectReachablePct metric");
+  assert(expSrc.includes("twoHopReachablePct"), "Has twoHopReachablePct metric");
+  assert(expSrc.includes("threePlusHopReachablePct"), "Has threePlusHopReachablePct metric");
+  // Split-capacity support via shared coverAmount.
+  assert(expSrc.includes("coverAmount(coverOffers, currentAmount)"), "Path feasibility uses shared coverAmount for split support");
+  // Per-user risk tolerance (not hard-coded BALANCED).
+  assert(expSrc.includes("assetRiskCeiling(riskTolerance)"), "Path feasibility uses per-user riskTolerance for asset ceiling");
+  assert(expSrc.includes("counterpartyRiskCeiling(riskTolerance)"), "Path feasibility uses per-user riskTolerance for counterparty ceiling");
+  // Risk caches (performance: precompute once per extractMetrics).
+  assert(expSrc.includes("saRiskCache"), "Precomputes settlement-asset risk cache");
+  assert(expSrc.includes("cpRiskCache"), "Precomputes counterparty risk cache");
+  // Import guard: experiment only runs when executed directly.
+  assert(expSrc.includes("__isMain"), "Experiment guarded against running on import");
+
+  // 10. Production routing delegates to shared (no duplicate formula)
+  console.log("\n== 10. Production routing delegates to shared ==");
+  const routingSrc = fs.readFileSync("src/lib/engine/routing.ts", "utf-8");
+  assert(routingSrc.includes("sharedComputeHopOutput"), "Production routing imports sharedComputeHopOutput");
+  assert(routingSrc.includes("sharedCoverAmount"), "Production routing imports sharedCoverAmount");
+  assert(routingSrc.includes("sharedEnumeratePaths"), "Production routing imports sharedEnumeratePaths");
+  assert(routingSrc.includes("type PathStep = SharedPathStep<AdjEdge>"), "Production routing uses shared PathStep type");
+  // No local duplicate formula in routing.ts.
+  assert(!routingSrc.includes("function computeHopOutput(inputAmount: Decimal, edge: AdjEdge): { output: Decimal; fee: Decimal; incentive: Decimal } {\n  const fee = feeForAmount"), "No local duplicate computeHopOutput formula in routing.ts");
 
   console.log(`\n========================================`);
-  console.log(`  P4.8.5 Integrity: Passed: ${passed}  |  Failed: ${failed}`);
+  console.log(`  P4.8.8 Integrity: Passed: ${passed}  |  Failed: ${failed}`);
   console.log(`========================================`);
   if (failed > 0) {
     console.log("\nFailures:");

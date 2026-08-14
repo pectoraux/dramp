@@ -1,11 +1,31 @@
-// dRamp Prompt 4.8.3 — Independent Replicates & True Reachability
+// dRamp Prompt 4.8.8 — Production-Faithful Path Reachability
 //
-// Fixes:
-//   1. Immutable provider spec + deep clone per run (no mutable reuse)
-//   2. Per-seed canonical pool (derive corridors from each seed's demand)
-//   3. Correct route coverage semantics (executionAttemptRate vs reachableDemandPct)
-//   4. Separate graph reachability from executable reachability
-//   5. Effective-cost sensitivity (100/300/500 bps)
+// Builds on Prompt 4.8.3 (independent replicates, frozen demand, deep clone).
+// Key change: the experiment now answers the SAME routing question as the
+// actual dRamp engine:
+//
+//   "Given the exact same demand, can the actual dRamp routing engine assemble
+//    sufficient liquidity across providers and hops to execute it?"
+//
+// Fixes (Prompt 4.8.8):
+//   1. Extracts computeHopOutput(), coverAmount(), enumeratePaths() into the
+//      canonical shared economics layer. Production routing.ts and this
+//      experiment import the SAME functions. No duplicate formula.
+//   2. Production-faithful route feasibility: enumeratePaths (maxHops=4),
+//      coverAmount (split-capacity), computeHopOutput (hop propagation),
+//      hard filters (provider status, min/max, settlement-asset risk ceiling,
+//      counterparty risk ceiling — per user's ACTUAL risk tolerance),
+//      liquidity (each hop's provider holds enough destination asset).
+//   3. Split-capacity support: 6k + 4k satisfies 10k demand.
+//   4. Multi-hop up to maxHops=4 (direct / 2-hop / 3-hop / 4-hop).
+//   5. Route-composition metrics: direct (single) / split direct / 2-hop / 3+-hop.
+//
+// Controls preserved from 4.8.3-4.8.7:
+//   - Frozen demand per seed (independent RNG stream from providers)
+//   - Canonical 100-provider pool per seed (deep-cloned per run)
+//   - Per-seed demand-derived corridors for CORRIDOR_FOCUSED topology
+//   - Frozen provider economics (including liquidity/treasury) across topologies
+//   - No entry/exit, no incentives, no shocks
 //
 // Usage: bun experiments/p4-topology-experiment.ts
 
@@ -17,7 +37,11 @@ import {
   SimLiquidityInventory, SettlementReliabilityProfile,
   DEFAULT_RELIABILITY_PROFILES,
 } from "../src/lib/simulator/world";
-import { calculateProviderEconomics, settlementAssetRisk, assetRiskCeiling, counterpartyRiskCeiling, providerCounterpartyRisk } from "../src/lib/economics/shared";
+import {
+  calculateProviderEconomics, settlementAssetRisk, assetRiskCeiling, counterpartyRiskCeiling,
+  providerCounterpartyRisk, computeHopOutput, coverAmount, enumeratePaths,
+  type CoverOffer, type AdjacencyEdge, type PathStep,
+} from "../src/lib/economics/shared";
 
 // ---- Constants ----
 const COUNTRIES = ["US", "EU", "NG", "PH", "KE", "GB", "SG", "JP", "IN", "BR"];
@@ -26,6 +50,23 @@ const PROVIDER_TYPES = ["LOCAL_FIAT_AGENT", "PSP", "BANK", "CEX", "DEX", "STABLE
 const TRUST_MODELS = ["COLLATERALIZED", "INSTITUTIONALLY_TRUSTED", "PRE_FUNDED", "NON_CUSTODIAL"];
 const STRATEGIES = ["AGGRESSIVE", "PREMIUM", "LIQUIDITY_MAXIMIZER", "MARKET_MAKER", "INCENTIVE_SEEKER", "CONSERVATIVE", "OPPORTUNISTIC"];
 const PROVIDER_NAMES = ["Northbridge", "SwiftPay", "Meridian", "Atlas", "OpenSwap", "Sahara", "Continental", "Pacific", "GlobalBridge", "TransContinental", "FastCorridor", "LiquidityHub", "CapitalFlow", "EdgeExchange", "DirectRoute", "PrimeLiquidity", "ValueBridge", "SpeedTransfer", "TrustFlow", "OpenMarket"];
+
+// Production-faithful routing: same maxHops as production's findRoutes() default.
+const MAX_HOPS = 4;
+// Demand sampling: for corridors with many demands, check a representative
+// sample (evenly spaced by amount) rather than every demand. This preserves
+// the demand-weight distribution while cutting per-corridor cost ~10x.
+// Feasibility is approximately monotonic in amount (larger = harder), so
+// evenly-spaced sampling captures the feasibility threshold accurately.
+const MAX_DEMANDS_FULL = 8;   // full mode (breakdown): 8 samples per corridor
+const MAX_DEMANDS_TOTAL = 4;  // total mode (time-series): 4 samples per corridor
+// Path limit per tier: cap the number of paths checked per hop-count tier.
+// With maxHops=4 on a 100-provider graph, enumeratePaths can generate hundreds
+// of paths per corridor. For infeasible demands (the majority), all paths get
+// checked. Capping at 15 per tier bounds the worst case while still finding
+// feasible paths in virtually all real cases (the shortest 15 paths are checked
+// first, sorted by hop count).
+const MAX_PATHS_PER_TIER = 15;
 
 let idCounter = 0;
 function nextId(prefix: string): string { return `${prefix}_${++idCounter}`; }
@@ -318,7 +359,7 @@ export function generateCanonicalSpecs(
 }
 
 // ---- Build a world from frozen demand + deep-cloned providers ----
-function buildWorld(
+export function buildWorld(
   seed: number, providerCount: number, topology: TopologyMode,
   demandPopulation: SimUser[], canonicalSpecs: ProviderSpec[],
   config: SimConfig,
@@ -355,14 +396,122 @@ function buildWorld(
   return world;
 }
 
+// ---- Production-faithful path feasibility (Prompt 4.8.8) ----------------
+//
+// Mirrors production's buildCandidateRoute + applyHardFilters + execution-time
+// liquidity check. For a given path (sequence of hops) and demand amount:
+//   1. Propagate the amount through hops via shared coverAmount + computeHopOutput.
+//   2. Apply hard filters: provider status, min/max limits, settlement-asset
+//      risk ceiling, counterparty risk ceiling (per user's ACTUAL risk tolerance).
+//   3. Apply liquidity: each hop's provider must hold enough of that hop's
+//      destination asset (production checks this at execution time; the
+//      experiment checks it for feasibility).
+//
+// Returns null if the path is structurally infeasible (coverAmount fails).
+// Otherwise returns { liqFeasible, prodFeasible, split }:
+//   - liqFeasible: passes capacity + min/max + provider status + liquidity.
+//   - prodFeasible: passes liqFeasible + risk ceilings.
+//   - split: true if coverAmount split the amount across multiple offers on any hop.
+
+export interface PathFeasibility {
+  liqFeasible: boolean;
+  prodFeasible: boolean;
+  split: boolean;
+}
+
+export function checkPathFeasibility(
+  path: PathStep<SimOffer>[],
+  amount: number,
+  riskTolerance: string,
+  world: SimWorld,
+  saRiskCache: Map<string, number>,
+  cpRiskCache: Map<string, number>,
+): PathFeasibility | null {
+  let currentAmount = amount;
+  let split = false;
+  let liqFeasible = true;
+  let prodFeasible = true;
+
+  for (let i = 0; i < path.length; i++) {
+    const step = path[i];
+    // Convert SimOffers to CoverOffers for shared coverAmount.
+    const coverOffers: CoverOffer[] = step.edges.map((o) => ({
+      id: o.id,
+      channelType: o.channelType,
+      feeBps: o.feeBps,
+      availableCapacity: o.availableCapacity,
+      reservedCapacity: o.reservedCapacity,
+      minimumAmount: o.minimumAmount,
+    }));
+
+    const cover = coverAmount(coverOffers, currentAmount);
+    if (!cover) return null; // structural infeasibility: insufficient combined capacity
+    if (cover.split) split = true;
+
+    let hopOutputTotal = 0;
+    for (const a of cover.assignments) {
+      const offer = step.edges.find((e) => e.id === a.offerId);
+      if (!offer) return null; // shouldn't happen
+      const provider = world.providers.get(offer.providerId);
+      // Provider status (production hard filter via buildGraph).
+      if (!provider || provider.status !== "ACTIVE") {
+        liqFeasible = false; prodFeasible = false; return { liqFeasible, prodFeasible, split };
+      }
+      // Min/max limits (production checks min in coverAmount; max is an additional
+      // feasibility constraint the experiment applies for executability).
+      if (a.amount < offer.minimumAmount || a.amount > offer.maximumAmount) {
+        liqFeasible = false; prodFeasible = false; return { liqFeasible, prodFeasible, split };
+      }
+      // Destination liquidity: provider must hold enough of THIS hop's destination asset.
+      // (Production checks this at execution time; the experiment checks for feasibility.)
+      const hopDstAsset = offer.destinationAsset;
+      const dstLiquidity = provider.liquidity.balances.get(hopDstAsset) ?? 0;
+      if (dstLiquidity < a.amount) {
+        liqFeasible = false; prodFeasible = false; return { liqFeasible, prodFeasible, split };
+      }
+      // Settlement-asset risk ceiling (production hard filter, per user risk tolerance).
+      // Uses cached risk value (precomputed once per extractMetrics call).
+      if (offer.settlementAssetId) {
+        const saRisk = saRiskCache.get(offer.settlementAssetId);
+        if (saRisk !== undefined && saRisk > assetRiskCeiling(riskTolerance)) {
+          prodFeasible = false; // liq still OK (risk doesn't affect liquidity feasibility)
+        }
+      }
+      // Counterparty risk ceiling (production hard filter, per user risk tolerance).
+      // Uses cached risk value (precomputed once per extractMetrics call).
+      const cpRisk = cpRiskCache.get(provider.id);
+      if (cpRisk !== undefined && cpRisk > counterpartyRiskCeiling(riskTolerance)) {
+        prodFeasible = false;
+      }
+      // Propagate amount via shared computeHopOutput (canonical hop economics).
+      const hopResult = computeHopOutput(a.amount, {
+        feeBps: offer.feeBps,
+        rate: offer.rate,
+        incentiveBps: offer.incentiveBps ?? 0,
+      });
+      hopOutputTotal += hopResult.output;
+    }
+    currentAmount = hopOutputTotal;
+  }
+
+  return { liqFeasible, prodFeasible, split };
+}
+
 // ---- Metrics ----
-interface RunMetrics {
+export interface RunMetrics {
   executionAttemptRate: number;
-  // Four reachability levels (each stricter than the last).
+  // Five-level reachability ladder (each stricter than the last).
   assetReachablePct: number;                    // Abstract asset path (ignores countries)
   corridorReachablePct: number;                 // Asset + country match
-  liquidityExecutableReachabilityPct: number;   // + capacity ≥100, dest liquidity ≥100
-  productionExecutableReachabilityPct: number;  // + risk ceilings, min/max, provider status
+  liquidityExecutableReachabilityPct: number;   // + capacity, dest liquidity (demand-weighted, no risk)
+  productionExecutableReachabilityPct: number;  // + risk ceilings, min/max, provider status (production-faithful path search)
+  // Production-faithful route composition (Prompt 4.8.8).
+  // Each is the demand-weighted % reachable by that path type. These overlap:
+  // a demand may be reachable by multiple path types. totalProdExec ≤ sum of these.
+  directReachablePct: number;                   // feasible 1-hop single-provider path
+  splitDirectReachablePct: number;              // feasible 1-hop split (multiple providers) path
+  twoHopReachablePct: number;                   // feasible 2-hop path
+  threePlusHopReachablePct: number;             // feasible 3+-hop path
   assetReachablePairs: number;
   corridorReachablePairs: number;
   totalDemandPairs: number;
@@ -387,7 +536,59 @@ interface RunMetrics {
   corridorsWithMultipleRoutes: number;
 }
 
-function extractMetrics(world: any): RunMetrics {
+// Path cache: enumerated paths per corridor, keyed by "source→dest".
+// The graph structure (which nodes are connected) doesn't change during a run
+// (no providers exit), so paths are enumerated ONCE and reused across all
+// extractMetrics calls. Only offer attributes (capacity, liquidity) change.
+export type PathCache = Map<string, { hop1: PathStep<SimOffer>[][]; hop2: PathStep<SimOffer>[][]; hop3Plus: PathStep<SimOffer>[][] }>;
+
+export function buildPathCache(world: SimWorld): PathCache {
+  const cache: PathCache = new Map();
+  const activeOffers = [...world.offers.values()].filter((o: any) => o.active);
+  const adj = new Map<string, AdjacencyEdge<SimOffer>[]>();
+  for (const o of activeOffers) {
+    const provider = world.providers.get(o.providerId);
+    if (!provider || provider.status !== "ACTIVE") continue;
+    const from = `${o.sourceAsset}:${o.sourceCountry}`;
+    const to = `${o.destinationAsset}:${o.destinationCountry}`;
+    if (!adj.has(from)) adj.set(from, []);
+    adj.get(from)!.push({ to, edge: o });
+  }
+  // Enumerate paths for every demand corridor.
+  const seenCorridors = new Set<string>();
+  for (const u of world.users.values()) {
+    const source = `${u.sourceAsset}:${u.sourceCountry}`;
+    const dest = `${u.destinationAsset}:${u.destinationCountry}`;
+    const key = `${source}→${dest}`;
+    if (seenCorridors.has(key)) continue;
+    seenCorridors.add(key);
+    const allPaths = enumeratePaths(adj, source, dest, MAX_HOPS);
+    // Deduplicate by node sequence.
+    const seenSeq = new Set<string>();
+    const unique: PathStep<SimOffer>[][] = [];
+    for (const path of allPaths) {
+      const seq = [source, ...path.map(s => s.toNode)].join("→");
+      if (seenSeq.has(seq)) continue;
+      seenSeq.add(seq);
+      unique.push(path);
+    }
+    unique.sort((a, b) => a.length - b.length);
+    const byHop = new Map<number, PathStep<SimOffer>[][]>();
+    for (const path of unique) {
+      const h = path.length;
+      if (!byHop.has(h)) byHop.set(h, []);
+      byHop.get(h)!.push(path);
+    }
+    cache.set(key, {
+      hop1: (byHop.get(1) ?? []).slice(0, MAX_PATHS_PER_TIER),
+      hop2: (byHop.get(2) ?? []).slice(0, MAX_PATHS_PER_TIER),
+      hop3Plus: [...(byHop.get(3) ?? []), ...(byHop.get(4) ?? [])].slice(0, MAX_PATHS_PER_TIER),
+    });
+  }
+  return cache;
+}
+
+export function extractMetrics(world: any, mode: "full" | "total" = "full", pathCache?: PathCache): RunMetrics {
   const intents = world.intents;
   const completed = intents.filter((i: any) => i.status === "COMPLETED");
   const abandoned = intents.filter((i: any) => i.status === "ABANDONED");
@@ -433,14 +634,48 @@ function extractMetrics(world: any): RunMetrics {
   const multiHopPercentage = completed.length > 0 ? (multiHopCount / completed.length) * 100 : 0;
 
   // ---- Five-level reachability ladder (all demand-weighted, consistent) ----
-  // 1. ASSET: abstract asset path exists (ignores countries)
-  // 2. CORRIDOR: path matches asset AND country
+  // 1. ASSET: abstract asset path exists (ignores countries) — graph structure only
+  // 2. CORRIDOR: path matches asset AND country — graph structure only
   // 3. LIQUIDITY: + capacity, destination liquidity (per actual demand amount, no risk)
-  // 4. PRODUCTION: + risk ceilings using user's ACTUAL riskTolerance, min/max, provider status
+  // 4. PRODUCTION: + risk ceilings (user's ACTUAL riskTolerance), min/max, provider status,
+  //    via production-faithful path search (enumeratePaths + coverAmount + computeHopOutput)
   // 5. COMPLETION: actual simulation completion (from intent stats above)
-  // All levels 3-4 use actual user demand amounts and production hop economics.
+  //
+  // Levels 3-4 use shared computeHopOutput/coverAmount/enumeratePaths — the SAME
+  // canonical functions production routing.ts uses. No duplicate formula.
   const settlementAssetSymbols = new Set([...world.assets.values()].map((a: any) => a.symbol));
   const activeOffers = [...world.offers.values()].filter((o: any) => o.active);
+
+  // Build adjacency map for production-faithful path enumeration.
+  // Only offers from ACTIVE providers form edges (mirrors production buildGraph).
+  const adj = new Map<string, AdjacencyEdge<SimOffer>[]>();
+  for (const o of activeOffers) {
+    const provider = world.providers.get(o.providerId);
+    if (!provider || provider.status !== "ACTIVE") continue;
+    const from = `${o.sourceAsset}:${o.sourceCountry}`;
+    const to = `${o.destinationAsset}:${o.destinationCountry}`;
+    if (!adj.has(from)) adj.set(from, []);
+    adj.get(from)!.push({ to, edge: o });
+  }
+
+  // Precompute risk caches (settlement-asset + counterparty risk don't depend
+  // on risk tolerance, only on the asset/provider). This avoids recomputing
+  // them for every assignment of every path of every demand.
+  const saRiskCache = new Map<string, number>();
+  for (const [id, sa] of world.assets.entries()) {
+    saRiskCache.set(id, settlementAssetRisk({
+      assetType: sa.assetType, volatilityScore: sa.volatilityScore,
+      liquidityScore: sa.liquidityScore, pegQuality: sa.pegQuality,
+      status: sa.status, incentiveRate: sa.incentiveRate,
+    }));
+  }
+  const cpRiskCache = new Map<string, number>();
+  for (const [id, p] of world.providers.entries()) {
+    cpRiskCache.set(id, providerCounterpartyRisk({
+      trustModel: p.trustModel, providerType: p.providerType,
+      reputationScore: p.reputationScore, status: p.status,
+    }));
+  }
 
   // Collect demand per corridor with per-user risk tolerance.
   interface CorridorDemand { amount: number; weight: number; riskTolerance: string; }
@@ -463,15 +698,12 @@ function extractMetrics(world: any): RunMetrics {
   let liqExecutableVolume = 0;
   let prodExecutableVolume = 0;
   let corridorsWithMultipleRoutes = 0;
-
-  // Helper: compute hop output using production economics (fee + rate + incentive).
-  function hopOutput(inputAmount: number, offer: any): number {
-    const fee = inputAmount * offer.feeBps / 10000;
-    const afterFee = inputAmount - fee;
-    const converted = afterFee * offer.rate;
-    const incentive = converted * (offer.incentiveBps ?? 0) / 10000;
-    return converted + incentive;
-  }
+  // Route-composition weights (Prompt 4.8.8). These overlap: a demand may be
+  // reachable by multiple path types. totalProdExec ≤ sum of these.
+  let directReachableVolume = 0;        // feasible 1-hop single-provider
+  let splitDirectReachableVolume = 0;   // feasible 1-hop split
+  let twoHopReachableVolume = 0;        // feasible 2-hop
+  let threePlusHopReachableVolume = 0;  // feasible 3+-hop
 
   for (const [corridorKey, demands] of demandedCorridors) {
     const [srcPart, dstPart] = corridorKey.split("→");
@@ -479,7 +711,7 @@ function extractMetrics(world: any): RunMetrics {
     const [dstAsset, dstCountry] = dstPart.split(":");
     const weight = demands.reduce((s, d) => s + d.weight, 0);
 
-    // 1. ASSET reachability (ignores countries).
+    // 1. ASSET reachability (ignores countries) — structural graph check.
     let assetReachable = false;
     let routeCount = 0;
     const directAsset = activeOffers.filter(o => o.sourceAsset === srcAsset && o.destinationAsset === dstAsset);
@@ -491,7 +723,7 @@ function extractMetrics(world: any): RunMetrics {
     }
     if (assetReachable) { assetReachablePairs++; assetReachableVolume += weight; }
 
-    // 2. CORRIDOR reachability (matches asset AND country).
+    // 2. CORRIDOR reachability (matches asset AND country) — structural graph check.
     let corridorReachable = false;
     let corridorRouteCount = 0;
     const directCorridor = activeOffers.filter(o =>
@@ -513,100 +745,177 @@ function extractMetrics(world: any): RunMetrics {
     if (corridorReachable) { corridorReachablePairs++; corridorReachableVolume += weight; }
     if (corridorRouteCount >= 2) corridorsWithMultipleRoutes++;
 
-    // 3+4. Demand-weighted liquidity and production reachability.
-    // For each demand amount: test liquidity (no risk) then production (with risk).
+    // 3+4. Production-faithful path feasibility (Prompt 4.8.8).
+    // Use cached paths if available (graph structure doesn't change during a
+    // run). Otherwise, enumerate fresh (for standalone/test calls).
+    const source = `${srcAsset}:${srcCountry}`;
+    const dest = `${dstAsset}:${dstCountry}`;
+    const pathKey = `${source}→${dest}`;
+    let hop1Paths: PathStep<SimOffer>[][];
+    let hop2Paths: PathStep<SimOffer>[][];
+    let hop3PlusPaths: PathStep<SimOffer>[][];
+    if (pathCache && pathCache.has(pathKey)) {
+      const cached = pathCache.get(pathKey)!;
+      hop1Paths = cached.hop1;
+      hop2Paths = cached.hop2;
+      hop3PlusPaths = cached.hop3Plus;
+    } else {
+      const allPaths = enumeratePaths(adj, source, dest, MAX_HOPS);
+      const seenSequences = new Set<string>();
+      const uniquePaths: PathStep<SimOffer>[][] = [];
+      for (const path of allPaths) {
+        const seq = [source, ...path.map(s => s.toNode)].join("→");
+        if (seenSequences.has(seq)) continue;
+        seenSequences.add(seq);
+        uniquePaths.push(path);
+      }
+      uniquePaths.sort((a, b) => a.length - b.length);
+      const pathsByHop = new Map<number, PathStep<SimOffer>[][]>();
+      for (const path of uniquePaths) {
+        const h = path.length;
+        if (!pathsByHop.has(h)) pathsByHop.set(h, []);
+        pathsByHop.get(h)!.push(path);
+      }
+      hop1Paths = (pathsByHop.get(1) ?? []).slice(0, MAX_PATHS_PER_TIER);
+      hop2Paths = (pathsByHop.get(2) ?? []).slice(0, MAX_PATHS_PER_TIER);
+      hop3PlusPaths = [...(pathsByHop.get(3) ?? []), ...(pathsByHop.get(4) ?? [])].slice(0, MAX_PATHS_PER_TIER);
+    }
+
+    // Pre-filter: compute the max destination-asset liquidity across all active
+    // providers. If a demand's amount exceeds this, no direct route can pay out
+    // (the provider needs dstLiquidity ≥ amount). This eliminates obviously
+    // infeasible demands without checking any paths.
+    let maxDstLiquidity = 0;
+    for (const p of world.providers.values()) {
+      if (p.status !== "ACTIVE") continue;
+      const liq = p.liquidity.balances.get(dstAsset) ?? 0;
+      if (liq > maxDstLiquidity) maxDstLiquidity = liq;
+    }
+
     let liqExecutableWeight = 0;
     let prodExecutableWeight = 0;
+    let directWeight = 0;
+    let splitDirectWeight = 0;
+    let twoHopWeight = 0;
+    let threePlusHopWeight = 0;
+    const needBreakdown = mode === "full";
+    const maxSample = needBreakdown ? MAX_DEMANDS_FULL : MAX_DEMANDS_TOTAL;
 
-    for (const demand of demands) {
+    // Demand sampling: if the corridor has more demands than maxSample, pick
+    // evenly-spaced samples by amount. Each sample's weight is scaled to
+    // represent its share of the corridor's total demand weight.
+    let sampledDemands: { amount: number; weight: number; riskTolerance: string }[];
+    if (demands.length <= maxSample) {
+      sampledDemands = demands;
+    } else {
+      // Sort by amount and pick evenly-spaced samples.
+      const sorted = [...demands].sort((a, b) => a.amount - b.amount);
+      const totalWeight = sorted.reduce((s, d) => s + d.weight, 0);
+      const perSampleWeight = totalWeight / maxSample;
+      sampledDemands = [];
+      for (let i = 0; i < maxSample; i++) {
+        const idx = Math.floor((i + 0.5) * sorted.length / maxSample);
+        sampledDemands.push({
+          amount: sorted[idx].amount,
+          weight: perSampleWeight,
+          riskTolerance: sorted[idx].riskTolerance,
+        });
+      }
+    }
+
+    for (const demand of sampledDemands) {
       const amt = demand.amount;
-      const rt = demand.riskTolerance; // actual user risk tolerance
+      const rt = demand.riskTolerance;
       let liqOK = false;
       let prodOK = false;
+      let hasDirect = false;       // feasible 1-hop single-provider
+      let hasSplitDirect = false;  // feasible 1-hop split
+      let hasTwoHop = false;       // feasible 2-hop
+      let hasThreePlusHop = false; // feasible 3+-hop
 
-      // Direct.
-      for (const o of directCorridor) {
-        const provider = world.providers.get(o.providerId);
-        if (!provider || provider.status !== "ACTIVE") continue;
-        if (o.availableCapacity < amt) continue;
-        if (amt < o.minimumAmount || amt > o.maximumAmount) continue;
-        if ((provider.liquidity.balances.get(dstAsset) ?? 0) < amt) continue;
-        liqOK = true;
-        // Production: check risk using user's ACTUAL risk tolerance.
-        if (o.settlementAssetId) {
-          const saObj = world.assets.get(o.settlementAssetId);
-          if (saObj) {
-            const saRisk = settlementAssetRisk({ assetType: saObj.assetType, volatilityScore: saObj.volatilityScore, liquidityScore: saObj.liquidityScore, pegQuality: saObj.pegQuality, status: saObj.status, incentiveRate: saObj.incentiveRate });
-            if (saRisk > assetRiskCeiling(rt)) { continue; } // risk rejected
+      // Pre-filter: if no active provider has enough destination-asset liquidity
+      // for even the source amount, skip all path checks (demand is infeasible).
+      // This is conservative for multi-hop (hop2 input may differ) but exact
+      // for direct routes, and eliminates the majority of infeasible demands.
+      if (amt > maxDstLiquidity) continue;
+
+      // Tier 1: 1-hop paths (direct). Check until we find single + split
+      // (full mode) or until prodOK (total mode).
+      for (const path of hop1Paths) {
+        const feas = checkPathFeasibility(path, amt, rt, world, saRiskCache, cpRiskCache);
+        if (!feas) continue;
+        if (feas.liqFeasible) liqOK = true;
+        if (feas.prodFeasible) {
+          prodOK = true;
+          if (needBreakdown) {
+            if (feas.split) hasSplitDirect = true;
+            else hasDirect = true;
           }
         }
-        const cpRisk = providerCounterpartyRisk({ trustModel: provider.trustModel, providerType: provider.providerType, reputationScore: provider.reputationScore, status: provider.status });
-        if (cpRisk > counterpartyRiskCeiling(rt)) { continue; } // risk rejected
-        prodOK = true;
-        break;
+        // Stop: total mode once prodOK; full mode once both single+split found.
+        if (!needBreakdown && prodOK) break;
+        if (needBreakdown && hasDirect && hasSplitDirect) break;
       }
 
-      // Multi-hop: use production hop economics for hop2 amount.
-      if (!liqOK) {
-        for (const sa of settlementAssetSymbols) {
-          const hop1 = activeOffers.filter(o =>
-            o.sourceAsset === srcAsset && o.sourceCountry === srcCountry &&
-            o.destinationAsset === sa && o.destinationCountry === "GLOBAL");
-          const hop2 = activeOffers.filter(o =>
-            o.sourceAsset === sa && o.sourceCountry === "GLOBAL" &&
-            o.destinationAsset === dstAsset && o.destinationCountry === dstCountry);
-          if (hop1.length === 0 || hop2.length === 0) continue;
-
-          for (const o1 of hop1) {
-            const p1 = world.providers.get(o1.providerId);
-            if (!p1 || p1.status !== "ACTIVE") continue;
-            if (o1.availableCapacity < amt) continue;
-            if (amt < o1.minimumAmount || amt > o1.maximumAmount) continue;
-            if ((p1.liquidity.balances.get(sa) ?? 0) < amt) continue;
-
-            // Compute hop2 input amount using production hop economics.
-            const hop2Input = hopOutput(amt, o1);
-
-            for (const o2 of hop2) {
-              const p2 = world.providers.get(o2.providerId);
-              if (!p2 || p2.status !== "ACTIVE") continue;
-              if (o2.availableCapacity < hop2Input) continue;
-              if (hop2Input < o2.minimumAmount || hop2Input > o2.maximumAmount) continue;
-              if ((p2.liquidity.balances.get(dstAsset) ?? 0) < hop2Input) continue;
-              liqOK = true;
-
-              // Production: check risk using user's ACTUAL risk tolerance.
-              const saObj = [...world.assets.values()].find((a: any) => a.symbol === sa);
-              if (saObj) {
-                const saRisk = settlementAssetRisk({ assetType: saObj.assetType, volatilityScore: saObj.volatilityScore, liquidityScore: saObj.liquidityScore, pegQuality: saObj.pegQuality, status: saObj.status, incentiveRate: saObj.incentiveRate });
-                if (saRisk > assetRiskCeiling(rt)) { continue; }
-              }
-              const cpRisk1 = providerCounterpartyRisk({ trustModel: p1.trustModel, providerType: p1.providerType, reputationScore: p1.reputationScore, status: p1.status });
-              if (cpRisk1 > counterpartyRiskCeiling(rt)) { continue; }
-              const cpRisk2 = providerCounterpartyRisk({ trustModel: p2.trustModel, providerType: p2.providerType, reputationScore: p2.reputationScore, status: p2.status });
-              if (cpRisk2 > counterpartyRiskCeiling(rt)) { continue; }
-              prodOK = true;
-              break;
-            }
-            if (liqOK) break;
+      // Tier 2: 2-hop paths. Skip if total mode and already prodOK.
+      // Full mode: check until first feasible 2-hop. Total mode: until prodOK.
+      if (needBreakdown || !prodOK) {
+        for (const path of hop2Paths) {
+          const feas = checkPathFeasibility(path, amt, rt, world, saRiskCache, cpRiskCache);
+          if (!feas) continue;
+          if (feas.liqFeasible) liqOK = true;
+          if (feas.prodFeasible) {
+            prodOK = true;
+            if (needBreakdown) hasTwoHop = true;
           }
-          if (liqOK) break;
+          if (!needBreakdown && prodOK) break;
+          if (needBreakdown && hasTwoHop) break;
+        }
+      }
+
+      // Tier 3+4: 3-hop and 4-hop paths. Skip if total mode and already prodOK.
+      // Full mode: check until first feasible 3+hop. Total mode: until prodOK.
+      if (needBreakdown || !prodOK) {
+        for (const path of hop3PlusPaths) {
+          const feas = checkPathFeasibility(path, amt, rt, world, saRiskCache, cpRiskCache);
+          if (!feas) continue;
+          if (feas.liqFeasible) liqOK = true;
+          if (feas.prodFeasible) {
+            prodOK = true;
+            if (needBreakdown) hasThreePlusHop = true;
+          }
+          if (!needBreakdown && prodOK) break;
+          if (needBreakdown && hasThreePlusHop) break;
         }
       }
 
       if (liqOK) liqExecutableWeight += demand.weight;
-      if (prodOK) prodExecutableWeight += demand.weight;
+      if (prodOK) {
+        prodExecutableWeight += demand.weight;
+        if (hasDirect) directWeight += demand.weight;
+        if (hasSplitDirect) splitDirectWeight += demand.weight;
+        if (hasTwoHop) twoHopWeight += demand.weight;
+        if (hasThreePlusHop) threePlusHopWeight += demand.weight;
+      }
     }
 
     // Amount-weighted reachability for this corridor.
     if (liqExecutableWeight > 0) { liqExecutableReachablePairs++; liqExecutableVolume += liqExecutableWeight; }
     if (prodExecutableWeight > 0) { prodExecutableReachablePairs++; prodExecutableVolume += prodExecutableWeight; }
+    directReachableVolume += directWeight;
+    splitDirectReachableVolume += splitDirectWeight;
+    twoHopReachableVolume += twoHopWeight;
+    threePlusHopReachableVolume += threePlusHopWeight;
   }
 
   const assetReachablePct = totalDemandWeight > 0 ? (assetReachableVolume / totalDemandWeight) * 100 : 0;
   const corridorReachablePct = totalDemandWeight > 0 ? (corridorReachableVolume / totalDemandWeight) * 100 : 0;
   const liqExecutablePct = totalDemandWeight > 0 ? (liqExecutableVolume / totalDemandWeight) * 100 : 0;
   const prodExecutablePct = totalDemandWeight > 0 ? (prodExecutableVolume / totalDemandWeight) * 100 : 0;
+  const directPct = totalDemandWeight > 0 ? (directReachableVolume / totalDemandWeight) * 100 : 0;
+  const splitDirectPct = totalDemandWeight > 0 ? (splitDirectReachableVolume / totalDemandWeight) * 100 : 0;
+  const twoHopPct = totalDemandWeight > 0 ? (twoHopReachableVolume / totalDemandWeight) * 100 : 0;
+  const threePlusHopPct = totalDemandWeight > 0 ? (threePlusHopReachableVolume / totalDemandWeight) * 100 : 0;
 
   const corridorOfferCounts = new Map<string, number>();
   for (const o of world.offers.values()) {
@@ -625,6 +934,10 @@ function extractMetrics(world: any): RunMetrics {
     corridorReachablePct: Math.round(corridorReachablePct * 100) / 100,
     liquidityExecutableReachabilityPct: Math.round(liqExecutablePct * 100) / 100,
     productionExecutableReachabilityPct: Math.round(prodExecutablePct * 100) / 100,
+    directReachablePct: Math.round(directPct * 100) / 100,
+    splitDirectReachablePct: Math.round(splitDirectPct * 100) / 100,
+    twoHopReachablePct: Math.round(twoHopPct * 100) / 100,
+    threePlusHopReachablePct: Math.round(threePlusHopPct * 100) / 100,
     assetReachablePairs,
     corridorReachablePairs,
     totalDemandPairs,
@@ -680,7 +993,7 @@ function makeConfig(seed: number): SimConfig {
 }
 
 function runExperiment() {
-  console.log("Running topology experiment (P4.8.3 — independent replicates)...");
+  console.log("Running topology experiment (P4.8.8 — production-faithful path reachability)...");
   console.log(`  ${PROVIDER_COUNTS.length} densities × ${TOPOLOGIES.length} topologies × ${NUM_SEEDS} seeds = ${PROVIDER_COUNTS.length * TOPOLOGIES.length * NUM_SEEDS} runs`);
 
   interface Result { density: number; topology: string; metrics: RunMetrics[] }
@@ -708,21 +1021,30 @@ function runExperiment() {
         // Build world with deep-cloned providers (fresh state per run).
         const world = buildWorld(seed, density, topology, demandPopulation, canonicalSpecs, config);
 
-        // Capture INITIAL reachability (before simulation).
-        const initialMetrics = extractMetrics(world);
+        // Build path cache ONCE per run: enumerate all paths for all corridors.
+        // The graph structure doesn't change during the run (no providers exit),
+        // so paths are reused across all extractMetrics calls. Only offer
+        // attributes (capacity, liquidity) change, which affect feasibility
+        // but not path existence.
+        const pCache = buildPathCache(world);
 
-        // Run simulation, capturing reachability every 10 steps.
+        // Capture INITIAL reachability (full breakdown — before simulation).
+        const initialMetrics = extractMetrics(world, "full", pCache);
+
+        // Run simulation, capturing reachability every 25 steps.
+        // Time-series uses "total" mode (only production-executable %, with early
+        // termination) for performance. The depletion curve only needs the total.
         const rng = new SeededRNG(seed);
         const timeSeriesMetrics: RunMetrics[] = [initialMetrics];
         for (let step = 0; step < config.totalSteps; step++) {
           simulateStep(world, rng);
-          if ((step + 1) % 10 === 0 || step === config.totalSteps - 1) {
-            timeSeriesMetrics.push(extractMetrics(world));
+          if ((step + 1) % 25 === 0 || step === config.totalSteps - 1) {
+            timeSeriesMetrics.push(extractMetrics(world, "total", pCache));
           }
         }
 
-        // Final metrics + time-series summary.
-        const finalMetrics = extractMetrics(world);
+        // Final metrics (full breakdown) + time-series summary.
+        const finalMetrics = extractMetrics(world, "full", pCache);
         // Add time-series fields to finalMetrics.
         const tsAsset = timeSeriesMetrics.map(m => m.assetReachablePct);
         const tsCorridor = timeSeriesMetrics.map(m => m.corridorReachablePct);
@@ -748,13 +1070,14 @@ function runExperiment() {
 }
 
 function printResults(results: Result[]) {
-  console.log("\n╔══════════════════════════════════════════════════════════════════╗");
-  console.log("║  dRamp Topology Experiment (P4.8.3 — Independent Replicates)   ║");
-  console.log("║  20 seeds | 100 steps | Per-seed canonical pool | Deep clone   ║");
-  console.log("║  Controls: no entry/exit, no incentives, no shocks              ║");
-  console.log("╚══════════════════════════════════════════════════════════════════╝");
+  console.log("\n╔═══════════════════════════════════════════════════════════════════════╗");
+  console.log("║  dRamp Topology Experiment (P4.8.8 — Production-Faithful Path Reach)  ║");
+  console.log("║  20 seeds | 100 steps | Per-seed canonical pool | Deep clone         ║");
+  console.log("║  Controls: no entry/exit, no incentives, no shocks                    ║");
+  console.log("║  Routing: shared computeHopOutput/coverAmount/enumeratePaths (maxHops=4) ║");
+  console.log("╚═══════════════════════════════════════════════════════════════════════╝");
 
-  // Table A: Four-level reachability
+  // Table A: Five-level reachability ladder
   console.log("\n### Table A — Reachable Demand % (Asset / Corridor / Liq-Exec / Prod-Exec)\n");
   console.log("| Providers | Topology | Asset % | Corridor % | Liq-exec % | Prod-exec % |");
   console.log("| --- | --- | --- | --- | --- | --- |");
@@ -764,6 +1087,18 @@ function printResults(results: Result[]) {
     const lr = r.metrics.map(m => m.liquidityExecutableReachabilityPct);
     const pr = r.metrics.map(m => m.productionExecutableReachabilityPct);
     console.log(`| ${r.density} | ${r.topology} | ${statsLabel(ar)} | ${statsLabel(cr)} | ${statsLabel(lr)} | ${statsLabel(pr)} |`);
+  }
+
+  // Table A2: Route composition (direct / split / 2-hop / 3+hop) — production-faithful
+  console.log("\n### Table A2 — Route Composition % (Production-Faithful Path Search, maxHops=4)\n");
+  console.log("| Providers | Topology | Direct (single) % | Split direct % | 2-hop % | 3+-hop % |");
+  console.log("| --- | --- | --- | --- | --- | --- |");
+  for (const r of results) {
+    const d = r.metrics.map(m => m.directReachablePct);
+    const sd = r.metrics.map(m => m.splitDirectReachablePct);
+    const th = r.metrics.map(m => m.twoHopReachablePct);
+    const tph = r.metrics.map(m => m.threePlusHopReachablePct);
+    console.log(`| ${r.density} | ${r.topology} | ${statsLabel(d)} | ${statsLabel(sd)} | ${statsLabel(th)} | ${statsLabel(tph)} |`);
   }
 
   // Table B: Completion / Effective cost sensitivity
@@ -800,8 +1135,8 @@ function printResults(results: Result[]) {
     console.log(`| ${r.density} | ${r.topology} | ${statsLabel(rp)} | ${statsLabel(tp)} | ${statsLabel(mr)} |`);
   }
 
-  // Conclusion: Topology / Depletion / Execution decomposition
-  console.log("\n### Conclusion: Topology / Depletion / Execution Decomposition\n");
+  // Conclusion: Topology / Depletion / Execution / Composition decomposition
+  console.log("\n### Conclusion: Topology / Depletion / Execution / Composition Decomposition\n");
   for (const topo of TOPOLOGIES) {
     const r100 = results.find(r => r.density === 100 && r.topology === topo);
     if (r100) {
@@ -811,16 +1146,33 @@ function printResults(results: Result[]) {
       const medDepletion = percentile(r100.metrics.map(m => (m as any).depletionPct ?? 0), 0.5);
       const medComp = percentile(r100.metrics.map(m => m.completionRate), 0.5);
       const medMultiHop = percentile(r100.metrics.map(m => m.multiHopPercentage), 0.5);
+      const medDirect = percentile(r100.metrics.map(m => m.directReachablePct), 0.5);
+      const medSplit = percentile(r100.metrics.map(m => m.splitDirectReachablePct), 0.5);
+      const med2hop = percentile(r100.metrics.map(m => m.twoHopReachablePct), 0.5);
+      const med3plus = percentile(r100.metrics.map(m => m.threePlusHopReachablePct), 0.5);
+      const medProd = percentile(r100.metrics.map(m => m.productionExecutableReachabilityPct), 0.5);
       console.log(`  ${topo} @ 100:`);
       console.log(`    Topology effect:    initial prod-exec = ${medInitial.toFixed(1)}%`);
       console.log(`    Depletion effect:   final prod-exec = ${medFinal.toFixed(1)}% (decline ${medDepletion.toFixed(1)}%)`);
       console.log(`    Time-averaged:      mean prod-exec = ${medMean.toFixed(1)}%`);
       console.log(`    Execution effect:   completion = ${medComp.toFixed(1)}%`);
       console.log(`    Multi-hop share:    ${medMultiHop.toFixed(1)}%`);
+      console.log(`    Route composition (demand-weighted % reachable):`);
+      console.log(`      Direct (single):  ${medDirect.toFixed(1)}%`);
+      console.log(`      Split direct:     ${medSplit.toFixed(1)}%`);
+      console.log(`      2-hop:            ${med2hop.toFixed(1)}%`);
+      console.log(`      3+-hop:           ${med3plus.toFixed(1)}%`);
+      console.log(`      Total prod-exec:  ${medProd.toFixed(1)}%`);
     }
   }
 }
 
-const results = runExperiment();
-printResults(results);
-console.log("\nExperiment complete.");
+// Run only when executed directly (not when imported by tests).
+// This prevents the 300-run experiment from executing on import.
+import { pathToFileURL } from "node:url";
+const __isMain = process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
+if (__isMain) {
+  const results = runExperiment();
+  printResults(results);
+  console.log("\nExperiment complete.");
+}

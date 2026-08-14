@@ -16,7 +16,7 @@
 // Hard filters NEVER optimize — a route that violates one is invalid.
 
 import { db } from "@/lib/db";
-import { Decimal, moneyAdd, moneySub, moneyMul, moneyGte, moneyLte, moneyGt, moneyLt, moneyMin, moneyMax, bpsToFactor, feeForAmount, incentiveForAmount } from "./money";
+import { Decimal, moneyAdd, moneyMul, bpsToFactor } from "./money";
 import {
   computeRouteRisk,
   settlementAssetRisk,
@@ -38,6 +38,9 @@ import {
   computeRouteCommitment as sharedComputeRouteCommitment,
   rankRoutes as sharedRankRoutes,
   applyHardFilters as sharedApplyHardFilters,
+  computeHopOutput as sharedComputeHopOutput,
+  coverAmount as sharedCoverAmount,
+  enumeratePaths as sharedEnumeratePaths,
   ROUTE_REPLACEMENT_THRESHOLD as SHARED_ROUTE_REPLACEMENT_THRESHOLD,
   type RouteInfo as SharedRouteInfo,
   type RouteLegInfo as SharedRouteLegInfo,
@@ -45,6 +48,10 @@ import {
   type HardFilterContext as SharedHardFilterContext,
   type HardFilterResult as SharedHardFilterResult,
   type RankedRoute,
+  type HopEconomics,
+  type CoverOffer,
+  type AdjacencyEdge,
+  type PathStep as SharedPathStep,
 } from "@/lib/economics/shared";
 
 // ---- Graph node helpers --------------------------------------------------
@@ -209,94 +216,78 @@ async function buildGraph(): Promise<Map<string, AdjEdge[]>> {
   return adj;
 }
 
-interface PathStep {
-  fromNode: string;
-  toNode: string;
-  edges: AdjEdge[]; // offers that can serve this hop (parallel candidates)
-}
+// ---- Path enumeration ----------------------------------------------------
+//
+// Delegates the DFS simple-path enumeration to the canonical shared function.
+// Production wraps it with its own AdjEdge type; the path-search logic itself
+// (visited-set, maxHops cutoff, parallel-edge grouping) lives in shared.ts.
+// No duplicate path-search code.
 
-// Enumerate simple paths (no repeated nodes) up to maxHops.
+type PathStep = SharedPathStep<AdjEdge>;
+
 function enumeratePaths(adj: Map<string, AdjEdge[]>, source: string, dest: string, maxHops: number): PathStep[][] {
-  const results: PathStep[][] = [];
-  const visited = new Set<string>([source]);
-
-  function dfs(current: string, path: PathStep[]) {
-    if (path.length > 0 && current === dest) {
-      results.push([...path]);
-      return;
-    }
-    if (path.length >= maxHops) return;
-    const edges = adj.get(current) ?? [];
-    for (const e of edges) {
-      if (visited.has(e.to)) continue;
-      // Don't allow arriving at dest with 0 hops; also avoid trivial self-loops.
-      visited.add(e.to);
-      path.push({ fromNode: current, toNode: e.to, edges: edges.filter((x) => x.to === e.to) });
-      dfs(e.to, path);
-      path.pop();
-      visited.delete(e.to);
-    }
+  // Convert production's adjacency map (node -> AdjEdge[]) to the shared shape
+  // (node -> AdjacencyEdge<AdjEdge>[]). The edge payload is preserved verbatim.
+  const sharedAdj: Map<string, AdjacencyEdge<AdjEdge>[]> = new Map();
+  for (const [node, edges] of adj.entries()) {
+    sharedAdj.set(
+      node,
+      edges.map((e) => ({ to: e.to, edge: e })),
+    );
   }
-  dfs(source, []);
-  return results;
+  return sharedEnumeratePaths(sharedAdj, source, dest, maxHops);
 }
 
 // ---- Cover an amount across one hop's offers (split support) -------------
+//
+// Delegates the split-capacity assignment logic to the canonical shared
+// function. Production converts Decimal <-> number at the boundary and maps
+// offerId back to the full AdjEdge. No duplicate cover logic.
 
 interface LegAssignment {
   edge: AdjEdge;
   amount: Decimal; // input amount assigned to this offer
 }
 
-// Assign the input amount across available offers for a hop.
-// Returns a single assignment if one offer can cover it, otherwise a split.
-// Returns null if combined capacity is insufficient (hard filter).
 function coverAmount(edges: AdjEdge[], amount: Decimal): { assignments: LegAssignment[]; split: boolean } | null {
-  // Filter to offers that satisfy min amount (for single) and have capacity.
-  const usable = edges
-    .filter((e) => moneyGt(e.offer.availableCapacity, 0))
-    .sort((a, b) => {
-      // Prefer automatic, lower fee, higher capacity.
-      if (a.offer.channelType !== b.offer.channelType) {
-        return a.offer.channelType === CHANNEL_TYPE.AUTOMATIC ? -1 : 1;
-      }
-      if (a.offer.feeBps !== b.offer.feeBps) return a.offer.feeBps - b.offer.feeBps;
-      return new Decimal(b.offer.availableCapacity).minus(new Decimal(a.offer.availableCapacity)).toNumber();
-    });
-
-  // Try a single offer first.
-  for (const e of usable) {
-    const avail = moneySub(e.offer.availableCapacity, e.offer.reservedCapacity);
-    if (moneyGte(avail, amount) && moneyGte(amount, e.offer.minimumAmount)) {
-      return { assignments: [{ edge: e, amount }], split: false };
-    }
-  }
-  // Otherwise split across multiple offers.
-  const assignments: LegAssignment[] = [];
-  let remaining = amount;
-  for (const e of usable) {
-    if (moneyLte(remaining, 0)) break;
-    const avail = moneySub(e.offer.availableCapacity, e.offer.reservedCapacity);
-    if (moneyLte(avail, 0)) continue;
-    const take = moneyMin(remaining, avail);
-    if (moneyLt(take, e.offer.minimumAmount)) continue;
-    assignments.push({ edge: e, amount: take });
-    remaining = moneySub(remaining, take);
-  }
-  if (moneyGt(remaining, 0)) return null; // insufficient combined capacity
-  return { assignments, split: assignments.length > 1 };
+  const coverOffers: CoverOffer[] = edges.map((e) => ({
+    id: e.offer.id,
+    channelType: e.offer.channelType,
+    feeBps: e.offer.feeBps,
+    availableCapacity: e.offer.availableCapacity.toNumber(),
+    reservedCapacity: e.offer.reservedCapacity.toNumber(),
+    minimumAmount: e.offer.minimumAmount.toNumber(),
+  }));
+  const result = sharedCoverAmount(coverOffers, amount.toNumber());
+  if (!result) return null;
+  // Map offerId back to the full AdjEdge.
+  const edgeById = new Map(edges.map((e) => [e.offer.id, e] as const));
+  const assignments: LegAssignment[] = result.assignments.map((a) => ({
+    edge: edgeById.get(a.offerId)!,
+    amount: new Decimal(a.amount),
+  }));
+  return { assignments, split: result.split };
 }
 
 // ---- Economics computation ----------------------------------------------
+//
+// Delegates the hop-output formula (fee + FX + incentive) to the canonical
+// shared function. Production converts Decimal <-> number at the boundary.
+// For dRamp magnitudes (<= ~$1M) float64 gives ~1e-10 dollar precision — far
+// below the cent and below MONETARY_EPSILON (0.01). No duplicate formula.
 
 function computeHopOutput(inputAmount: Decimal, edge: AdjEdge): { output: Decimal; fee: Decimal; incentive: Decimal } {
-  const fee = feeForAmount(inputAmount, edge.offer.feeBps);
-  const afterFee = moneySub(inputAmount, fee);
-  const converted = moneyMul(afterFee, edge.offer.rate);
-  const incentive = incentiveForAmount(converted, edge.offer.incentiveBps);
-  // Incentive is a rebate — it increases the effective output (subsidized).
-  const output = moneyAdd(converted, incentive);
-  return { output, fee, incentive };
+  const econ: HopEconomics = {
+    feeBps: edge.offer.feeBps,
+    rate: edge.offer.rate.toNumber(),
+    incentiveBps: edge.offer.incentiveBps,
+  };
+  const result = sharedComputeHopOutput(inputAmount.toNumber(), econ);
+  return {
+    output: new Decimal(result.output),
+    fee: new Decimal(result.fee),
+    incentive: new Decimal(result.incentive),
+  };
 }
 
 // ---- Build a candidate route from a path --------------------------------

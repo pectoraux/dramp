@@ -664,3 +664,172 @@ export function clamp01(n: number): number {
 function round(n: number): number {
   return Math.round(n * 100) / 100;
 }
+
+// ---------------------------------------------------------------------------
+// Section 17 — Hop Economics (fee + FX rate + incentive)
+//
+// The CANONICAL hop-output formula. Production (routing.ts) and the topology
+// experiment both call THIS function — no duplicate formula anywhere.
+//
+// Formula (mirrors production's Decimal implementation exactly):
+//   fee        = inputAmount * feeBps / 10000
+//   afterFee   = inputAmount - fee
+//   converted  = afterFee * rate               // FX conversion
+//   incentive  = converted * incentiveBps / 10000   // rebate (subsidized)
+//   output     = converted + incentive          // net destination-asset amount
+//
+// Pure-number: production converts Decimal <-> number at the boundary. For
+// monetary magnitudes in dRamp (<= ~$1M) float64 gives ~1e-10 dollar
+// precision — far below the cent and below MONETARY_EPSILON (0.01).
+// ---------------------------------------------------------------------------
+
+export interface HopEconomics {
+  feeBps: number;
+  rate: number;
+  incentiveBps: number;
+}
+
+export interface HopOutputResult {
+  output: number;    // net destination-asset amount after fee, FX, incentive
+  fee: number;       // fee portion (source-asset terms)
+  incentive: number; // incentive rebate (destination-asset terms)
+}
+
+export function computeHopOutput(inputAmount: number, econ: HopEconomics): HopOutputResult {
+  const fee = (inputAmount * econ.feeBps) / 10000;
+  const afterFee = inputAmount - fee;
+  const converted = afterFee * econ.rate;
+  const incentive = (converted * econ.incentiveBps) / 10000;
+  const output = converted + incentive;
+  return { output, fee, incentive };
+}
+
+// ---------------------------------------------------------------------------
+// Section 18 — Split-Capacity Cover (coverAmount)
+//
+// Assigns an input amount across parallel offers for a single hop. Tries a
+// single offer first; if none can cover the full amount, splits across
+// multiple offers. Returns null if combined capacity is insufficient.
+//
+// This is the CANONICAL split-routing logic. Production (routing.ts) and the
+// topology experiment both call THIS function.
+//
+// Sort order (mirrors production): AUTOMATIC channel first, then lower fee,
+// then higher available capacity. Split pieces must each satisfy minimumAmount.
+// ---------------------------------------------------------------------------
+
+export interface CoverOffer {
+  id: string;
+  channelType: string;        // AUTOMATIC | MANUAL
+  feeBps: number;
+  availableCapacity: number;
+  reservedCapacity: number;
+  minimumAmount: number;
+}
+
+export interface CoverAssignment {
+  offerId: string;
+  amount: number;             // input amount assigned to this offer
+}
+
+export interface CoverResult {
+  assignments: CoverAssignment[];
+  split: boolean;             // true if more than one offer was used
+}
+
+export function coverAmount(offers: CoverOffer[], amount: number): CoverResult | null {
+  // Filter to offers with positive available capacity, then sort by preference.
+  const usable = offers
+    .filter((o) => o.availableCapacity > 0)
+    .sort((a, b) => {
+      // Prefer AUTOMATIC channel.
+      if (a.channelType !== b.channelType) {
+        return a.channelType === "AUTOMATIC" ? -1 : 1;
+      }
+      // Then lower fee.
+      if (a.feeBps !== b.feeBps) return a.feeBps - b.feeBps;
+      // Then higher available capacity.
+      return b.availableCapacity - a.availableCapacity;
+    });
+
+  // Try a single offer first.
+  for (const o of usable) {
+    const avail = o.availableCapacity - o.reservedCapacity;
+    if (avail >= amount && amount >= o.minimumAmount) {
+      return { assignments: [{ offerId: o.id, amount }], split: false };
+    }
+  }
+
+  // Otherwise split across multiple offers greedily.
+  const assignments: CoverAssignment[] = [];
+  let remaining = amount;
+  for (const o of usable) {
+    if (remaining <= 0) break;
+    const avail = o.availableCapacity - o.reservedCapacity;
+    if (avail <= 0) continue;
+    const take = Math.min(remaining, avail);
+    if (take < o.minimumAmount) continue;
+    assignments.push({ offerId: o.id, amount: take });
+    remaining -= take;
+  }
+  if (remaining > 0) return null; // insufficient combined capacity
+  return { assignments, split: assignments.length > 1 };
+}
+
+// ---------------------------------------------------------------------------
+// Section 19 — Path Enumeration (simple paths up to maxHops)
+//
+// DFS simple-path enumeration on a generic adjacency map. Production
+// (routing.ts) and the topology experiment both call THIS function.
+//
+// Generic over edge type E so production can pass its Decimal-laden AdjEdge
+// and the experiment can pass its plain SimOffer. The DFS logic itself is
+// identical — no duplicate path-search code.
+//
+// Behavior preserved exactly from production's prior implementation, including
+// the parallel-edge grouping (all offers between the same node pair are
+// collected into one PathStep.edges array for split-capacity routing).
+// ---------------------------------------------------------------------------
+
+export interface AdjacencyEdge<E> {
+  to: string;
+  edge: E;
+}
+
+export interface PathStep<E> {
+  fromNode: string;
+  toNode: string;
+  edges: E[]; // parallel offers serving this hop (all go fromNode -> toNode)
+}
+
+export function enumeratePaths<E>(
+  adj: Map<string, AdjacencyEdge<E>[]>,
+  source: string,
+  dest: string,
+  maxHops: number,
+): PathStep<E>[][] {
+  const results: PathStep<E>[][] = [];
+  const visited = new Set<string>([source]);
+
+  function dfs(current: string, path: PathStep<E>[]) {
+    if (path.length > 0 && current === dest) {
+      results.push([...path]);
+      return;
+    }
+    if (path.length >= maxHops) return;
+    const edges = adj.get(current) ?? [];
+    for (const e of edges) {
+      if (visited.has(e.to)) continue;
+      // Don't allow trivial self-loops.
+      visited.add(e.to);
+      // Group parallel edges: all edges from `current` to `e.to`.
+      const parallel = edges.filter((x) => x.to === e.to).map((p) => p.edge);
+      path.push({ fromNode: current, toNode: e.to, edges: parallel });
+      dfs(e.to, path);
+      path.pop();
+      visited.delete(e.to);
+    }
+  }
+  dfs(source, []);
+  return results;
+}
