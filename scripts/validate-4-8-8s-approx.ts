@@ -38,7 +38,8 @@ const EMPIRICAL_SEEDS = 5;
 
 const METRIC_KEYS = [
   "corridorReachablePct",
-  "aggregateCapacityReachabilityPct",
+  "aggregatePhysicalCapacityReachabilityPct",
+  "aggregateEconomicCapacityReachabilityPct",
   "capacityExecutableReachabilityPct",
   "liquidityExecutableReachabilityPct",
   "productionExecutableReachabilityPct",

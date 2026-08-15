@@ -3,7 +3,8 @@
     {
       "seed": 10000,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 64.52,
       "greedyLiquidity": 5.14,
       "greedyProduction": 1.83,
@@ -14,7 +15,8 @@
       "maxPathsObserved": 313,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 2.95,
         "greedyProduction": 2.93,
@@ -24,7 +26,8 @@
     {
       "seed": 10001,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 6.98,
       "greedyProduction": 6.8,
@@ -35,7 +38,8 @@
       "maxPathsObserved": 267,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 7.49,
         "greedyProduction": 7.41,
@@ -45,7 +49,8 @@
     {
       "seed": 10002,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 12.73,
       "greedyProduction": 9.07,
@@ -56,7 +61,8 @@
       "maxPathsObserved": 280,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 2.86,
         "greedyProduction": 2.27,
@@ -66,7 +72,8 @@
     {
       "seed": 10003,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 5.74,
       "greedyProduction": 4.04,
@@ -77,7 +84,8 @@
       "maxPathsObserved": 283,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 3.11,
         "greedyProduction": 2.66,
@@ -87,7 +95,8 @@
     {
       "seed": 10004,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 67.14,
       "greedyLiquidity": 17.41,
       "greedyProduction": 6.55,
@@ -98,7 +107,8 @@
       "maxPathsObserved": 278,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 67.14,
         "greedyLiquidity": 6.54,
         "greedyProduction": 4.82,
@@ -108,7 +118,8 @@
     {
       "seed": 10005,
       "structural": 100,
-      "aggregateCapacity": 91.75,
+      "aggregatePhysicalCapacity": 91.75,
+      "aggregateEconomicCapacity": 91.75,
       "greedyCapacity": 91.75,
       "greedyLiquidity": 15.68,
       "greedyProduction": 12.2,
@@ -119,7 +130,8 @@
       "maxPathsObserved": 313,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 91.75,
+        "aggregatePhysicalCapacity": 91.75,
+        "aggregateEconomicCapacity": 91.75,
         "greedyCapacity": 91.75,
         "greedyLiquidity": 7.95,
         "greedyProduction": 6.38,
@@ -129,7 +141,8 @@
     {
       "seed": 10006,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 3.63,
       "greedyProduction": 3.21,
@@ -140,7 +153,8 @@
       "maxPathsObserved": 268,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 5.19,
         "greedyProduction": 5.19,
@@ -150,7 +164,8 @@
     {
       "seed": 10007,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 11.24,
       "greedyProduction": 4.69,
@@ -161,7 +176,8 @@
       "maxPathsObserved": 300,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 6.62,
         "greedyProduction": 5.53,
@@ -171,7 +187,8 @@
     {
       "seed": 10008,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 7.5,
       "greedyProduction": 7.26,
@@ -182,7 +199,8 @@
       "maxPathsObserved": 227,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 7.19,
         "greedyProduction": 7.18,
@@ -192,7 +210,8 @@
     {
       "seed": 10009,
       "structural": 100,
-      "aggregateCapacity": 85.89,
+      "aggregatePhysicalCapacity": 85.89,
+      "aggregateEconomicCapacity": 85.89,
       "greedyCapacity": 85.89,
       "greedyLiquidity": 0.6,
       "greedyProduction": 0.6,
@@ -203,7 +222,8 @@
       "maxPathsObserved": 258,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 85.89,
+        "aggregatePhysicalCapacity": 85.89,
+        "aggregateEconomicCapacity": 85.89,
         "greedyCapacity": 85.89,
         "greedyLiquidity": 3.04,
         "greedyProduction": 3.04,
@@ -213,7 +233,8 @@
     {
       "seed": 10010,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 12.25,
       "greedyProduction": 7.83,
@@ -224,7 +245,8 @@
       "maxPathsObserved": 227,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 11.54,
         "greedyProduction": 7.41,
@@ -234,7 +256,8 @@
     {
       "seed": 10011,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 4.14,
       "greedyProduction": 3.17,
@@ -245,7 +268,8 @@
       "maxPathsObserved": 233,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 1.5,
         "greedyProduction": 1.5,
@@ -255,7 +279,8 @@
     {
       "seed": 10012,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 27.2,
       "greedyProduction": 13.9,
@@ -266,7 +291,8 @@
       "maxPathsObserved": 258,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 13.39,
         "greedyProduction": 12.53,
@@ -276,7 +302,8 @@
     {
       "seed": 10013,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 17.71,
       "greedyProduction": 15.74,
@@ -287,7 +314,8 @@
       "maxPathsObserved": 281,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 8.21,
         "greedyProduction": 6.7,
@@ -297,7 +325,8 @@
     {
       "seed": 10014,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 12.04,
       "greedyProduction": 6.17,
@@ -308,7 +337,8 @@
       "maxPathsObserved": 300,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 11.79,
         "greedyProduction": 9.87,
@@ -318,7 +348,8 @@
     {
       "seed": 10015,
       "structural": 100,
-      "aggregateCapacity": 69.77,
+      "aggregatePhysicalCapacity": 69.77,
+      "aggregateEconomicCapacity": 69.77,
       "greedyCapacity": 69.77,
       "greedyLiquidity": 4.84,
       "greedyProduction": 2.52,
@@ -329,7 +360,8 @@
       "maxPathsObserved": 257,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 69.77,
+        "aggregatePhysicalCapacity": 69.77,
+        "aggregateEconomicCapacity": 69.77,
         "greedyCapacity": 69.77,
         "greedyLiquidity": 4.26,
         "greedyProduction": 3.44,
@@ -339,7 +371,8 @@
     {
       "seed": 10016,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 11.18,
       "greedyProduction": 5.1,
@@ -350,7 +383,8 @@
       "maxPathsObserved": 228,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 8.88,
         "greedyProduction": 8.13,
@@ -360,7 +394,8 @@
     {
       "seed": 10017,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 24.37,
       "greedyProduction": 22.8,
@@ -371,7 +406,8 @@
       "maxPathsObserved": 312,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 24.68,
         "greedyProduction": 21.12,
@@ -381,7 +417,8 @@
     {
       "seed": 10018,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 81.09,
       "greedyLiquidity": 6.09,
       "greedyProduction": 4.6,
@@ -392,7 +429,8 @@
       "maxPathsObserved": 290,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 81.09,
+        "aggregatePhysicalCapacity": 81.09,
+        "aggregateEconomicCapacity": 81.09,
         "greedyCapacity": 81.09,
         "greedyLiquidity": 6.59,
         "greedyProduction": 5.34,
@@ -402,7 +440,8 @@
     {
       "seed": 10019,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 17,
       "greedyProduction": 8.43,
@@ -413,7 +452,8 @@
       "maxPathsObserved": 270,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 10.49,
         "greedyProduction": 7.57,
@@ -425,7 +465,8 @@
     {
       "seed": 10000,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 6.94,
       "greedyProduction": 1.39,
@@ -436,7 +477,8 @@
       "maxPathsObserved": 28,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 5.86,
         "greedyProduction": 5.74,
@@ -446,7 +488,8 @@
     {
       "seed": 10001,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 12.83,
       "greedyProduction": 12.83,
@@ -457,7 +500,8 @@
       "maxPathsObserved": 15,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 2,
         "greedyProduction": 2,
@@ -467,7 +511,8 @@
     {
       "seed": 10002,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 2.82,
       "greedyProduction": 1.12,
@@ -478,7 +523,8 @@
       "maxPathsObserved": 22,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 1.36,
         "greedyProduction": 0.74,
@@ -488,7 +534,8 @@
     {
       "seed": 10003,
       "structural": 100,
-      "aggregateCapacity": 75.98,
+      "aggregatePhysicalCapacity": 75.98,
+      "aggregateEconomicCapacity": 75.98,
       "greedyCapacity": 75.98,
       "greedyLiquidity": 2.84,
       "greedyProduction": 2.83,
@@ -499,7 +546,8 @@
       "maxPathsObserved": 13,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 75.98,
+        "aggregatePhysicalCapacity": 75.98,
+        "aggregateEconomicCapacity": 75.98,
         "greedyCapacity": 54.45,
         "greedyLiquidity": 4.26,
         "greedyProduction": 4.26,
@@ -509,7 +557,8 @@
     {
       "seed": 10004,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 2.13,
       "greedyProduction": 2.13,
@@ -520,7 +569,8 @@
       "maxPathsObserved": 26,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 1.16,
         "greedyProduction": 1.16,
@@ -530,7 +580,8 @@
     {
       "seed": 10005,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 7.22,
       "greedyProduction": 7.22,
@@ -541,7 +592,8 @@
       "maxPathsObserved": 18,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 6.6,
         "greedyProduction": 6.6,
@@ -551,7 +603,8 @@
     {
       "seed": 10006,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 0.34,
       "greedyProduction": 0.34,
@@ -562,7 +615,8 @@
       "maxPathsObserved": 14,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 0.25,
         "greedyProduction": 0.25,
@@ -572,7 +626,8 @@
     {
       "seed": 10007,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 6.16,
       "greedyProduction": 5.22,
@@ -583,7 +638,8 @@
       "maxPathsObserved": 22,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 1.64,
         "greedyProduction": 1.58,
@@ -593,7 +649,8 @@
     {
       "seed": 10008,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 5.04,
       "greedyProduction": 4.37,
@@ -604,7 +661,8 @@
       "maxPathsObserved": 34,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 3.65,
         "greedyProduction": 3.44,
@@ -614,7 +672,8 @@
     {
       "seed": 10009,
       "structural": 100,
-      "aggregateCapacity": 76.13,
+      "aggregatePhysicalCapacity": 76.13,
+      "aggregateEconomicCapacity": 76.13,
       "greedyCapacity": 76.13,
       "greedyLiquidity": 2.95,
       "greedyProduction": 2.8,
@@ -625,7 +684,8 @@
       "maxPathsObserved": 24,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 76.13,
+        "aggregatePhysicalCapacity": 76.13,
+        "aggregateEconomicCapacity": 76.13,
         "greedyCapacity": 76.13,
         "greedyLiquidity": 2.14,
         "greedyProduction": 2.04,
@@ -635,7 +695,8 @@
     {
       "seed": 10010,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 3.78,
       "greedyProduction": 1.58,
@@ -646,7 +707,8 @@
       "maxPathsObserved": 26,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 2.8,
         "greedyProduction": 2.5,
@@ -656,7 +718,8 @@
     {
       "seed": 10011,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 9.85,
       "greedyProduction": 6.84,
@@ -667,7 +730,8 @@
       "maxPathsObserved": 18,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 10.91,
         "greedyProduction": 10.83,
@@ -677,7 +741,8 @@
     {
       "seed": 10012,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 16.19,
       "greedyProduction": 1.32,
@@ -688,7 +753,8 @@
       "maxPathsObserved": 22,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 17.1,
         "greedyProduction": 6.42,
@@ -698,7 +764,8 @@
     {
       "seed": 10013,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 9.27,
       "greedyProduction": 6.53,
@@ -709,7 +776,8 @@
       "maxPathsObserved": 38,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 5.49,
         "greedyProduction": 4.68,
@@ -719,7 +787,8 @@
     {
       "seed": 10014,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 3.33,
       "greedyProduction": 2.63,
@@ -730,7 +799,8 @@
       "maxPathsObserved": 13,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 17.45,
         "greedyProduction": 17.43,
@@ -740,7 +810,8 @@
     {
       "seed": 10015,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 2.27,
       "greedyProduction": 2.27,
@@ -751,7 +822,8 @@
       "maxPathsObserved": 20,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 2.78,
         "greedyProduction": 2.78,
@@ -761,7 +833,8 @@
     {
       "seed": 10016,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 10.32,
       "greedyProduction": 4.81,
@@ -772,7 +845,8 @@
       "maxPathsObserved": 32,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 9.23,
         "greedyProduction": 8.51,
@@ -782,7 +856,8 @@
     {
       "seed": 10017,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 11.36,
       "greedyProduction": 7.01,
@@ -793,7 +868,8 @@
       "maxPathsObserved": 22,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 8.98,
         "greedyProduction": 7.92,
@@ -803,7 +879,8 @@
     {
       "seed": 10018,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 7.61,
       "greedyProduction": 5.62,
@@ -814,7 +891,8 @@
       "maxPathsObserved": 23,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 0.82,
         "greedyProduction": 0.46,
@@ -824,7 +902,8 @@
     {
       "seed": 10019,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 15.5,
       "greedyProduction": 12.25,
@@ -835,7 +914,8 @@
       "maxPathsObserved": 25,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 20.57,
         "greedyProduction": 19.79,
@@ -847,7 +927,8 @@
     {
       "seed": 10000,
       "structural": 100,
-      "aggregateCapacity": 53.55,
+      "aggregatePhysicalCapacity": 53.55,
+      "aggregateEconomicCapacity": 53.55,
       "greedyCapacity": 53.55,
       "greedyLiquidity": 4.18,
       "greedyProduction": 2.66,
@@ -858,7 +939,8 @@
       "maxPathsObserved": 54,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 53.55,
+        "aggregatePhysicalCapacity": 53.55,
+        "aggregateEconomicCapacity": 53.55,
         "greedyCapacity": 53.55,
         "greedyLiquidity": 5.09,
         "greedyProduction": 3.45,
@@ -868,7 +950,8 @@
     {
       "seed": 10001,
       "structural": 100,
-      "aggregateCapacity": 65.67,
+      "aggregatePhysicalCapacity": 65.67,
+      "aggregateEconomicCapacity": 65.67,
       "greedyCapacity": 65.67,
       "greedyLiquidity": 3.14,
       "greedyProduction": 0.73,
@@ -879,7 +962,8 @@
       "maxPathsObserved": 33,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 65.67,
+        "aggregatePhysicalCapacity": 65.67,
+        "aggregateEconomicCapacity": 65.67,
         "greedyCapacity": 65.67,
         "greedyLiquidity": 3.49,
         "greedyProduction": 1.08,
@@ -889,7 +973,8 @@
     {
       "seed": 10002,
       "structural": 100,
-      "aggregateCapacity": 78.46,
+      "aggregatePhysicalCapacity": 78.46,
+      "aggregateEconomicCapacity": 78.46,
       "greedyCapacity": 38.16,
       "greedyLiquidity": 2.4,
       "greedyProduction": 1.96,
@@ -900,7 +985,8 @@
       "maxPathsObserved": 53,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 89.55,
+        "aggregatePhysicalCapacity": 89.55,
+        "aggregateEconomicCapacity": 89.55,
         "greedyCapacity": 62.6,
         "greedyLiquidity": 3.04,
         "greedyProduction": 2.42,
@@ -910,7 +996,8 @@
     {
       "seed": 10003,
       "structural": 100,
-      "aggregateCapacity": 54.45,
+      "aggregatePhysicalCapacity": 54.45,
+      "aggregateEconomicCapacity": 54.45,
       "greedyCapacity": 54.45,
       "greedyLiquidity": 0.6,
       "greedyProduction": 0.42,
@@ -921,7 +1008,8 @@
       "maxPathsObserved": 34,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 54.45,
+        "aggregatePhysicalCapacity": 54.45,
+        "aggregateEconomicCapacity": 54.45,
         "greedyCapacity": 54.45,
         "greedyLiquidity": 9.61,
         "greedyProduction": 9.1,
@@ -931,7 +1019,8 @@
     {
       "seed": 10004,
       "structural": 100,
-      "aggregateCapacity": 67.14,
+      "aggregatePhysicalCapacity": 67.14,
+      "aggregateEconomicCapacity": 67.14,
       "greedyCapacity": 57.49,
       "greedyLiquidity": 1.16,
       "greedyProduction": 0.71,
@@ -942,7 +1031,8 @@
       "maxPathsObserved": 58,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 67.14,
+        "aggregatePhysicalCapacity": 67.14,
+        "aggregateEconomicCapacity": 67.14,
         "greedyCapacity": 67.14,
         "greedyLiquidity": 2.54,
         "greedyProduction": 2.48,
@@ -952,7 +1042,8 @@
     {
       "seed": 10005,
       "structural": 100,
-      "aggregateCapacity": 75.82,
+      "aggregatePhysicalCapacity": 75.82,
+      "aggregateEconomicCapacity": 75.82,
       "greedyCapacity": 75.82,
       "greedyLiquidity": 7.66,
       "greedyProduction": 6.21,
@@ -963,7 +1054,8 @@
       "maxPathsObserved": 61,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 75.82,
+        "aggregatePhysicalCapacity": 75.82,
+        "aggregateEconomicCapacity": 75.82,
         "greedyCapacity": 75.82,
         "greedyLiquidity": 6.71,
         "greedyProduction": 5.5,
@@ -973,7 +1065,8 @@
     {
       "seed": 10006,
       "structural": 100,
-      "aggregateCapacity": 57.17,
+      "aggregatePhysicalCapacity": 57.17,
+      "aggregateEconomicCapacity": 57.17,
       "greedyCapacity": 45.14,
       "greedyLiquidity": 4.89,
       "greedyProduction": 1.41,
@@ -984,7 +1077,8 @@
       "maxPathsObserved": 46,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 57.17,
+        "aggregatePhysicalCapacity": 57.17,
+        "aggregateEconomicCapacity": 57.17,
         "greedyCapacity": 45.14,
         "greedyLiquidity": 5,
         "greedyProduction": 4.59,
@@ -994,7 +1088,8 @@
     {
       "seed": 10007,
       "structural": 100,
-      "aggregateCapacity": 61.96,
+      "aggregatePhysicalCapacity": 61.96,
+      "aggregateEconomicCapacity": 61.96,
       "greedyCapacity": 61.96,
       "greedyLiquidity": 5,
       "greedyProduction": 4.94,
@@ -1005,7 +1100,8 @@
       "maxPathsObserved": 63,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 61.96,
+        "aggregatePhysicalCapacity": 61.96,
+        "aggregateEconomicCapacity": 61.96,
         "greedyCapacity": 61.96,
         "greedyLiquidity": 5,
         "greedyProduction": 4.94,
@@ -1015,7 +1111,8 @@
     {
       "seed": 10008,
       "structural": 100,
-      "aggregateCapacity": 62.6,
+      "aggregatePhysicalCapacity": 62.6,
+      "aggregateEconomicCapacity": 62.6,
       "greedyCapacity": 62.6,
       "greedyLiquidity": 4.13,
       "greedyProduction": 3.29,
@@ -1026,7 +1123,8 @@
       "maxPathsObserved": 78,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 62.6,
+        "aggregatePhysicalCapacity": 62.6,
+        "aggregateEconomicCapacity": 62.6,
         "greedyCapacity": 62.6,
         "greedyLiquidity": 4.13,
         "greedyProduction": 3.45,
@@ -1036,7 +1134,8 @@
     {
       "seed": 10009,
       "structural": 100,
-      "aggregateCapacity": 26.74,
+      "aggregatePhysicalCapacity": 26.74,
+      "aggregateEconomicCapacity": 26.74,
       "greedyCapacity": 26.74,
       "greedyLiquidity": 3.18,
       "greedyProduction": 2.8,
@@ -1047,7 +1146,8 @@
       "maxPathsObserved": 49,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 26.74,
+        "aggregatePhysicalCapacity": 26.74,
+        "aggregateEconomicCapacity": 26.74,
         "greedyCapacity": 26.74,
         "greedyLiquidity": 3.18,
         "greedyProduction": 2.99,
@@ -1057,7 +1157,8 @@
     {
       "seed": 10010,
       "structural": 100,
-      "aggregateCapacity": 60.45,
+      "aggregatePhysicalCapacity": 60.45,
+      "aggregateEconomicCapacity": 60.45,
       "greedyCapacity": 60.45,
       "greedyLiquidity": 3.53,
       "greedyProduction": 3.53,
@@ -1068,7 +1169,8 @@
       "maxPathsObserved": 32,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 60.45,
+        "aggregatePhysicalCapacity": 60.45,
+        "aggregateEconomicCapacity": 60.45,
         "greedyCapacity": 60.45,
         "greedyLiquidity": 5.64,
         "greedyProduction": 5.64,
@@ -1078,7 +1180,8 @@
     {
       "seed": 10011,
       "structural": 100,
-      "aggregateCapacity": 29.39,
+      "aggregatePhysicalCapacity": 29.39,
+      "aggregateEconomicCapacity": 29.39,
       "greedyCapacity": 29.39,
       "greedyLiquidity": 6.07,
       "greedyProduction": 3.24,
@@ -1089,7 +1192,8 @@
       "maxPathsObserved": 67,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 29.39,
+        "aggregatePhysicalCapacity": 29.39,
+        "aggregateEconomicCapacity": 29.39,
         "greedyCapacity": 29.39,
         "greedyLiquidity": 6.2,
         "greedyProduction": 5.7,
@@ -1099,7 +1203,8 @@
     {
       "seed": 10012,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 0.27,
       "greedyProduction": 0.27,
@@ -1110,7 +1215,8 @@
       "maxPathsObserved": 39,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 86.98,
         "greedyLiquidity": 1.47,
         "greedyProduction": 1.47,
@@ -1120,7 +1226,8 @@
     {
       "seed": 10013,
       "structural": 100,
-      "aggregateCapacity": 89,
+      "aggregatePhysicalCapacity": 89,
+      "aggregateEconomicCapacity": 89,
       "greedyCapacity": 89,
       "greedyLiquidity": 2.89,
       "greedyProduction": 2.73,
@@ -1131,7 +1238,8 @@
       "maxPathsObserved": 43,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 89,
+        "aggregatePhysicalCapacity": 89,
+        "aggregateEconomicCapacity": 89,
         "greedyCapacity": 89,
         "greedyLiquidity": 2.75,
         "greedyProduction": 2.7,
@@ -1141,7 +1249,8 @@
     {
       "seed": 10014,
       "structural": 100,
-      "aggregateCapacity": 100,
+      "aggregatePhysicalCapacity": 100,
+      "aggregateEconomicCapacity": 100,
       "greedyCapacity": 100,
       "greedyLiquidity": 6.45,
       "greedyProduction": 6.41,
@@ -1152,7 +1261,8 @@
       "maxPathsObserved": 62,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 100,
+        "aggregatePhysicalCapacity": 100,
+        "aggregateEconomicCapacity": 100,
         "greedyCapacity": 100,
         "greedyLiquidity": 4.64,
         "greedyProduction": 4.61,
@@ -1162,7 +1272,8 @@
     {
       "seed": 10015,
       "structural": 89.66,
-      "aggregateCapacity": 36.71,
+      "aggregatePhysicalCapacity": 36.71,
+      "aggregateEconomicCapacity": 36.71,
       "greedyCapacity": 36.71,
       "greedyLiquidity": 1.35,
       "greedyProduction": 1.01,
@@ -1173,7 +1284,8 @@
       "maxPathsObserved": 45,
       "initial": {
         "structural": 89.66,
-        "aggregateCapacity": 36.71,
+        "aggregatePhysicalCapacity": 36.71,
+        "aggregateEconomicCapacity": 36.71,
         "greedyCapacity": 36.71,
         "greedyLiquidity": 1.35,
         "greedyProduction": 1.01,
@@ -1183,7 +1295,8 @@
     {
       "seed": 10016,
       "structural": 100,
-      "aggregateCapacity": 86.73,
+      "aggregatePhysicalCapacity": 86.73,
+      "aggregateEconomicCapacity": 86.73,
       "greedyCapacity": 63.05,
       "greedyLiquidity": 9.27,
       "greedyProduction": 4.35,
@@ -1194,7 +1307,8 @@
       "maxPathsObserved": 64,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 86.73,
+        "aggregatePhysicalCapacity": 86.73,
+        "aggregateEconomicCapacity": 86.73,
         "greedyCapacity": 63.05,
         "greedyLiquidity": 3.34,
         "greedyProduction": 2.91,
@@ -1204,7 +1318,8 @@
     {
       "seed": 10017,
       "structural": 100,
-      "aggregateCapacity": 53.03,
+      "aggregatePhysicalCapacity": 53.03,
+      "aggregateEconomicCapacity": 53.03,
       "greedyCapacity": 53.03,
       "greedyLiquidity": 4.48,
       "greedyProduction": 4.48,
@@ -1215,7 +1330,8 @@
       "maxPathsObserved": 54,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 53.03,
+        "aggregatePhysicalCapacity": 53.03,
+        "aggregateEconomicCapacity": 53.03,
         "greedyCapacity": 53.03,
         "greedyLiquidity": 19.13,
         "greedyProduction": 19.13,
@@ -1225,7 +1341,8 @@
     {
       "seed": 10018,
       "structural": 100,
-      "aggregateCapacity": 24.48,
+      "aggregatePhysicalCapacity": 24.48,
+      "aggregateEconomicCapacity": 24.48,
       "greedyCapacity": 24.48,
       "greedyLiquidity": 0.78,
       "greedyProduction": 0.57,
@@ -1236,7 +1353,8 @@
       "maxPathsObserved": 53,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 24.48,
+        "aggregatePhysicalCapacity": 24.48,
+        "aggregateEconomicCapacity": 24.48,
         "greedyCapacity": 24.48,
         "greedyLiquidity": 0.75,
         "greedyProduction": 0.74,
@@ -1246,7 +1364,8 @@
     {
       "seed": 10019,
       "structural": 100,
-      "aggregateCapacity": 53.2,
+      "aggregatePhysicalCapacity": 53.2,
+      "aggregateEconomicCapacity": 53.2,
       "greedyCapacity": 53.2,
       "greedyLiquidity": 19.67,
       "greedyProduction": 16.08,
@@ -1257,7 +1376,8 @@
       "maxPathsObserved": 49,
       "initial": {
         "structural": 100,
-        "aggregateCapacity": 53.2,
+        "aggregatePhysicalCapacity": 53.2,
+        "aggregateEconomicCapacity": 53.2,
         "greedyCapacity": 53.2,
         "greedyLiquidity": 7.56,
         "greedyProduction": 6.5,

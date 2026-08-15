@@ -36,7 +36,8 @@ const EMPIRICAL_SEEDS = 5;
 
 const METRIC_KEYS = [
   "corridorReachablePct",
-  "aggregateCapacityReachabilityPct",
+  "aggregatePhysicalCapacityReachabilityPct",
+  "aggregateEconomicCapacityReachabilityPct",
   "capacityExecutableReachabilityPct",
   "liquidityExecutableReachabilityPct",
   "productionExecutableReachabilityPct",
@@ -89,14 +90,16 @@ async function main() {
   console.log(`\nPhase 2: Direct sampled-vs-exact metric comparison (${EMPIRICAL_SEEDS} seeds × ${TOPOLOGIES.length} topologies)...`);
   const stats: Record<MetricKey, MetricStats> = {
     corridorReachablePct: { maxAbs: 0, maxRel: 0, meanAbs: 0, count: 0 },
-    aggregateCapacityReachabilityPct: { maxAbs: 0, maxRel: 0, meanAbs: 0, count: 0 },
+    aggregatePhysicalCapacityReachabilityPct: { maxAbs: 0, maxRel: 0, meanAbs: 0, count: 0 },
+    aggregateEconomicCapacityReachabilityPct: { maxAbs: 0, maxRel: 0, meanAbs: 0, count: 0 },
     capacityExecutableReachabilityPct: { maxAbs: 0, maxRel: 0, meanAbs: 0, count: 0 },
     liquidityExecutableReachabilityPct: { maxAbs: 0, maxRel: 0, meanAbs: 0, count: 0 },
     productionExecutableReachabilityPct: { maxAbs: 0, maxRel: 0, meanAbs: 0, count: 0 },
   };
   const absSums: Record<MetricKey, number> = {
     corridorReachablePct: 0,
-    aggregateCapacityReachabilityPct: 0,
+    aggregatePhysicalCapacityReachabilityPct: 0,
+    aggregateEconomicCapacityReachabilityPct: 0,
     capacityExecutableReachabilityPct: 0,
     liquidityExecutableReachabilityPct: 0,
     productionExecutableReachabilityPct: 0,

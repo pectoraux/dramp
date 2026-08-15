@@ -72,7 +72,8 @@ async function main() {
       results[topology].push({
         seed,
         structural: finalMetrics.corridorReachablePct,
-        aggregateCapacity: finalMetrics.aggregateCapacityReachabilityPct,
+        aggregatePhysicalCapacity: finalMetrics.aggregatePhysicalCapacityReachabilityPct,
+        aggregateEconomicCapacity: finalMetrics.aggregateEconomicCapacityReachabilityPct,
         greedyCapacity: finalMetrics.capacityExecutableReachabilityPct,
         greedyLiquidity: finalMetrics.liquidityExecutableReachabilityPct,
         greedyProduction: finalMetrics.productionExecutableReachabilityPct,
@@ -83,7 +84,8 @@ async function main() {
         maxPathsObserved: finalMetrics.maxPathsObserved,
         initial: {
           structural: initialMetrics.corridorReachablePct,
-          aggregateCapacity: initialMetrics.aggregateCapacityReachabilityPct,
+          aggregatePhysicalCapacity: initialMetrics.aggregatePhysicalCapacityReachabilityPct,
+          aggregateEconomicCapacity: initialMetrics.aggregateEconomicCapacityReachabilityPct,
           greedyCapacity: initialMetrics.capacityExecutableReachabilityPct,
           greedyLiquidity: initialMetrics.liquidityExecutableReachabilityPct,
           greedyProduction: initialMetrics.productionExecutableReachabilityPct,
@@ -111,7 +113,7 @@ async function main() {
 
   // Produce the final table.
   console.log("\n╔═══════════════════════════════════════════════════════════════════════╗");
-  console.log("║  dRamp P4.8.8S — FROZEN Routing Diagnostic (density=100, 20 seeds)  ║");
+  console.log("║  dRamp P4.8.8T — FROZEN Routing Diagnostic (density=100, 20 seeds)  ║");
   console.log("╚═══════════════════════════════════════════════════════════════════════╝");
 
   // Path-cap acceptance.
@@ -125,33 +127,37 @@ async function main() {
 
   // Monotonicity check (per-seed, on medians).
   console.log("\n### Monotonicity Check (medians per topology)\n");
+  console.log("  Chain: structural >= aggregateEconomicCapacity >= greedyCapacity >= greedyLiquidity >= greedyProduction");
+  console.log("  (aggregatePhysicalCapacity is independent — not in the chain)\n");
   for (const t of TOPOLOGIES) {
     const ms = results[t];
     const medStruct = percentile(ms.map(r => r.structural), 0.5);
-    const medAgg = percentile(ms.map(r => r.aggregateCapacity), 0.5);
+    const medAggPhys = percentile(ms.map(r => r.aggregatePhysicalCapacity), 0.5);
+    const medAggEcon = percentile(ms.map(r => r.aggregateEconomicCapacity), 0.5);
     const medCap = percentile(ms.map(r => r.greedyCapacity), 0.5);
     const medLiq = percentile(ms.map(r => r.greedyLiquidity), 0.5);
     const medProd = percentile(ms.map(r => r.greedyProduction), 0.5);
-    const mono = medStruct >= medAgg && medAgg >= medCap && medCap >= medLiq && medLiq >= medProd;
-    console.log(`  ${t}: ${medStruct.toFixed(1)} >= ${medAgg.toFixed(1)} >= ${medCap.toFixed(1)} >= ${medLiq.toFixed(1)} >= ${medProd.toFixed(1)} → ${mono ? "✓" : "✗ VIOLATION"}`);
+    const mono = medStruct >= medAggEcon && medAggEcon >= medCap && medCap >= medLiq && medLiq >= medProd;
+    console.log(`  ${t}: struct=${medStruct.toFixed(1)} physCap=${medAggPhys.toFixed(1)} econCap=${medAggEcon.toFixed(1)} greedyCap=${medCap.toFixed(1)} liq=${medLiq.toFixed(1)} prod=${medProd.toFixed(1)} → ${mono ? "✓" : "✗ VIOLATION"}`);
   }
 
-  // Final frozen table.
-  console.log("\n### Table F — FROZEN Routing Diagnostic (P4.8.8S) — density=100, 20 seeds\n");
+  // Final frozen table — 7 columns (physical + economic capacity separated).
+  console.log("\n### Table F — FROZEN Routing Diagnostic (P4.8.8T) — density=100, 20 seeds\n");
   console.log("Medians (10th–90th percentile). Demand-weighted % of reachable volume.");
-  console.log("Invariant: structural ≥ aggregateCapacity ≥ greedyCapacity ≥ greedyLiquidity ≥ greedyProduction");
+  console.log("Invariant: structural ≥ aggregateEconomicCapacity ≥ greedyCapacity ≥ greedyLiquidity ≥ greedyProduction");
+  console.log("aggregatePhysicalCapacity: independent diagnostic (rate-only, no guaranteed ordering vs economic).");
   console.log("alternativeProduction = LOWER_BOUND (solver not proven exhaustive for 3+ offer multi-hop).\n");
-  console.log("| topology | structural | aggregate capacity | greedy capacity | greedy liquidity | greedy production | alternative production LB |");
-  console.log("| --- | --- | --- | --- | --- | --- | --- |");
+  console.log("| topology | structural | aggregate physical capacity | aggregate economic capacity | greedy capacity | greedy liquidity | greedy production | alternative production LB |");
+  console.log("| --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const t of TOPOLOGIES) {
     const ms = results[t];
     const fmt = (key: string) => {
       const arr = ms.map(r => r[key]);
       return `${percentile(arr, 0.5).toFixed(1)} (${percentile(arr, 0.1).toFixed(1)}–${percentile(arr, 0.9).toFixed(1)})`;
     };
-    console.log(`| ${t} | ${fmt("structural")} | ${fmt("aggregateCapacity")} | ${fmt("greedyCapacity")} | ${fmt("greedyLiquidity")} | ${fmt("greedyProduction")} | ${fmt("alternativeProduction")} |`);
+    console.log(`| ${t} | ${fmt("structural")} | ${fmt("aggregatePhysicalCapacity")} | ${fmt("aggregateEconomicCapacity")} | ${fmt("greedyCapacity")} | ${fmt("greedyLiquidity")} | ${fmt("greedyProduction")} | ${fmt("alternativeProduction")} |`);
   }
-  console.log("\n>>> DIAGNOSTIC FROZEN (P4.8.8S). No further routing-experiment changes. <<<");
+  console.log("\n>>> DIAGNOSTIC FROZEN (P4.8.8T). No further routing-experiment changes. <<<");
   console.log(`\nResults saved to ${OUTPUT_FILE}`);
 }
 

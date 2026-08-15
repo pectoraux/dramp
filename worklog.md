@@ -1165,3 +1165,36 @@ Stage Summary:
 - Alternative production = LOWER_BOUND (solver not proven exhaustive for 3+ offer multi-hop).
 - Binding constraint confirmed: LIQUIDITY INVENTORY SCARCITY. The gap aggCap→greedyLiq is 89pp (RANDOM), 93pp (CORRIDOR_FOCUSED), 53pp (BRIDGED). Capacity exists but destination liquidity is missing. The routing gain LB (D→D') is only 12.5pp/23.5pp/2.3pp — most of the loss is NOT addressable by router changes; it requires moving liquidity to where demand needs it.
 - Diagnostic FROZEN. No further routing-experiment changes. Next: inventory-allocation experiment.
+
+---
+Task ID: P4.8.8T-SeparatePhysicalFromEconomicCapacity
+Agent: main (Z.ai Code)
+Task: Separate aggregate physical capacity (rate-only denomination conversion) from aggregate economic capacity (full outputMultiplier including fees/incentives). Add adversarial tests. Re-run validators and 20-seed experiment.
+
+Work Log:
+- Renamed checkAggregateCapacityFeasible → checkAggregateEconomicCapacityFeasible (4.8.8S metric, now explicitly labelled as including fee/incentive economics).
+- Added checkAggregatePhysicalCapacityFeasible: propagates amount through hops using ONLY the FX rate (minimum rate per hop). Ignores fees, incentives, liquidity, risk, status, min/max. This is the purest physical-capacity metric — "is there enough raw denomination capacity?"
+- Updated RunMetrics: added aggregatePhysicalCapacityReachabilityPct, renamed aggregateCapacityReachabilityPct → aggregateEconomicCapacityReachabilityPct.
+- Updated DemandFeasibility + evaluateDemandFeasibility to compute both metrics.
+- Updated extractMetrics to track both volumes and return both percentages.
+- Updated printResults: 7-column frozen table (structural | physCap | econCap | greedyCap | greedyLiq | greedyProd | altProd LB). Added economic-conversion-loss decomposition (B-phys→B-econ).
+- Wrote 8 adversarial test cases proving physical ≠ economic when economics are non-trivial:
+  - High-fee (500bps): economic TRUE, physical FALSE (fee shrinks propagated amount below hop2 cap).
+  - High-incentive (500bps): physical TRUE, economic FALSE (incentive grows propagated amount above hop2 cap).
+  - These prove the two metrics produce different results — the separation is meaningful.
+- Updated all 3 validators for new metric names. All PASS:
+  - Monotonicity: 0 violations (structural >= aggEconCap >= greedyCap >= greedyLiq >= greedyProd).
+  - Approximation: 0 cap hits, 0 disagreements (physical + economic both exact).
+  - Sampling: 0 error (both metrics lossless at max 4 demands/corridor).
+- Re-ran 20-seed × 3-topology experiment at density=100 (60 runs).
+
+Stage Summary:
+- FROZEN ROUTING DIAGNOSTIC (P4.8.8T) — density=100, 20 seeds, medians (10th–90th pctile):
+  | topology | structural | physCap | econCap | greedyCap | greedyLiq | greedyProd | altProd LB |
+  | RANDOM | 100.0 | 100.0 | 100.0 | 100.0 | 11.2 | 6.5 | 19.0 |
+  | CORRIDOR_FOCUSED | 100.0 | 100.0 | 100.0 | 100.0 | 6.9 | 4.4 | 27.9 |
+  | BRIDGED | 100.0 | 62.0 | 62.0 | 57.5 | 4.1 | 2.8 | 5.1 |
+- Key finding: physical == economic capacity at these experiment parameters (simulator fees/incentives are small enough that min outputMultiplier ≈ min rate). The adversarial tests prove they CAN diverge with extreme economics, but in practice the conversion-economics loss (B-phys→B-econ) is 0.0 pp for all topologies.
+- Path-cap acceptance: PASS (0 hits, max 313 paths, cap 10000).
+- Monotonicity: holds for all 3 topologies.
+- Diagnostic FROZEN (P4.8.8T). No further routing-experiment changes. Next: inventory-allocation experiment.

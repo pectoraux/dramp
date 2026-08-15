@@ -236,17 +236,30 @@ async function main() {
   assert(expSrc.includes("Simulator (engine-faithful.ts"), "Adapter documents simulator semantics");
   assert(expSrc.includes("Production (collateral.ts"), "Adapter documents production semantics");
 
-  // 12. P4.8.8S — Frozen diagnostic integrity
-  console.log("\n== 12. Frozen diagnostic integrity (P4.8.8S) ==");
-  // (4.8.8S) Aggregate capacity: FX-propagated physical capacity.
-  // Propagates the amount through computeHopOutput using the MIN outputMultiplier
-  // per hop — this fixes the 4.8.8R constant-amount unit-mismatch bug and
-  // guarantees the monotonicity invariant (greedyCap => aggCap).
-  assert(expSrc.includes("PHYSICAL capacity with FX propagation"), "Aggregate capacity documents FX propagation");
-  assert(expSrc.includes("minOutputMultiplier"), "Aggregate capacity tracks minimum outputMultiplier for propagation");
-  assert(expSrc.includes("sum(usableCapacity"), "Aggregate capacity sums usable capacity across offers");
-  assert(expSrc.includes("greedyCapacity feasible  =>  aggregateCapacity feasible"), "Aggregate capacity documents the monotonicity invariant");
-  assert(expSrc.includes("UNIT MISMATCH"), "Aggregate capacity documents the 4.8.8R unit-mismatch bug it fixes");
+  // 12. P4.8.8T — Frozen diagnostic integrity (physical vs economic capacity)
+  console.log("\n== 12. Frozen diagnostic integrity (P4.8.8T) ==");
+  // (4.8.8T) Aggregate PHYSICAL capacity: rate-only denomination conversion.
+  assert(expSrc.includes("Aggregate PHYSICAL capacity"), "Experiment defines aggregatePhysicalCapacity");
+  assert(expSrc.includes("denomination conversion ONLY"), "Physical capacity documents rate-only propagation");
+  assert(expSrc.includes("RATE-ONLY (not outputMultiplier)"), "Physical capacity documents why rate-only (not outputMultiplier)");
+  assert(expSrc.includes("export function checkAggregatePhysicalCapacityFeasible"), "checkAggregatePhysicalCapacityFeasible is exported");
+  // (4.8.8T) Aggregate ECONOMIC capacity: full outputMultiplier (fees + incentives).
+  assert(expSrc.includes("Aggregate ECONOMIC capacity"), "Experiment defines aggregateEconomicCapacity");
+  assert(expSrc.includes("conversion economics (fees + incentives + FX rate)"), "Economic capacity documents full conversion terms");
+  assert(expSrc.includes("export function checkAggregateEconomicCapacityFeasible"), "checkAggregateEconomicCapacityFeasible is exported");
+  assert(expSrc.includes("greedyCapacity feasible  =>  aggregateEconomicCapacity feasible"), "Economic capacity documents the monotonicity invariant");
+  assert(expSrc.includes("UNIT MISMATCH"), "Economic capacity documents the 4.8.8R unit-mismatch bug it fixes");
+  // RunMetrics has both fields.
+  assert(expSrc.includes("aggregatePhysicalCapacityReachabilityPct"), "RunMetrics has aggregatePhysicalCapacityReachabilityPct");
+  assert(expSrc.includes("aggregateEconomicCapacityReachabilityPct"), "RunMetrics has aggregateEconomicCapacityReachabilityPct");
+  assert(!expSrc.includes("aggregateCapacityReachabilityPct:"), "Old aggregateCapacityReachabilityPct field removed from RunMetrics");
+  // DemandFeasibility has both fields.
+  assert(expSrc.includes("aggregatePhysicalCapacity: boolean"), "DemandFeasibility has aggregatePhysicalCapacity");
+  assert(expSrc.includes("aggregateEconomicCapacity: boolean"), "DemandFeasibility has aggregateEconomicCapacity");
+  assert(!expSrc.includes("aggregateCapacity: boolean"), "Old aggregateCapacity field removed from DemandFeasibility");
+  // evaluateDemandFeasibility calls both.
+  assert(expSrc.includes("checkAggregatePhysicalCapacityFeasible(path, amount, world)"), "evaluateDemandFeasibility calls physical capacity");
+  assert(expSrc.includes("checkAggregateEconomicCapacityFeasible(path, amount, world)"), "evaluateDemandFeasibility calls economic capacity");
   // Path-cache cap tracking (the fix for the broken 4.8.8R tracking).
   assert(expSrc.includes("pathCapHitCount") && expSrc.includes("maxPathsObserved"), "RunMetrics carries path-cap tracking fields");
   assert(expSrc.includes("cache.pathCapHitCount = pathCapHitCount"), "buildPathCache writes cap stats onto the cache object");
@@ -255,7 +268,7 @@ async function main() {
   // Per-demand evaluator (DRY: shared by extractMetrics + validators).
   assert(expSrc.includes("export function evaluateDemandFeasibility"), "Exports evaluateDemandFeasibility helper");
   assert(expSrc.includes("export interface DemandFeasibility"), "Exports DemandFeasibility interface");
-  assert(expSrc.includes("structural: boolean") && expSrc.includes("aggregateCapacity: boolean"), "DemandFeasibility has structural + aggregateCapacity flags");
+  assert(expSrc.includes("structural: boolean") && expSrc.includes("aggregatePhysicalCapacity: boolean"), "DemandFeasibility has structural + aggregatePhysicalCapacity flags");
   // Demand-sampling override (for validation).
   assert(expSrc.includes("demandSampleCap"), "extractMetrics accepts demandSampleCap override");
   assert(expSrc.includes("export interface ExtractMetricsOpts"), "Exports ExtractMetricsOpts interface");
@@ -264,13 +277,15 @@ async function main() {
   assert(expSrc.includes("pathCapHitCount === 0"), "Output documents the pathCapHitCount === 0 acceptance criterion");
   // Frozen table.
   assert(expSrc.includes("FROZEN Routing Diagnostic"), "printResults emits the FROZEN diagnostic table");
-  assert(expSrc.includes("DIAGNOSTIC FROZEN (P4.8.8S)"), "Output marks the diagnostic as frozen");
+  assert(expSrc.includes("DIAGNOSTIC FROZEN (P4.8.8T)"), "Output marks the diagnostic as frozen (P4.8.8T)");
   assert(expSrc.includes("alternative production LB"), "Frozen table labels alternative production as LOWER BOUND");
+  assert(expSrc.includes("aggregate physical capacity"), "Frozen table includes aggregate physical capacity column");
+  assert(expSrc.includes("aggregate economic capacity"), "Frozen table includes aggregate economic capacity column");
   // alternativeProduction still labelled LOWER_BOUND (not exact).
   assert(expSrc.includes("LOWER_BOUND") || expSrc.includes("LOWER BOUND"), "Alternative production labelled as lower bound (not exact)");
 
   console.log(`\n========================================`);
-  console.log(`  P4.8.8S Integrity: Passed: ${passed}  |  Failed: ${failed}`);
+  console.log(`  P4.8.8T Integrity: Passed: ${passed}  |  Failed: ${failed}`);
   console.log(`========================================`);
   if (failed > 0) {
     console.log("\nFailures:");

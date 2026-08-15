@@ -874,47 +874,96 @@ export function productionUsable(prod: ProductionCapacity): number {
 // instead of dstLiquidity < hopResult.output) that was fixed in the staged version
 // but never removed from the legacy one. Keeping both was dangerous.
 
-// (Prompt 4.8.8S) Aggregate capacity check — PHYSICAL capacity with FX propagation.
-//
-// STILL IGNORES: liquidity, risk, provider status, min/max constraints.
-// (These are checked by the later stages — greedyLiquidity, greedyProduction.)
+// (Prompt 4.8.8T) Aggregate PHYSICAL capacity — denomination conversion ONLY.
 //
 // Answers: Is there sufficient aggregate usable capacity on every hop to carry
-// the demand, accounting for the PHYSICAL FX conversion at each hop?
+// the demand, accounting ONLY for the physical denomination conversion (FX rate)?
+//
+// IGNORES: liquidity, risk, provider status, min/max, AND economic conversion
+// terms (fees, incentives). This is the purest physical-capacity metric.
 //
 // For each hop:
 //   1. sum(usableCapacity across offers with usable > 0) >= currentAmount
-//   2. Propagate currentAmount to the next hop via the MINIMUM outputMultiplier
-//      (the most favorable conversion among usable offers).
+//   2. Propagate currentAmount to the next hop via the MINIMUM rate (most
+//      conservative denomination conversion among usable offers).
 //
-// WHY FX PROPAGATION IS REQUIRED (4.8.8S fix for the 4.8.8R constant-amount bug):
-//   The 4.8.8R definition kept the amount CONSTANT across hops. But on a
-//   multi-hop path (e.g. SGD:SG → USDC:GLOBAL → INR:IN), hop 1's capacity is
-//   denominated in SGD and hop 2's in USDC. The constant-amount check compared
-//   37,678 SGD against hop 2's USDC capacity — a UNIT MISMATCH. When the FX
-//   rate < 1 (e.g. SGD→USDC at ~0.74), greedy's propagated amount shrinks
-//   (27,882 USDC) and succeeds on hop 2, but the constant-amount check (37,678)
-//   fails. This violated the monotonicity invariant (greedyCap=true, aggCap=false).
+// WHY RATE-ONLY (not outputMultiplier):
+//   The FX rate is a PHYSICAL conversion — 1 USD physically becomes N NGN.
+//   Fees and incentives are ECONOMIC adjustments — they reduce/increase the
+//   output within the destination denomination, but they don't change the
+//   denomination itself. Mixing them into a "physical capacity" metric (as 4.8.8S
+//   did) conflates physical scarcity with economic cost. This metric isolates
+//   the physical question: "Is there enough raw denomination capacity?"
 //
-// WHY THE MINIMUM outputMultiplier:
-//   The greedy assignment picks specific offers and propagates their combined
-//   output. For the invariant greedyCap → aggCap to hold, aggregate's propagated
-//   amount must be <= greedy's on every hop. Since every offer's outputMultiplier
-//   >= min(outputMultiplier), the greedy output = Σ(aᵢ·multᵢ) >= Σ(aᵢ)·minMult >=
-//   amount·minMult. So propagating via minMult guarantees aggregate's downstream
-//   amount <= greedy's downstream amount, preserving:
+// WHY THE MINIMUM rate:
+//   Different offers on the same hop may have different rates (e.g. USD→NGN at
+//   1500 vs 1495). Using the minimum rate gives the smallest propagated amount,
+//   making this the most conservative physical-capacity check.
 //
-//     greedyCapacity feasible  =>  aggregateCapacity feasible
+// RELATIONSHIP TO ECONOMIC CAPACITY:
+//   There is NO guaranteed ordering between physical and economic capacity.
+//   When net fees > net incentives (typical), economic output < physical output,
+//   so economic capacity is harder → aggregatePhysicalCapacity >= aggregateEconomicCapacity.
+//   When net incentives > net fees (rare), the reverse holds. Both are valid
+//   independent diagnostics.
+export function checkAggregatePhysicalCapacityFeasible(
+  path: PathStep<SimOffer>[],
+  amount: number,
+  world: SimWorld,
+): boolean {
+  let currentAmount = amount;
+  for (let i = 0; i < path.length; i++) {
+    const step = path[i];
+    let totalUsableCap = 0;
+    let minRate = Infinity;
+    let minRateOffer: SimOffer | null = null;
+    for (const o of step.edges) {
+      const prodCap = toProductionCapacity({ availableCapacity: o.availableCapacity, reservedCapacity: o.reservedCapacity });
+      const usableCap = prodCap.availableCapacity - prodCap.reservedCapacity;
+      if (usableCap > 0) {
+        totalUsableCap += usableCap;
+        if (o.rate < minRate) {
+          minRate = o.rate;
+          minRateOffer = o;
+        }
+      }
+    }
+    if (totalUsableCap < currentAmount) return false;
+    // (Prompt 4.8.8T) Physical propagation: rate ONLY, no fees or incentives.
+    if (i < path.length - 1 && minRateOffer) {
+      currentAmount = currentAmount * minRateOffer.rate;
+    }
+  }
+  return true;
+}
+
+// (Prompt 4.8.8S, renamed 4.8.8T) Aggregate ECONOMIC capacity — capacity after
+// conversion economics (fees + incentives + FX rate).
 //
-//   This makes aggregate a provable UPPER BOUND on greedy. The gap
-//   (aggregate − greedy) measures "capacity exists but greedy coverAmount
-//   can't assign it" (e.g. min-amount fragmentation).
+// STILL IGNORES: liquidity, risk, provider status, min/max constraints.
 //
-// NOTE: fees and incentives ARE included in the outputMultiplier because they
-// affect the physical output amount (computeHopOutput). This is NOT an economic
-// cost filter — it's the same physical conversion greedy uses. Risk/status/min
-// remain ignored here.
-export function checkAggregateCapacityFeasible(
+// This is the metric that preserves the monotonicity invariant:
+//
+//   greedyCapacity feasible  =>  aggregateEconomicCapacity feasible
+//
+// PROOF: greedy's output = Σ(aᵢ × multᵢ) where multᵢ = (1-feeᵢ)×rateᵢ×(1+incᵢ).
+//   Since every multᵢ >= min(mult), greedy output >= Σ(aᵢ)×minMult >= amount×minMult.
+//   So propagating via minMult guarantees aggregate's downstream amount <= greedy's
+//   downstream amount, preserving greedyCap → aggEconCap.
+//
+// The gap (aggregateEconomicCapacity − greedyCapacity) measures "capacity exists
+// but greedy coverAmount can't assign it" (e.g. min-amount fragmentation).
+//
+// (4.8.8T) This metric was renamed from checkAggregateCapacityFeasible to make
+// explicit that it includes economic conversion terms (fees, incentives), not
+// just physical denomination conversion. The separate aggregatePhysicalCapacity
+// metric isolates the physical question.
+//
+// HISTORY: The 4.8.8R "constant amount" definition had a cross-hop UNIT MISMATCH
+// bug (compared SGD on hop1 vs USDC on hop2). The 4.8.8S fix propagated via
+// min outputMultiplier. The 4.8.8T split separates physical (rate-only) from
+// economic (full outputMultiplier) so the two questions are answered independently.
+export function checkAggregateEconomicCapacityFeasible(
   path: PathStep<SimOffer>[],
   amount: number,
   world: SimWorld,
@@ -926,14 +975,10 @@ export function checkAggregateCapacityFeasible(
     let minOutputMultiplier = Infinity;
     let minMultOffer: SimOffer | null = null;
     for (const o of step.edges) {
-      // (Prompt 4.8.8R) Ignore provider status — this is pure capacity.
-      // Even inactive providers' capacity counts as physical capacity.
-      // The capacity-semantics adapter still applies (simulator vs production).
       const prodCap = toProductionCapacity({ availableCapacity: o.availableCapacity, reservedCapacity: o.reservedCapacity });
       const usableCap = prodCap.availableCapacity - prodCap.reservedCapacity;
       if (usableCap > 0) {
         totalUsableCap += usableCap;
-        // Track the minimum outputMultiplier for propagation (4.8.8S).
         const mult = (1 - o.feeBps / 10000) * o.rate * (1 + (o.incentiveBps ?? 0) / 10000);
         if (mult < minOutputMultiplier) {
           minOutputMultiplier = mult;
@@ -942,9 +987,6 @@ export function checkAggregateCapacityFeasible(
       }
     }
     if (totalUsableCap < currentAmount) return false;
-    // (Prompt 4.8.8S) Propagate the amount through FX using the minimum
-    // outputMultiplier. This preserves the greedyCap → aggCap invariant
-    // (see proof above) and fixes the cross-hop unit-mismatch bug.
     if (i < path.length - 1 && minMultOffer) {
       const hopResult = computeHopOutput(currentAmount, {
         feeBps: minMultOffer.feeBps, rate: minMultOffer.rate,
@@ -959,10 +1001,11 @@ export function checkAggregateCapacityFeasible(
 // ---- Metrics ----
 export interface RunMetrics {
   executionAttemptRate: number;
-  // Five-level reachability ladder (each stricter than the last).
+  // Seven-level reachability ladder (each stage adds a constraint).
   assetReachablePct: number;                    // Abstract asset path (ignores countries)
-  corridorReachablePct: number;                 // Asset + country match (4-hop graph)
-  aggregateCapacityReachabilityPct: number;     // B-physical: sufficient aggregate capacity exists (not greedy)
+  corridorReachablePct: number;                 // Asset + country match (4-hop graph) = structural
+  aggregatePhysicalCapacityReachabilityPct: number; // B-phys: rate-only denomination capacity (no fees/incentives)
+  aggregateEconomicCapacityReachabilityPct: number;  // B-econ: + conversion economics (fees/incentives, preserves greedyCap)
   capacityExecutableReachabilityPct: number;    // B-greedy: coverAmount succeeds
   liquidityExecutableReachabilityPct: number;   // C: + dest liquidity (greedy coverAmount, output-aware)
   inventoryExecutableReachabilityPct: number;   // C': SOME assignment has liquidity (ignores risk)
@@ -1086,23 +1129,23 @@ export function buildPathCache(world: SimWorld, pathCap: number = MAX_PATHS_PER_
   return cache;
 }
 
-// (Prompt 4.8.8S) Per-demand feasibility-ladder evaluation.
+// (Prompt 4.8.8S/4.8.8T) Per-demand feasibility-ladder evaluation.
 // Extracted from extractMetrics so that the SAME evaluation path is used by:
 //   - extractMetrics (aggregate demand-weighted accumulation)
 //   - the monotonicity validator (per-demand invariant check)
 //   - the approximation / sampling validators
 // No duplicate formula: it calls the SAME shared staged checkers
-// (checkPathFeasibilityStaged + checkAggregateCapacityFeasible) that the
-// experiment has used since 4.8.8R. Refactoring only restructures the loop,
-// it does not change any feasibility rule.
+// (checkPathFeasibilityStaged + checkAggregatePhysicalCapacityFeasible +
+//  checkAggregateEconomicCapacityFeasible) that the experiment has used.
 export interface DemandFeasibility {
-  structural: boolean;            // A: at least one path exists (any tier)
-  aggregateCapacity: boolean;     // Bp: pure physical capacity (sum usable >= amount)
-  greedyCapacity: boolean;        // Bg: coverAmount succeeds (greedy assignment)
-  greedyLiquidity: boolean;       // C:  + destination liquidity (output-aware, greedy)
-  inventory: boolean;             // C': SOME assignment has liquidity (ignores risk)
-  greedyProduction: boolean;      // D:  + risk ceilings + min/max + status (greedy)
-  alternativeProduction: boolean; // D': SOME assignment satisfies ALL constraints (LOWER_BOUND)
+  structural: boolean;                  // A: at least one path exists (any tier)
+  aggregatePhysicalCapacity: boolean;   // B-phys: rate-only denomination capacity
+  aggregateEconomicCapacity: boolean;   // B-econ: + conversion economics (preserves greedyCap)
+  greedyCapacity: boolean;              // B-greedy: coverAmount succeeds (greedy assignment)
+  greedyLiquidity: boolean;             // C:  + destination liquidity (output-aware, greedy)
+  inventory: boolean;                   // C': SOME assignment has liquidity (ignores risk)
+  greedyProduction: boolean;            // D:  + risk ceilings + min/max + status (greedy)
+  alternativeProduction: boolean;       // D': SOME assignment satisfies ALL constraints (LOWER_BOUND)
   hasDirect: boolean;
   hasSplitDirect: boolean;
   hasTwoHop: boolean;
@@ -1122,7 +1165,8 @@ export function evaluateDemandFeasibility(
   needBreakdown: boolean,
 ): DemandFeasibility {
   let capOK = false;
-  let aggCapOK = false;
+  let aggPhysCapOK = false;
+  let aggEconCapOK = false;
   let liqOK = false;
   let invOK = false;
   let prodOK = false;
@@ -1134,15 +1178,15 @@ export function evaluateDemandFeasibility(
 
   const tiers: PathStep<SimOffer>[][][] = [hop1Paths, hop2Paths, hop3Paths, hop4Paths];
   for (let t = 0; t < tiers.length; t++) {
-    // Skip remaining tiers once both prod + altProd are satisfied (total mode),
-    // or once we have no reason to keep scanning (full mode scans everything
-    // reachable until the composition flags are all set).
     if (!(needBreakdown || !prodOK || !altProdOK)) break;
     for (const path of tiers[t]) {
       const staged = checkPathFeasibilityStaged(path, amount, riskTolerance, world, saRiskCache, cpRiskCache);
       if (!staged) continue;
       if (staged.capacityFeasible) capOK = true;
-      if (!aggCapOK && checkAggregateCapacityFeasible(path, amount, world)) aggCapOK = true;
+      // (4.8.8T) Both capacity metrics — physical (rate-only) and economic
+      // (full outputMultiplier, preserves greedyCap invariant).
+      if (!aggPhysCapOK && checkAggregatePhysicalCapacityFeasible(path, amount, world)) aggPhysCapOK = true;
+      if (!aggEconCapOK && checkAggregateEconomicCapacityFeasible(path, amount, world)) aggEconCapOK = true;
       if (staged.liquidityFeasible) liqOK = true;
       if (staged.inventoryFeasible) invOK = true;
       if (staged.productionFeasible) {
@@ -1167,7 +1211,8 @@ export function evaluateDemandFeasibility(
   const structural = hop1Paths.length + hop2Paths.length + hop3Paths.length + hop4Paths.length > 0;
   return {
     structural,
-    aggregateCapacity: aggCapOK,
+    aggregatePhysicalCapacity: aggPhysCapOK,
+    aggregateEconomicCapacity: aggEconCapOK,
     greedyCapacity: capOK,
     greedyLiquidity: liqOK,
     inventory: invOK,
@@ -1305,7 +1350,8 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
   let assetReachableVolume = 0;
   let corridorReachableVolume = 0;
   let capacityExecutableVolume = 0;
-  let aggregateCapacityVolume = 0;
+  let aggregatePhysicalCapacityVolume = 0;
+  let aggregateEconomicCapacityVolume = 0;
   let liqExecutableVolume = 0;
   let inventoryExecutableVolume = 0;
   let prodExecutableVolume = 0;
@@ -1408,7 +1454,8 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
     // before comparing against the provider's balance.
 
     let capacityExecutableWeight = 0;
-    let aggregateCapacityWeight = 0;
+    let aggregatePhysicalCapacityWeight = 0;
+    let aggregateEconomicCapacityWeight = 0;
     let liqExecutableWeight = 0;
     let inventoryExecutableWeight = 0;
     let prodExecutableWeight = 0;
@@ -1456,7 +1503,8 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
         world, saRiskCache, cpRiskCache, needBreakdown,
       );
       if (feas.greedyCapacity) capacityExecutableWeight += demand.weight;
-      if (feas.aggregateCapacity) aggregateCapacityWeight += demand.weight;
+      if (feas.aggregatePhysicalCapacity) aggregatePhysicalCapacityWeight += demand.weight;
+      if (feas.aggregateEconomicCapacity) aggregateEconomicCapacityWeight += demand.weight;
       if (feas.greedyLiquidity) liqExecutableWeight += demand.weight;
       if (feas.inventory) inventoryExecutableWeight += demand.weight;
       if (feas.greedyProduction) {
@@ -1471,7 +1519,8 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
 
     // Amount-weighted reachability for this corridor.
     if (capacityExecutableWeight > 0) capacityExecutableVolume += capacityExecutableWeight;
-    if (aggregateCapacityWeight > 0) aggregateCapacityVolume += aggregateCapacityWeight;
+    if (aggregatePhysicalCapacityWeight > 0) aggregatePhysicalCapacityVolume += aggregatePhysicalCapacityWeight;
+    if (aggregateEconomicCapacityWeight > 0) aggregateEconomicCapacityVolume += aggregateEconomicCapacityWeight;
     if (liqExecutableWeight > 0) { liqExecutableReachablePairs++; liqExecutableVolume += liqExecutableWeight; }
     if (inventoryExecutableWeight > 0) inventoryExecutableVolume += inventoryExecutableWeight;
     if (prodExecutableWeight > 0) { prodExecutableReachablePairs++; prodExecutableVolume += prodExecutableWeight; }
@@ -1484,7 +1533,8 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
 
   const assetReachablePct = totalDemandWeight > 0 ? (assetReachableVolume / totalDemandWeight) * 100 : 0;
   const corridorReachablePct = totalDemandWeight > 0 ? (corridorReachableVolume / totalDemandWeight) * 100 : 0;
-  const aggCapPct = totalDemandWeight > 0 ? (aggregateCapacityVolume / totalDemandWeight) * 100 : 0;
+  const aggPhysCapPct = totalDemandWeight > 0 ? (aggregatePhysicalCapacityVolume / totalDemandWeight) * 100 : 0;
+  const aggEconCapPct = totalDemandWeight > 0 ? (aggregateEconomicCapacityVolume / totalDemandWeight) * 100 : 0;
   const capExecutablePct = totalDemandWeight > 0 ? (capacityExecutableVolume / totalDemandWeight) * 100 : 0;
   const liqExecutablePct = totalDemandWeight > 0 ? (liqExecutableVolume / totalDemandWeight) * 100 : 0;
   const invExecutablePct = totalDemandWeight > 0 ? (inventoryExecutableVolume / totalDemandWeight) * 100 : 0;
@@ -1510,7 +1560,8 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
     executionAttemptRate: intents.length > 0 ? (intents.filter((i: any) => i.status === "COMPLETED" || i.status === "EXECUTING" || i.status === "FAILED").length / intents.length) * 100 : 0,
     assetReachablePct: Math.round(assetReachablePct * 100) / 100,
     corridorReachablePct: Math.round(corridorReachablePct * 100) / 100,
-    aggregateCapacityReachabilityPct: Math.round(aggCapPct * 100) / 100,
+    aggregatePhysicalCapacityReachabilityPct: Math.round(aggPhysCapPct * 100) / 100,
+    aggregateEconomicCapacityReachabilityPct: Math.round(aggEconCapPct * 100) / 100,
     capacityExecutableReachabilityPct: Math.round(capExecutablePct * 100) / 100,
     liquidityExecutableReachabilityPct: Math.round(liqExecutablePct * 100) / 100,
     inventoryExecutableReachabilityPct: Math.round(invExecutablePct * 100) / 100,
@@ -1756,13 +1807,14 @@ function printResults(results: Result[]) {
     console.log(`| ${r.density} | ${r.topology} | ${statsLabel(rp)} | ${statsLabel(tp)} | ${statsLabel(mr)} |`);
   }
 
-  // Conclusion: Final routing diagnostic (Prompt 4.8.8P)
-  console.log("\n### Conclusion: Final Routing Diagnostic (P4.8.8P)\n");
+  // Conclusion: Final routing diagnostic (Prompt 4.8.8T)
+  console.log("\n### Conclusion: Final Routing Diagnostic (P4.8.8T)\n");
   for (const topo of TOPOLOGIES) {
     const r100 = results.find(r => r.density === 100 && r.topology === topo);
     if (r100) {
       const medCorridor = percentile(r100.metrics.map(m => m.corridorReachablePct), 0.5);
-      const medAggCap = percentile(r100.metrics.map(m => m.aggregateCapacityReachabilityPct), 0.5);
+      const medAggPhys = percentile(r100.metrics.map(m => m.aggregatePhysicalCapacityReachabilityPct), 0.5);
+      const medAggEcon = percentile(r100.metrics.map(m => m.aggregateEconomicCapacityReachabilityPct), 0.5);
       const medCap = percentile(r100.metrics.map(m => m.capacityExecutableReachabilityPct), 0.5);
       const medLiq = percentile(r100.metrics.map(m => m.liquidityExecutableReachabilityPct), 0.5);
       const medInv = percentile(r100.metrics.map(m => m.inventoryExecutableReachabilityPct), 0.5);
@@ -1770,60 +1822,68 @@ function printResults(results: Result[]) {
       const medAltProd = percentile(r100.metrics.map(m => m.alternativeProductionExecutableReachabilityPct), 0.5);
       const medComp = percentile(r100.metrics.map(m => m.completionRate), 0.5);
 
-      const capacityGap = medAggCap - medCap;
+      const econConversionLoss = medAggPhys - medAggEcon;
+      const capacityAssignmentLoss = medAggEcon - medCap;
       const inventoryGap = medCap - medInv;
       const routingGainLowerBound = medAltProd - medProd;
-      const trueInventoryGap = medAggCap - medAltProd;
+      const trueInventoryGap = medAggEcon - medAltProd;
 
       console.log(`  ${topo} @ 100:`);
       console.log(`    Reachability ladder (demand-weighted %, medians):`);
-      console.log(`      A.  Structural (4-hop graph):     ${medCorridor.toFixed(1)}%`);
-      console.log(`      Bp. + Aggregate capacity:         ${medAggCap.toFixed(1)}%  (physical capacity exists)`);
-      console.log(`      Bg. + Greedy capacity:            ${medCap.toFixed(1)}%  (coverAmount assignment)`);
-      console.log(`      C.  + Greedy liquidity:           ${medLiq.toFixed(1)}%`);
-      console.log(`      C'. + Alt inventory (LOWER_BOUND): ${medInv.toFixed(1)}%`);
-      console.log(`      D.  + Greedy production:          ${medProd.toFixed(1)}%`);
-      console.log(`      D'. + Alt production (LOWER_BOUND):${medAltProd.toFixed(1)}%`);
+      console.log(`      A.   Structural (4-hop graph):      ${medCorridor.toFixed(1)}%`);
+      console.log(`      B-phys. + Aggregate physical cap:    ${medAggPhys.toFixed(1)}%  (rate-only denomination conversion)`);
+      console.log(`      B-econ. + Aggregate economic cap:    ${medAggEcon.toFixed(1)}%  (+ fees/incentives, preserves greedyCap)`);
+      console.log(`      Bg.  + Greedy capacity:              ${medCap.toFixed(1)}%  (coverAmount assignment)`);
+      console.log(`      C.   + Greedy liquidity:             ${medLiq.toFixed(1)}%`);
+      console.log(`      C'.  + Alt inventory (LOWER_BOUND):   ${medInv.toFixed(1)}%`);
+      console.log(`      D.   + Greedy production:            ${medProd.toFixed(1)}%`);
+      console.log(`      D'.  + Alt production (LOWER_BOUND):  ${medAltProd.toFixed(1)}%`);
       console.log(`    Decomposition (where demand is lost):`);
-      console.log(`      Structural loss:        ${(100 - medCorridor).toFixed(1)} pp`);
-      console.log(`      Capacity-assignment loss (Bp→Bg):  ${capacityGap.toFixed(1)} pp  (greedy coverAmount failure)`);
-      console.log(`      Inventory gap (Bg→C'):             ${inventoryGap.toFixed(1)} pp  (destination liquidity missing)`);
-      console.log(`      True inventory gap (Bp→D'):        ${trueInventoryGap.toFixed(1)} pp  (after alt routing)`);
-      console.log(`      Routing gain LOWER_BOUND (D→D'):   ${routingGainLowerBound.toFixed(1)} pp  (addressable by router change)`);
-      console.log(`    Completion (separate population):   ${medComp.toFixed(1)}%`);
+      console.log(`      Structural loss:              ${(100 - medCorridor).toFixed(1)} pp`);
+      console.log(`      Economic conversion loss (B-phys→B-econ): ${econConversionLoss.toFixed(1)} pp  (fees exceed incentives)`);
+      console.log(`      Capacity-assignment loss (B-econ→Bg):     ${capacityAssignmentLoss.toFixed(1)} pp  (greedy coverAmount failure)`);
+      console.log(`      Inventory gap (Bg→C'):                    ${inventoryGap.toFixed(1)} pp  (destination liquidity missing)`);
+      console.log(`      True inventory gap (B-econ→D'):           ${trueInventoryGap.toFixed(1)} pp  (after alt routing)`);
+      console.log(`      Routing gain LOWER_BOUND (D→D'):          ${routingGainLowerBound.toFixed(1)} pp  (addressable by router change)`);
+      console.log(`    Completion (separate population):    ${medComp.toFixed(1)}%`);
     }
   }
 
-  // (Prompt 4.8.8S) FINAL FROZEN TABLE — the strategic measurement.
-  // 6 columns: topology | structural | aggregate capacity | greedy capacity |
-  //            greedy liquidity | greedy production | alternative production LB
+  // (Prompt 4.8.8T) FINAL FROZEN TABLE — the strategic measurement.
+  // 7 columns: topology | structural | aggregate physical capacity |
+  //            aggregate economic capacity | greedy capacity | greedy liquidity |
+  //            greedy production | alternative production LB
   // Values are medians (10th–90th percentile) over 20 seeds at density=100.
-  // Monotonicity invariant: structural ≥ aggCap ≥ greedyCap ≥ greedyLiq ≥ greedyProd
+  // Invariant: structural ≥ aggregateEconomicCapacity ≥ greedyCapacity ≥ greedyLiquidity ≥ greedyProduction
   // (asserted per-demand by scripts/validate-4-8-8s-monotonicity.ts).
+  // aggregatePhysicalCapacity has NO guaranteed ordering vs economic (depends on
+  // net fee/incentive balance) — it's an independent diagnostic.
   // alternativeProduction is a LOWER_BOUND (solver is breakpoint-based, not
   // proven exhaustive for 3+ offer multi-hop splits).
   const lb = capAcceptable ? "" : "  [PATH-CAP HIT → LOWER BOUND]";
-  console.log("\n### Table F — FROZEN Routing Diagnostic (P4.8.8S) — density=100, 20 seeds\n");
+  console.log("\n### Table F — FROZEN Routing Diagnostic (P4.8.8T) — density=100, 20 seeds\n");
   console.log("Medians (10th–90th percentile). Demand-weighted % of reachable volume.");
-  console.log("Invariant: structural ≥ aggregateCapacity ≥ greedyCapacity ≥ greedyLiquidity ≥ greedyProduction");
+  console.log("Invariant: structural ≥ aggregateEconomicCapacity ≥ greedyCapacity ≥ greedyLiquidity ≥ greedyProduction");
+  console.log("aggregatePhysicalCapacity: independent diagnostic (rate-only, no guaranteed ordering vs economic).");
   console.log("alternativeProduction = LOWER_BOUND (solver not proven exhaustive for 3+ offer multi-hop).");
   if (lb) console.log(`WARNING: ${lb}`);
   console.log("");
-  console.log("| topology | structural | aggregate capacity | greedy capacity | greedy liquidity | greedy production | alternative production LB |");
-  console.log("| --- | --- | --- | --- | --- | --- | --- |");
+  console.log("| topology | structural | aggregate physical capacity | aggregate economic capacity | greedy capacity | greedy liquidity | greedy production | alternative production LB |");
+  console.log("| --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const topo of TOPOLOGIES) {
     const r100 = results.find(r => r.density === 100 && r.topology === topo);
     if (!r100) continue;
     const ms = r100.metrics;
     const s = statsLabel(ms.map(m => m.corridorReachablePct));
-    const ac = statsLabel(ms.map(m => m.aggregateCapacityReachabilityPct));
+    const apc = statsLabel(ms.map(m => m.aggregatePhysicalCapacityReachabilityPct));
+    const aec = statsLabel(ms.map(m => m.aggregateEconomicCapacityReachabilityPct));
     const gc = statsLabel(ms.map(m => m.capacityExecutableReachabilityPct));
     const gl = statsLabel(ms.map(m => m.liquidityExecutableReachabilityPct));
     const gp = statsLabel(ms.map(m => m.productionExecutableReachabilityPct));
     const ap = statsLabel(ms.map(m => m.alternativeProductionExecutableReachabilityPct));
-    console.log(`| ${topo} | ${s} | ${ac} | ${gc} | ${gl} | ${gp} | ${ap} |`);
+    console.log(`| ${topo} | ${s} | ${apc} | ${aec} | ${gc} | ${gl} | ${gp} | ${ap} |`);
   }
-  console.log("\n>>> DIAGNOSTIC FROZEN (P4.8.8S). No further routing-experiment changes. <<<");
+  console.log("\n>>> DIAGNOSTIC FROZEN (P4.8.8T). No further routing-experiment changes. <<<");
 }
 
 // Run only when executed directly (not when imported by tests).
