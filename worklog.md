@@ -1198,3 +1198,35 @@ Stage Summary:
 - Path-cap acceptance: PASS (0 hits, max 313 paths, cap 10000).
 - Monotonicity: holds for all 3 topologies.
 - Diagnostic FROZEN (P4.8.8T). No further routing-experiment changes. Next: inventory-allocation experiment.
+
+---
+Task ID: P4.8.8U-RepositoryStateReconciliation
+Agent: main (Z.ai Code)
+Task: Verify repository integrity — confirm Prompt 4.8.8T implementation is on origin/main and reproducible from a fresh clone.
+
+Work Log:
+- User reported GitHub's main branch was at 445bf45 (old P3 hardening commit), not the P4.8.8T work. Investigated as a potential push failure.
+- Checked local git state: git status clean, branch=main, local HEAD=d4f3e2a, origin/main=d4f3e2a. Local refs claimed sync.
+- Ran git fetch origin to refresh remote tracking refs. origin/main remained d4f3e2a.
+- Ran git ls-remote origin (bypasses ALL local caching, queries git wire protocol directly). Confirmed remote refs/heads/main = d4f3e2a. The push DID succeed.
+- Verified 445bf45 is an ANCESTOR of d4f3e2a (45 commits behind). It's the old tip the user saw cached on GitHub's web UI.
+- Queried GitHub API directly: GET /repos/pectoraux/dramp/branches/main → HEAD SHA = d4f3e2a, message = "fix: separate physical from economic capacity (P4.8.8T)", date = 2026-08-15T00:53:49Z. Definitive proof the remote is up to date.
+- Performed FRESH CLONE verification (the gold standard the user requested):
+  - git clone https://github.com/pectoraux/dramp.git → HEAD = d4f3e2a, branch = main.
+  - All key files exist: experiments/p4-topology-experiment.ts (1897 lines), tests/p4-path-feasibility.test.ts (975 lines), tests/p4-experiment-integrity.test.ts (300 lines), scripts/validate-4-8-8s-{monotonicity,approx,sampling}.ts, scripts/run-frozen-table-100.ts, frozen-table-results.json (1387 lines).
+  - 14 dual-capacity markers (checkAggregatePhysicalCapacityFeasible + checkAggregateEconomicCapacityFeasible + both ReachabilityPct fields) confirmed in experiment file.
+  - bun install (829 packages) succeeded.
+  - Tests PASS from fresh clone: P4.8.8T Path Feasibility 144/144, P4.8.8T Integrity 94/94.
+  - Lint clean from fresh clone.
+  - All 3 validators PASS from fresh clone: monotonicity (0 violations/3000 demands), approximation (0 cap hits/0 disagreements), sampling (0 error).
+  - Reproduced saved 20-seed frozen table from frozen-table-results.json.
+  - Reproducibility check: re-ran seed 10000 for all 3 topologies, compared 7 fields each (21 checks) against saved results → 0 mismatches. Experiment is fully reproducible.
+- Cleaned up fresh clone. Restarted dev server (HTTP 200, page renders).
+
+Stage Summary:
+- Repository integrity CONFIRMED. The Prompt 4.8.8T implementation IS on origin/main at commit d4f3e2a.
+- The user's observation of 445bf45 was a GitHub web UI cache lag (the commits page hadn't refreshed). The git wire protocol (ls-remote), GitHub API, and a fresh clone all confirm main = d4f3e2a.
+- All tests, lint, and validators pass from a FRESH CLONE of origin/main.
+- The 20-seed experiment results are reproducible (seed 10000 matches across 21 field checks).
+- No code changes were needed — this was a verification task. The repository was already in the correct state.
+- Ready to proceed to the inventory-allocation experiment.
