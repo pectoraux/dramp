@@ -60,3 +60,6 @@ server.log
 
 # database (local sqlite, if any)
 /db/
+tool-results/,
+experiment-4-8-8s-output.txt
+frozen-table-output.txt

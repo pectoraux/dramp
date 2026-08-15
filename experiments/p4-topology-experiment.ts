@@ -874,39 +874,84 @@ export function productionUsable(prod: ProductionCapacity): number {
 // instead of dstLiquidity < hopResult.output) that was fixed in the staged version
 // but never removed from the legacy one. Keeping both was dangerous.
 
-// (Prompt 4.8.8R) PURE aggregate capacity check.
-// Ignores: liquidity, risk, provider status, fees, rates, incentives,
-// downstream FX economics, min/max constraints.
+// (Prompt 4.8.8S) Aggregate capacity check — PHYSICAL capacity with FX propagation.
 //
-// Answers ONE question: Is there sufficient aggregate usable capacity
-// to cover the demand amount at every hop?
+// STILL IGNORES: liquidity, risk, provider status, min/max constraints.
+// (These are checked by the later stages — greedyLiquidity, greedyProduction.)
 //
-// For each hop: sum(usableCapacity across all offers) >= amount.
-// The amount is NOT propagated through FX — it stays constant across hops.
-// This is a pure physical-capacity diagnostic.
+// Answers: Is there sufficient aggregate usable capacity on every hop to carry
+// the demand, accounting for the PHYSICAL FX conversion at each hop?
 //
-// INVARIANT: If greedy coverAmount succeeds (capacityFeasible=true), then
-// aggregateCapacityFeasible MUST be true, because coverAmount's assignment
-// is a valid allocation that uses a subset of the available capacity.
-// Therefore: aggregateCapacity >= greedyCapacity always holds.
+// For each hop:
+//   1. sum(usableCapacity across offers with usable > 0) >= currentAmount
+//   2. Propagate currentAmount to the next hop via the MINIMUM outputMultiplier
+//      (the most favorable conversion among usable offers).
+//
+// WHY FX PROPAGATION IS REQUIRED (4.8.8S fix for the 4.8.8R constant-amount bug):
+//   The 4.8.8R definition kept the amount CONSTANT across hops. But on a
+//   multi-hop path (e.g. SGD:SG → USDC:GLOBAL → INR:IN), hop 1's capacity is
+//   denominated in SGD and hop 2's in USDC. The constant-amount check compared
+//   37,678 SGD against hop 2's USDC capacity — a UNIT MISMATCH. When the FX
+//   rate < 1 (e.g. SGD→USDC at ~0.74), greedy's propagated amount shrinks
+//   (27,882 USDC) and succeeds on hop 2, but the constant-amount check (37,678)
+//   fails. This violated the monotonicity invariant (greedyCap=true, aggCap=false).
+//
+// WHY THE MINIMUM outputMultiplier:
+//   The greedy assignment picks specific offers and propagates their combined
+//   output. For the invariant greedyCap → aggCap to hold, aggregate's propagated
+//   amount must be <= greedy's on every hop. Since every offer's outputMultiplier
+//   >= min(outputMultiplier), the greedy output = Σ(aᵢ·multᵢ) >= Σ(aᵢ)·minMult >=
+//   amount·minMult. So propagating via minMult guarantees aggregate's downstream
+//   amount <= greedy's downstream amount, preserving:
+//
+//     greedyCapacity feasible  =>  aggregateCapacity feasible
+//
+//   This makes aggregate a provable UPPER BOUND on greedy. The gap
+//   (aggregate − greedy) measures "capacity exists but greedy coverAmount
+//   can't assign it" (e.g. min-amount fragmentation).
+//
+// NOTE: fees and incentives ARE included in the outputMultiplier because they
+// affect the physical output amount (computeHopOutput). This is NOT an economic
+// cost filter — it's the same physical conversion greedy uses. Risk/status/min
+// remain ignored here.
 export function checkAggregateCapacityFeasible(
   path: PathStep<SimOffer>[],
   amount: number,
   world: SimWorld,
 ): boolean {
+  let currentAmount = amount;
   for (let i = 0; i < path.length; i++) {
     const step = path[i];
     let totalUsableCap = 0;
+    let minOutputMultiplier = Infinity;
+    let minMultOffer: SimOffer | null = null;
     for (const o of step.edges) {
       // (Prompt 4.8.8R) Ignore provider status — this is pure capacity.
       // Even inactive providers' capacity counts as physical capacity.
       // The capacity-semantics adapter still applies (simulator vs production).
       const prodCap = toProductionCapacity({ availableCapacity: o.availableCapacity, reservedCapacity: o.reservedCapacity });
       const usableCap = prodCap.availableCapacity - prodCap.reservedCapacity;
-      if (usableCap > 0) totalUsableCap += usableCap;
+      if (usableCap > 0) {
+        totalUsableCap += usableCap;
+        // Track the minimum outputMultiplier for propagation (4.8.8S).
+        const mult = (1 - o.feeBps / 10000) * o.rate * (1 + (o.incentiveBps ?? 0) / 10000);
+        if (mult < minOutputMultiplier) {
+          minOutputMultiplier = mult;
+          minMultOffer = o;
+        }
+      }
     }
-    if (totalUsableCap < amount) return false;
-    // Amount stays constant — no FX propagation in pure capacity check.
+    if (totalUsableCap < currentAmount) return false;
+    // (Prompt 4.8.8S) Propagate the amount through FX using the minimum
+    // outputMultiplier. This preserves the greedyCap → aggCap invariant
+    // (see proof above) and fixes the cross-hop unit-mismatch bug.
+    if (i < path.length - 1 && minMultOffer) {
+      const hopResult = computeHopOutput(currentAmount, {
+        feeBps: minMultOffer.feeBps, rate: minMultOffer.rate,
+        incentiveBps: minMultOffer.incentiveBps ?? 0,
+      });
+      currentAmount = hopResult.output;
+    }
   }
   return true;
 }
@@ -960,10 +1005,25 @@ export interface RunMetrics {
 // The graph structure (which nodes are connected) doesn't change during a run
 // (no providers exit), so paths are enumerated ONCE and reused across all
 // extractMetrics calls. Only offer attributes (capacity, liquidity) change.
-export type PathCache = Map<string, { hop1: PathStep<SimOffer>[][]; hop2: PathStep<SimOffer>[][]; hop3: PathStep<SimOffer>[][]; hop4: PathStep<SimOffer>[][] }>;
+//
+// (Prompt 4.8.8S) The cache also carries TWO acceptance stats computed at
+// build time across ALL corridors:
+//   pathCapHitCount  — number of (corridor × tier) buckets whose unique path
+//                      count EXCEEDED the cap (i.e. truncation occurred).
+//   maxPathsObserved — the single largest unique-path count seen in any
+//                      (corridor × tier) bucket.
+// The experiment is valid only if pathCapHitCount === 0. If > 0, every
+// path-dependent metric (structural, aggregateCapacity, greedyCapacity,
+// greedyLiquidity, greedyProduction, alternativeProduction) is a LOWER BOUND.
+export type PathCache = Map<string, { hop1: PathStep<SimOffer>[][]; hop2: PathStep<SimOffer>[][]; hop3: PathStep<SimOffer>[][]; hop4: PathStep<SimOffer>[][] }> & {
+  pathCapHitCount?: number;
+  maxPathsObserved?: number;
+};
 
-export function buildPathCache(world: SimWorld): PathCache {
+export function buildPathCache(world: SimWorld, pathCap: number = MAX_PATHS_PER_TIER): PathCache {
   const cache: PathCache = new Map();
+  let pathCapHitCount = 0;
+  let maxPathsObserved = 0;
   const activeOffers = [...world.offers.values()].filter((o: any) => o.active);
   const adj = new Map<string, AdjacencyEdge<SimOffer>[]>();
   for (const o of activeOffers) {
@@ -999,17 +1059,177 @@ export function buildPathCache(world: SimWorld): PathCache {
       if (!byHop.has(h)) byHop.set(h, []);
       byHop.get(h)!.push(path);
     }
-    cache.set(key, {
-      hop1: (byHop.get(1) ?? []).slice(0, MAX_PATHS_PER_TIER),
-      hop2: (byHop.get(2) ?? []).slice(0, MAX_PATHS_PER_TIER),
-      hop3: (byHop.get(3) ?? []).slice(0, MAX_PATHS_PER_TIER),
-      hop4: (byHop.get(4) ?? []).slice(0, MAX_PATHS_PER_TIER),
-    });
+    // (Prompt 4.8.8S) Track cap hits + max paths observed ACROSS all tiers,
+    // at build time. This is the ONLY place the experiment can detect
+    // truncation, because runExperiment always passes a pre-built cache to
+    // extractMetrics (the non-cached branch never runs in production).
+    const tiers: Array<[number, PathStep<SimOffer>[][]]> = [
+      [1, byHop.get(1) ?? []],
+      [2, byHop.get(2) ?? []],
+      [3, byHop.get(3) ?? []],
+      [4, byHop.get(4) ?? []],
+    ];
+    const capped: { hop1: PathStep<SimOffer>[][]; hop2: PathStep<SimOffer>[][]; hop3: PathStep<SimOffer>[][]; hop4: PathStep<SimOffer>[][] } = { hop1: [], hop2: [], hop3: [], hop4: [] };
+    for (const [h, paths] of tiers) {
+      if (paths.length > maxPathsObserved) maxPathsObserved = paths.length;
+      if (paths.length > pathCap) pathCapHitCount++;
+      const slice = paths.slice(0, pathCap);
+      if (h === 1) capped.hop1 = slice;
+      else if (h === 2) capped.hop2 = slice;
+      else if (h === 3) capped.hop3 = slice;
+      else capped.hop4 = slice;
+    }
+    cache.set(key, capped);
   }
+  cache.pathCapHitCount = pathCapHitCount;
+  cache.maxPathsObserved = maxPathsObserved;
   return cache;
 }
 
-export function extractMetrics(world: any, mode: "full" | "total" = "full", pathCache?: PathCache): RunMetrics {
+// (Prompt 4.8.8S) Per-demand feasibility-ladder evaluation.
+// Extracted from extractMetrics so that the SAME evaluation path is used by:
+//   - extractMetrics (aggregate demand-weighted accumulation)
+//   - the monotonicity validator (per-demand invariant check)
+//   - the approximation / sampling validators
+// No duplicate formula: it calls the SAME shared staged checkers
+// (checkPathFeasibilityStaged + checkAggregateCapacityFeasible) that the
+// experiment has used since 4.8.8R. Refactoring only restructures the loop,
+// it does not change any feasibility rule.
+export interface DemandFeasibility {
+  structural: boolean;            // A: at least one path exists (any tier)
+  aggregateCapacity: boolean;     // Bp: pure physical capacity (sum usable >= amount)
+  greedyCapacity: boolean;        // Bg: coverAmount succeeds (greedy assignment)
+  greedyLiquidity: boolean;       // C:  + destination liquidity (output-aware, greedy)
+  inventory: boolean;             // C': SOME assignment has liquidity (ignores risk)
+  greedyProduction: boolean;      // D:  + risk ceilings + min/max + status (greedy)
+  alternativeProduction: boolean; // D': SOME assignment satisfies ALL constraints (LOWER_BOUND)
+  hasDirect: boolean;
+  hasSplitDirect: boolean;
+  hasTwoHop: boolean;
+  hasThreePlusHop: boolean;
+}
+
+export function evaluateDemandFeasibility(
+  hop1Paths: PathStep<SimOffer>[][],
+  hop2Paths: PathStep<SimOffer>[][],
+  hop3Paths: PathStep<SimOffer>[][],
+  hop4Paths: PathStep<SimOffer>[][],
+  amount: number,
+  riskTolerance: string,
+  world: SimWorld,
+  saRiskCache: Map<string, number>,
+  cpRiskCache: Map<string, number>,
+  needBreakdown: boolean,
+): DemandFeasibility {
+  let capOK = false;
+  let aggCapOK = false;
+  let liqOK = false;
+  let invOK = false;
+  let prodOK = false;
+  let altProdOK = false;
+  let hasDirect = false;
+  let hasSplitDirect = false;
+  let hasTwoHop = false;
+  let hasThreePlusHop = false;
+
+  const tiers: PathStep<SimOffer>[][][] = [hop1Paths, hop2Paths, hop3Paths, hop4Paths];
+  for (let t = 0; t < tiers.length; t++) {
+    // Skip remaining tiers once both prod + altProd are satisfied (total mode),
+    // or once we have no reason to keep scanning (full mode scans everything
+    // reachable until the composition flags are all set).
+    if (!(needBreakdown || !prodOK || !altProdOK)) break;
+    for (const path of tiers[t]) {
+      const staged = checkPathFeasibilityStaged(path, amount, riskTolerance, world, saRiskCache, cpRiskCache);
+      if (!staged) continue;
+      if (staged.capacityFeasible) capOK = true;
+      if (!aggCapOK && checkAggregateCapacityFeasible(path, amount, world)) aggCapOK = true;
+      if (staged.liquidityFeasible) liqOK = true;
+      if (staged.inventoryFeasible) invOK = true;
+      if (staged.productionFeasible) {
+        prodOK = true;
+        if (needBreakdown) {
+          if (path.length >= 3) hasThreePlusHop = true;
+          else if (path.length === 2) hasTwoHop = true;
+          else if (staged.split) hasSplitDirect = true;
+          else hasDirect = true;
+        }
+      }
+      if (staged.alternativeProductionFeasible) altProdOK = true;
+      if (!needBreakdown && prodOK && altProdOK) break;
+      if (needBreakdown) {
+        if (t === 0 && hasDirect && hasSplitDirect) break;
+        else if (t === 1 && hasTwoHop) break;
+        else if (t >= 2 && hasThreePlusHop) break;
+      }
+    }
+  }
+
+  const structural = hop1Paths.length + hop2Paths.length + hop3Paths.length + hop4Paths.length > 0;
+  return {
+    structural,
+    aggregateCapacity: aggCapOK,
+    greedyCapacity: capOK,
+    greedyLiquidity: liqOK,
+    inventory: invOK,
+    greedyProduction: prodOK,
+    alternativeProduction: altProdOK,
+    hasDirect, hasSplitDirect, hasTwoHop, hasThreePlusHop,
+  };
+}
+
+// (Prompt 4.8.8S) Optional overrides for validation. Defaults preserve the
+// production experiment's behaviour exactly.
+export interface ExtractMetricsOpts {
+  // Override the per-corridor demand-sample cap. Default: MAX_DEMANDS_FULL (full
+  // mode) / MAX_DEMANDS_TOTAL (total mode). Pass Infinity for EXACT evaluation.
+  demandSampleCap?: number;
+}
+
+// (Prompt 4.8.8S) Build the shared feasibility context (active offers, corridor
+// adjacency, precomputed risk caches) used by extractMetrics. Exported so the
+// validation scripts (monotonicity / approximation / sampling) build the SAME
+// context — no duplicated adjacency or risk-cache logic, no divergence risk.
+export interface FeasibilityContext {
+  activeOffers: SimOffer[];
+  adj: Map<string, AdjacencyEdge<SimOffer>[]>;
+  saRiskCache: Map<string, number>;
+  cpRiskCache: Map<string, number>;
+}
+
+export function buildFeasibilityContext(world: SimWorld): FeasibilityContext {
+  const activeOffers = [...world.offers.values()].filter((o: any) => o.active);
+  // Build adjacency map for production-faithful path enumeration.
+  // Only offers from ACTIVE providers form edges (mirrors production buildGraph).
+  const adj = new Map<string, AdjacencyEdge<SimOffer>[]>();
+  for (const o of activeOffers) {
+    const provider = world.providers.get(o.providerId);
+    if (!provider || provider.status !== "ACTIVE") continue;
+    const from = `${o.sourceAsset}:${o.sourceCountry}`;
+    const to = `${o.destinationAsset}:${o.destinationCountry}`;
+    if (!adj.has(from)) adj.set(from, []);
+    adj.get(from)!.push({ to, edge: o });
+  }
+  // Precompute risk caches (settlement-asset + counterparty risk don't depend
+  // on risk tolerance, only on the asset/provider).
+  const saRiskCache = new Map<string, number>();
+  for (const [id, sa] of world.assets.entries()) {
+    saRiskCache.set(id, settlementAssetRisk({
+      assetType: sa.assetType, volatilityScore: sa.volatilityScore,
+      liquidityScore: sa.liquidityScore, pegQuality: sa.pegQuality,
+      status: sa.status, incentiveRate: sa.incentiveRate,
+    }));
+  }
+  const cpRiskCache = new Map<string, number>();
+  for (const [id, p] of world.providers.entries()) {
+    cpRiskCache.set(id, providerCounterpartyRisk({
+      trustModel: p.trustModel, providerType: p.providerType,
+      reputationScore: p.reputationScore, status: p.status,
+    }));
+  }
+  return { activeOffers, adj, saRiskCache, cpRiskCache };
+}
+
+export function extractMetrics(world: any, mode: "full" | "total" = "full", pathCache?: PathCache, opts?: ExtractMetricsOpts): RunMetrics {
   const intents = world.intents;
   const completed = intents.filter((i: any) => i.status === "COMPLETED");
   const abandoned = intents.filter((i: any) => i.status === "ABANDONED");
@@ -1064,39 +1284,7 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
   //
   // Levels 3-4 use shared computeHopOutput/coverAmount/enumeratePaths — the SAME
   // canonical functions production routing.ts uses. No duplicate formula.
-  const settlementAssetSymbols = new Set([...world.assets.values()].map((a: any) => a.symbol));
-  const activeOffers = [...world.offers.values()].filter((o: any) => o.active);
-
-  // Build adjacency map for production-faithful path enumeration.
-  // Only offers from ACTIVE providers form edges (mirrors production buildGraph).
-  const adj = new Map<string, AdjacencyEdge<SimOffer>[]>();
-  for (const o of activeOffers) {
-    const provider = world.providers.get(o.providerId);
-    if (!provider || provider.status !== "ACTIVE") continue;
-    const from = `${o.sourceAsset}:${o.sourceCountry}`;
-    const to = `${o.destinationAsset}:${o.destinationCountry}`;
-    if (!adj.has(from)) adj.set(from, []);
-    adj.get(from)!.push({ to, edge: o });
-  }
-
-  // Precompute risk caches (settlement-asset + counterparty risk don't depend
-  // on risk tolerance, only on the asset/provider). This avoids recomputing
-  // them for every assignment of every path of every demand.
-  const saRiskCache = new Map<string, number>();
-  for (const [id, sa] of world.assets.entries()) {
-    saRiskCache.set(id, settlementAssetRisk({
-      assetType: sa.assetType, volatilityScore: sa.volatilityScore,
-      liquidityScore: sa.liquidityScore, pegQuality: sa.pegQuality,
-      status: sa.status, incentiveRate: sa.incentiveRate,
-    }));
-  }
-  const cpRiskCache = new Map<string, number>();
-  for (const [id, p] of world.providers.entries()) {
-    cpRiskCache.set(id, providerCounterpartyRisk({
-      trustModel: p.trustModel, providerType: p.providerType,
-      reputationScore: p.reputationScore, status: p.status,
-    }));
-  }
+  const { activeOffers, adj, saRiskCache, cpRiskCache } = buildFeasibilityContext(world);
 
   // Collect demand per corridor with per-user risk tolerance.
   interface CorridorDemand { amount: number; weight: number; riskTolerance: string; }
@@ -1123,8 +1311,12 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
   let prodExecutableVolume = 0;
   let altProductionExecutableVolume = 0;
   let corridorsWithMultipleRoutes = 0;
-  let pathCapHitCount = 0;
-  let maxPathsObserved = 0;
+  // (Prompt 4.8.8S) Inherit cap-stats from the pre-built cache. The cache is
+  // built once per run by buildPathCache, which is the ONLY place truncation
+  // can be detected (runExperiment always passes a cache). The non-cached
+  // fallback below still tracks locally for standalone/test calls.
+  let pathCapHitCount = pathCache?.pathCapHitCount ?? 0;
+  let maxPathsObserved = pathCache?.maxPathsObserved ?? 0;
   // Route-composition weights (Prompt 4.8.8). These overlap: a demand may be
   // reachable by multiple path types. totalProdExec ≤ sum of these.
   let directReachableVolume = 0;        // feasible 1-hop single-provider
@@ -1226,7 +1418,11 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
     let twoHopWeight = 0;
     let threePlusHopWeight = 0;
     const needBreakdown = mode === "full";
-    const maxSample = needBreakdown ? MAX_DEMANDS_FULL : MAX_DEMANDS_TOTAL;
+    // (Prompt 4.8.8S) Allow callers (validation scripts) to override the
+    // per-corridor demand-sample cap. Default preserves production behaviour.
+    // Pass Infinity to evaluate EVERY demand exactly (no sampling).
+    const defaultSample = needBreakdown ? MAX_DEMANDS_FULL : MAX_DEMANDS_TOTAL;
+    const maxSample = opts?.demandSampleCap ?? defaultSample;
 
     // Demand sampling: if the corridor has more demands than maxSample, pick
     // evenly-spaced samples by amount. Each sample's weight is scaled to
@@ -1251,111 +1447,26 @@ export function extractMetrics(world: any, mode: "full" | "total" = "full", path
     }
 
     for (const demand of sampledDemands) {
-      const amt = demand.amount;
-      const rt = demand.riskTolerance;
-      let capOK = false;
-      let aggCapOK = false;
-      let liqOK = false;
-      let invOK = false;
-      let prodOK = false;
-      let altProdOK = false;
-      let hasDirect = false;
-      let hasSplitDirect = false;
-      let hasTwoHop = false;
-      let hasThreePlusHop = false;
-
-      // (Prompt 4.8.8O) No source-amount pre-filter. The correct output-aware
-      // liquidity check happens inside checkPathFeasibilityStaged.
-
-      // Tier 1: 1-hop paths (direct).
-      for (const path of hop1Paths) {
-        const staged = checkPathFeasibilityStaged(path, amt, rt, world, saRiskCache, cpRiskCache);
-        if (!staged) continue;
-        if (staged.capacityFeasible) capOK = true;
-        if (!aggCapOK && checkAggregateCapacityFeasible(path, amt, world)) aggCapOK = true;
-        if (staged.liquidityFeasible) liqOK = true;
-        if (staged.inventoryFeasible) invOK = true;
-        if (staged.productionFeasible) {
-          prodOK = true;
-          if (needBreakdown) {
-            if (staged.split) hasSplitDirect = true;
-            else hasDirect = true;
-          }
-        }
-        if (staged.alternativeProductionFeasible) altProdOK = true;
-        if (!needBreakdown && prodOK && altProdOK) break;
-        if (needBreakdown && hasDirect && hasSplitDirect) break;
-      }
-
-      // Tier 2: 2-hop paths.
-      if (needBreakdown || !prodOK || !altProdOK) {
-        for (const path of hop2Paths) {
-          const staged = checkPathFeasibilityStaged(path, amt, rt, world, saRiskCache, cpRiskCache);
-          if (!staged) continue;
-          if (staged.capacityFeasible) capOK = true;
-        if (!aggCapOK && checkAggregateCapacityFeasible(path, amt, world)) aggCapOK = true;
-          if (staged.liquidityFeasible) liqOK = true;
-          if (staged.inventoryFeasible) invOK = true;
-          if (staged.productionFeasible) {
-            prodOK = true;
-            if (needBreakdown) hasTwoHop = true;
-          }
-          if (staged.alternativeProductionFeasible) altProdOK = true;
-          if (!needBreakdown && prodOK && altProdOK) break;
-          if (needBreakdown && hasTwoHop) break;
-        }
-      }
-
-      // (Prompt 4.8.8Q) Tier 3: 3-hop paths (evaluated SEPARATELY from 4-hop).
-      if (needBreakdown || !prodOK || !altProdOK) {
-        for (const path of hop3Paths) {
-          const staged = checkPathFeasibilityStaged(path, amt, rt, world, saRiskCache, cpRiskCache);
-          if (!staged) continue;
-          if (staged.capacityFeasible) capOK = true;
-          if (!aggCapOK && checkAggregateCapacityFeasible(path, amt, world)) aggCapOK = true;
-          if (staged.liquidityFeasible) liqOK = true;
-          if (staged.inventoryFeasible) invOK = true;
-          if (staged.productionFeasible) {
-            prodOK = true;
-            if (needBreakdown) hasThreePlusHop = true;
-          }
-          if (staged.alternativeProductionFeasible) altProdOK = true;
-          if (!needBreakdown && prodOK && altProdOK) break;
-          if (needBreakdown && hasThreePlusHop) break;
-        }
-      }
-
-      // (Prompt 4.8.8Q) Tier 4: 4-hop paths (evaluated SEPARATELY from 3-hop).
-      if (needBreakdown || !prodOK || !altProdOK) {
-        for (const path of hop4Paths) {
-          const staged = checkPathFeasibilityStaged(path, amt, rt, world, saRiskCache, cpRiskCache);
-          if (!staged) continue;
-          if (staged.capacityFeasible) capOK = true;
-          if (!aggCapOK && checkAggregateCapacityFeasible(path, amt, world)) aggCapOK = true;
-          if (staged.liquidityFeasible) liqOK = true;
-          if (staged.inventoryFeasible) invOK = true;
-          if (staged.productionFeasible) {
-            prodOK = true;
-            if (needBreakdown) hasThreePlusHop = true;
-          }
-          if (staged.alternativeProductionFeasible) altProdOK = true;
-          if (!needBreakdown && prodOK && altProdOK) break;
-          if (needBreakdown && hasThreePlusHop) break;
-        }
-      }
-
-      if (capOK) capacityExecutableWeight += demand.weight;
-      if (aggCapOK) aggregateCapacityWeight += demand.weight;
-      if (liqOK) liqExecutableWeight += demand.weight;
-      if (invOK) inventoryExecutableWeight += demand.weight;
-      if (prodOK) {
+      // (Prompt 4.8.8S) Delegate to the shared per-demand evaluator. This is
+      // the SAME code path used by the monotonicity / approximation / sampling
+      // validators — no duplicate feasibility formula.
+      const feas = evaluateDemandFeasibility(
+        hop1Paths, hop2Paths, hop3Paths, hop4Paths,
+        demand.amount, demand.riskTolerance,
+        world, saRiskCache, cpRiskCache, needBreakdown,
+      );
+      if (feas.greedyCapacity) capacityExecutableWeight += demand.weight;
+      if (feas.aggregateCapacity) aggregateCapacityWeight += demand.weight;
+      if (feas.greedyLiquidity) liqExecutableWeight += demand.weight;
+      if (feas.inventory) inventoryExecutableWeight += demand.weight;
+      if (feas.greedyProduction) {
         prodExecutableWeight += demand.weight;
-        if (hasDirect) directWeight += demand.weight;
-        if (hasSplitDirect) splitDirectWeight += demand.weight;
-        if (hasTwoHop) twoHopWeight += demand.weight;
-        if (hasThreePlusHop) threePlusHopWeight += demand.weight;
+        if (feas.hasDirect) directWeight += demand.weight;
+        if (feas.hasSplitDirect) splitDirectWeight += demand.weight;
+        if (feas.hasTwoHop) twoHopWeight += demand.weight;
+        if (feas.hasThreePlusHop) threePlusHopWeight += demand.weight;
       }
-      if (altProdOK) altProductionExecutableWeight += demand.weight;
+      if (feas.alternativeProduction) altProductionExecutableWeight += demand.weight;
     }
 
     // Amount-weighted reachability for this corridor.
@@ -1452,7 +1563,7 @@ const TOPOLOGIES: TopologyMode[] = ["RANDOM", "CORRIDOR_FOCUSED", "BRIDGED"];
 const NUM_SEEDS = 20;
 const BASE_SEED = 10000;
 
-function makeConfig(seed: number): SimConfig {
+export function makeConfig(seed: number): SimConfig {
   return {
     ...createDefaultConfig(),
     seed, totalSteps: 100, stepDurationMs: 60000,
@@ -1465,19 +1576,40 @@ function makeConfig(seed: number): SimConfig {
   };
 }
 
-function runExperiment() {
-  console.log("Running topology experiment (P4.8.8 — production-faithful path reachability)...");
-  console.log(`  ${PROVIDER_COUNTS.length} densities × ${TOPOLOGIES.length} topologies × ${NUM_SEEDS} seeds = ${PROVIDER_COUNTS.length * TOPOLOGIES.length * NUM_SEEDS} runs`);
-
-  interface Result { density: number; topology: string; metrics: RunMetrics[] }
-  const results: Result[] = [];
-
-  const settlementAssets = new Map<string, SimSettlementAsset>([
+// (Prompt 4.8.8S) Exported so validation scripts build the EXACT same
+// settlement-asset universe as runExperiment — no divergence risk.
+export function makeSettlementAssets(): Map<string, SimSettlementAsset> {
+  return new Map<string, SimSettlementAsset>([
     ["asset_usdc", { id: "asset_usdc", symbol: "USDC", assetType: "STABLECOIN", volatilityScore: 0.02, liquidityScore: 0.95, pegQuality: 0.99, incentiveRate: 0, collateralHaircut: 0.05, isEligibleCollateral: true, status: "ACTIVE" }],
     ["asset_eurc", { id: "asset_eurc", symbol: "EURC", assetType: "STABLECOIN", volatilityScore: 0.05, liquidityScore: 0.7, pegQuality: 0.95, incentiveRate: 0, collateralHaircut: 0.1, isEligibleCollateral: true, status: "ACTIVE" }],
     ["asset_sc", { id: "asset_sc", symbol: "SC", assetType: "INTERNAL_SETTLEMENT_UNIT", volatilityScore: 0.0, liquidityScore: 0.9, pegQuality: 1.0, incentiveRate: 0, collateralHaircut: 0.0, isEligibleCollateral: true, status: "ACTIVE" }],
     ["asset_weth", { id: "asset_weth", symbol: "WETH", assetType: "VOLATILE_TOKEN", volatilityScore: 0.6, liquidityScore: 0.6, pegQuality: null, incentiveRate: 0, collateralHaircut: 0.5, isEligibleCollateral: false, status: "ACTIVE" }],
   ]);
+}
+
+// (Prompt 4.8.8S) Exported constants so validation scripts use the same
+// seed base, density grid, and topology list as the production experiment.
+export const EXPERIMENT_CONSTANTS = {
+  BASE_SEED,
+  NUM_SEEDS,
+  PROVIDER_COUNTS,
+  TOPOLOGIES,
+  MAX_HOPS,
+  MAX_PATHS_PER_TIER,
+  MAX_DEMANDS_FULL,
+  MAX_DEMANDS_TOTAL,
+} as const;
+
+// (Prompt 4.8.8S) Hoisted to module scope so printResults can reference it.
+interface Result { density: number; topology: string; metrics: RunMetrics[] }
+
+function runExperiment() {
+  console.log("Running topology experiment (P4.8.8 — production-faithful path reachability)...");
+  console.log(`  ${PROVIDER_COUNTS.length} densities × ${TOPOLOGIES.length} topologies × ${NUM_SEEDS} seeds = ${PROVIDER_COUNTS.length * TOPOLOGIES.length * NUM_SEEDS} runs`);
+
+  const results: Result[] = [];
+
+  const settlementAssets = makeSettlementAssets();
 
   for (const topology of TOPOLOGIES) {
     for (const density of PROVIDER_COUNTS) {
@@ -1544,11 +1676,27 @@ function runExperiment() {
 
 function printResults(results: Result[]) {
   console.log("\n╔═══════════════════════════════════════════════════════════════════════╗");
-  console.log("║  dRamp Topology Experiment (P4.8.8 — Production-Faithful Path Reach)  ║");
+  console.log("║  dRamp Topology Experiment (P4.8.8S — FROZEN Routing Diagnostic)     ║");
   console.log("║  20 seeds | 100 steps | Per-seed canonical pool | Deep clone         ║");
   console.log("║  Controls: no entry/exit, no incentives, no shocks                    ║");
   console.log("║  Routing: shared computeHopOutput/coverAmount/enumeratePaths (maxHops=4) ║");
   console.log("╚═══════════════════════════════════════════════════════════════════════╝");
+
+  // (Prompt 4.8.8S) Path-cap acceptance gate.
+  // The experiment is valid only if pathCapHitCount === 0 for EVERY run.
+  // If any run hit the 10,000-path cap, all path-dependent metrics are
+  // LOWER BOUNDS and must be labelled as such.
+  const allCapHits = results.flatMap(r => r.metrics.map(m => m.pathCapHitCount));
+  const totalCapHits = allCapHits.reduce((s, v) => s + v, 0);
+  const runsHittingCap = allCapHits.filter(v => v > 0).length;
+  const globalMaxPaths = results.flatMap(r => r.metrics.map(m => m.maxPathsObserved)).reduce((mx, v) => Math.max(mx, v), 0);
+  const capAcceptable = totalCapHits === 0;
+  console.log("\n### Path-Cap Acceptance Gate (P4.8.8S)\n");
+  console.log(`  MAX_PATHS_PER_TIER      : 10000`);
+  console.log(`  Total cap hits (all runs): ${totalCapHits}`);
+  console.log(`  Runs hitting cap         : ${runsHittingCap} / ${allCapHits.length}`);
+  console.log(`  Max paths observed       : ${globalMaxPaths}`);
+  console.log(`  ACCEPTANCE (pathCapHitCount === 0): ${capAcceptable ? "PASS ✓ — no truncation, metrics are EXACT" : "FAIL ✗ — path-dependent metrics are LOWER BOUNDS below"}`);
 
   // Table A: Five-level reachability ladder
   console.log("\n### Table A — Reachable Demand % (Asset / Corridor / Liq-Exec / Prod-Exec)\n");
@@ -1645,6 +1793,37 @@ function printResults(results: Result[]) {
       console.log(`    Completion (separate population):   ${medComp.toFixed(1)}%`);
     }
   }
+
+  // (Prompt 4.8.8S) FINAL FROZEN TABLE — the strategic measurement.
+  // 6 columns: topology | structural | aggregate capacity | greedy capacity |
+  //            greedy liquidity | greedy production | alternative production LB
+  // Values are medians (10th–90th percentile) over 20 seeds at density=100.
+  // Monotonicity invariant: structural ≥ aggCap ≥ greedyCap ≥ greedyLiq ≥ greedyProd
+  // (asserted per-demand by scripts/validate-4-8-8s-monotonicity.ts).
+  // alternativeProduction is a LOWER_BOUND (solver is breakpoint-based, not
+  // proven exhaustive for 3+ offer multi-hop splits).
+  const lb = capAcceptable ? "" : "  [PATH-CAP HIT → LOWER BOUND]";
+  console.log("\n### Table F — FROZEN Routing Diagnostic (P4.8.8S) — density=100, 20 seeds\n");
+  console.log("Medians (10th–90th percentile). Demand-weighted % of reachable volume.");
+  console.log("Invariant: structural ≥ aggregateCapacity ≥ greedyCapacity ≥ greedyLiquidity ≥ greedyProduction");
+  console.log("alternativeProduction = LOWER_BOUND (solver not proven exhaustive for 3+ offer multi-hop).");
+  if (lb) console.log(`WARNING: ${lb}`);
+  console.log("");
+  console.log("| topology | structural | aggregate capacity | greedy capacity | greedy liquidity | greedy production | alternative production LB |");
+  console.log("| --- | --- | --- | --- | --- | --- | --- |");
+  for (const topo of TOPOLOGIES) {
+    const r100 = results.find(r => r.density === 100 && r.topology === topo);
+    if (!r100) continue;
+    const ms = r100.metrics;
+    const s = statsLabel(ms.map(m => m.corridorReachablePct));
+    const ac = statsLabel(ms.map(m => m.aggregateCapacityReachabilityPct));
+    const gc = statsLabel(ms.map(m => m.capacityExecutableReachabilityPct));
+    const gl = statsLabel(ms.map(m => m.liquidityExecutableReachabilityPct));
+    const gp = statsLabel(ms.map(m => m.productionExecutableReachabilityPct));
+    const ap = statsLabel(ms.map(m => m.alternativeProductionExecutableReachabilityPct));
+    console.log(`| ${topo} | ${s} | ${ac} | ${gc} | ${gl} | ${gp} | ${ap} |`);
+  }
+  console.log("\n>>> DIAGNOSTIC FROZEN (P4.8.8S). No further routing-experiment changes. <<<");
 }
 
 // Run only when executed directly (not when imported by tests).

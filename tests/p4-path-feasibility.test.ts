@@ -732,9 +732,9 @@ async function main() {
   }
 
   // =========================================================================
-  // 12. (4.8.8R) Aggregate capacity monotonicity invariant + adversarial tests
+  // 12. (4.8.8S) Aggregate capacity — FX-propagated physical capacity + invariant
   // =========================================================================
-  console.log("\n== 12. Aggregate capacity invariant (4.8.8R) ==");
+  console.log("\n== 12. Aggregate capacity invariant (4.8.8S) ==");
 
   const { checkAggregateCapacityFeasible } = await import("../experiments/p4-topology-experiment");
 
@@ -762,10 +762,11 @@ async function main() {
     const staged = checkPathFeasibilityStaged(threeHop[0], 1000, "BALANCED", world, sa, cp);
     assert(staged !== null && staged.capacityFeasible === true, "Invariant: greedy capacity feasible on 3-hop");
     const aggResult = checkAggregateCapacityFeasible(threeHop[0], 1000, world);
-    assert(aggResult === true, "Invariant: aggregate capacity feasible when greedy is feasible (3-hop)");
+    assert(aggResult === true, "Invariant: aggregate capacity feasible when greedy is feasible (3-hop, rate=1.0)");
   }
 
-  // Test: heterogeneous FX rates — aggregate must not depend on rates.
+  // Test: single-hop capacity — rate does not affect the single-hop check
+  // (no downstream hop to propagate to). Capacity is the only criterion.
   {
     const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 100000 });
     // Offer with rate 2.0, capacity 10k
@@ -774,15 +775,15 @@ async function main() {
     const path: { fromNode: string; toNode: string; edges: SimOffer[] }[] = [{
       fromNode: "USD:US", toNode: "NGN:NG", edges: [o1],
     }];
-    // Demand 5k: capacity 10k >= 5k → aggregate true, regardless of rate.
+    // Demand 5k: capacity 10k >= 5k → aggregate true (single hop, no propagation).
     const aggResult = checkAggregateCapacityFeasible(path, 5000, world);
-    assert(aggResult === true, "Heterogeneous FX: aggregate capacity true (cap 10k >= 5k, rate irrelevant)");
+    assert(aggResult === true, "Single-hop: aggregate capacity true (cap 10k >= 5k)");
     // Demand 15k: capacity 10k < 15k → aggregate false.
     const aggResult2 = checkAggregateCapacityFeasible(path, 15000, world);
-    assert(aggResult2 === false, "Heterogeneous FX: aggregate capacity false (cap 10k < 15k)");
+    assert(aggResult2 === false, "Single-hop: aggregate capacity false (cap 10k < 15k)");
   }
 
-  // Test: split capacity — aggregate sums across offers.
+  // Test: split capacity — aggregate sums across offers (single hop).
   {
     const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 100000 });
     const p2 = makeProvider("p2", "COLLATERALIZED", "BANK", 0.9, { NGN: 100000 });
@@ -800,7 +801,9 @@ async function main() {
     assert(aggResult2 === false, "Split: aggregate capacity false (10k < 11k)");
   }
 
-  // Test: 2-hop with different rates — aggregate ignores FX.
+  // Test: 2-hop with rate > 1 on hop 1 — propagation AMPLIFIES the amount.
+  // (4.8.8S fix: the old constant-amount definition had a cross-hop unit
+  //  mismatch here — it compared USD on hop1 against USDC on hop2.)
   {
     const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { USDC: 100000, NGN: 100000 });
     const o1 = makeOffer("o1", "p1", "USD", "US", "USDC", "GLOBAL", 2.0, 0, 5000, "asset_usdc");
@@ -815,15 +818,50 @@ async function main() {
     }
     const paths = enumeratePaths(adj, "USD:US", "NGN:NG", 4);
     const twoHop = paths.filter((p: any) => p.length === 2);
-    // Demand 4k: hop1 cap 5k >= 4k, hop2 cap 3k < 4k → aggregate false.
+    // Demand 4k: hop1 cap 5k >= 4k ✓. Propagated = 4k * 2.0 = 8k USDC.
+    //   hop2 cap 3k < 8k → aggregate false. (Correct: path can't carry 8k USDC.)
     const aggResult = checkAggregateCapacityFeasible(twoHop[0], 4000, world);
-    assert(aggResult === false, "2-hop: aggregate false (hop2 cap 3k < 4k demand)");
-    // Demand 3k: hop1 cap 5k >= 3k, hop2 cap 3k >= 3k → aggregate true.
-    const aggResult2 = checkAggregateCapacityFeasible(twoHop[0], 3000, world);
-    assert(aggResult2 === true, "2-hop: aggregate true (both hops have enough capacity)");
+    assert(aggResult === false, "2-hop rate>1: aggregate false (propagated 8k > hop2 cap 3k)");
+    // Demand 1.5k: hop1 cap 5k >= 1.5k ✓. Propagated = 1.5k * 2.0 = 3k USDC.
+    //   hop2 cap 3k >= 3k → aggregate true. (Correct: just fits.)
+    const aggResult2 = checkAggregateCapacityFeasible(twoHop[0], 1500, world);
+    assert(aggResult2 === true, "2-hop rate>1: aggregate true (propagated 3k <= hop2 cap 3k)");
   }
 
-  // Test: reserved capacity — adapter correctly computes usable.
+  // Test: 2-hop with rate < 1 on hop 1 — propagation SHRINKS the amount.
+  // This is the case that broke the 4.8.8R constant-amount definition:
+  // greedy succeeds (propagated amount is small) but constant-amount aggregate
+  // falsely failed. The 4.8.8S propagated definition correctly succeeds.
+  {
+    const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { USDC: 100000, NGN: 100000 });
+    const o1 = makeOffer("o1", "p1", "USD", "US", "USDC", "GLOBAL", 0.5, 0, 10000, "asset_usdc");
+    const o2 = makeOffer("o2", "p1", "USDC", "GLOBAL", "NGN", "NG", 1.0, 0, 3000, "asset_usdc");
+    const world = buildTestWorld([p1], [o1, o2], [stableAsset]);
+    const adj = new Map<string, { to: string; edge: SimOffer }[]>();
+    for (const o of [o1, o2]) {
+      const from = `${o.sourceAsset}:${o.sourceCountry}`;
+      const to = `${o.destinationAsset}:${o.destinationCountry}`;
+      if (!adj.has(from)) adj.set(from, []);
+      adj.get(from)!.push({ to, edge: o });
+    }
+    const paths = enumeratePaths(adj, "USD:US", "NGN:NG", 4);
+    const twoHop = paths.filter((p: any) => p.length === 2);
+    // Demand 4k: hop1 cap 10k >= 4k ✓. Propagated = 4k * 0.5 = 2k USDC.
+    //   hop2 cap 3k >= 2k → aggregate true. (Greedy also succeeds here.)
+    //   The old constant-amount definition would FALSELY compare 4k > 3k → false.
+    const aggResult = checkAggregateCapacityFeasible(twoHop[0], 4000, world);
+    assert(aggResult === true, "2-hop rate<1: aggregate true (propagated 2k <= hop2 cap 3k) — fixes 4.8.8R unit-mismatch bug");
+    // Verify the invariant: greedy should also be feasible.
+    const sa = new Map([["asset_usdc", 0.018]]);
+    const cp = new Map([["p1", 0.12]]);
+    const staged = checkPathFeasibilityStaged(twoHop[0], 4000, "BALANCED", world, sa, cp);
+    assert(staged !== null && staged.capacityFeasible === true, "2-hop rate<1: greedy capacity feasible (invariant partner)");
+    // Demand 8k: propagated = 8k * 0.5 = 4k > hop2 cap 3k → aggregate false.
+    const aggResult2 = checkAggregateCapacityFeasible(twoHop[0], 8000, world);
+    assert(aggResult2 === false, "2-hop rate<1: aggregate false (propagated 4k > hop2 cap 3k)");
+  }
+
+  // Test: reserved capacity — adapter correctly computes usable (single hop).
   {
     const p1 = makeProvider("p1", "COLLATERALIZED", "BANK", 0.9, { NGN: 100000 });
     const o1 = makeOffer("o1", "p1", "USD", "US", "NGN", "NG", 1.0, 0, 10000, "asset_usdc");
@@ -841,7 +879,7 @@ async function main() {
   }
 
   console.log(`\n========================================`);
-  console.log(`  P4.8.8R Path Feasibility: Passed: ${passed}  |  Failed: ${failed}`);
+  console.log(`  P4.8.8S Path Feasibility: Passed: ${passed}  |  Failed: ${failed}`);
   console.log(`========================================`);
   if (failed > 0) {
     console.log("\nFailures:");

@@ -91,12 +91,17 @@ async function main() {
   console.log("\n== 6. Four reachability metrics exist ==");
   assert(expSrc.includes("assetReachablePct"), "Has assetReachablePct");
   assert(expSrc.includes("corridorReachablePct"), "Has corridorReachablePct");
-  // Verify corridor reachability uses country matching.
-  assert(expSrc.includes("o.sourceCountry === srcCountry"), "Corridor reachability matches sourceCountry");
-  assert(expSrc.includes("o.destinationCountry === dstCountry"), "Corridor reachability matches destinationCountry");
-  // Verify bridge multi-hop uses GLOBAL for settlement assets.
-  assert(expSrc.includes('o.destinationCountry === "GLOBAL"'), "Bridge hop1 uses GLOBAL destination");
-  assert(expSrc.includes('o.sourceCountry === "GLOBAL"'), "Bridge hop2 uses GLOBAL source");
+  // (P4.8.8S) Corridor reachability now matches country via node-key graph
+  // enumeration (source = `${srcAsset}:${srcCountry}`), not a direct field
+  // comparison. Verify the node-key construction embeds the country.
+  assert(expSrc.includes('`${o.sourceAsset}:${o.sourceCountry}`'), "Adjacency node key embeds sourceAsset:sourceCountry");
+  assert(expSrc.includes('`${o.destinationAsset}:${o.destinationCountry}`'), "Adjacency node key embeds destinationAsset:destinationCountry");
+  assert(expSrc.includes('`${srcAsset}:${srcCountry}`'), "Corridor source node key embeds srcCountry");
+  assert(expSrc.includes('`${dstAsset}:${dstCountry}`'), "Corridor dest node key embeds dstCountry");
+  // (P4.8.8S) Verify bridge multi-hop uses GLOBAL for settlement assets.
+  // Bridge offers are created in generateCanonicalSpecs with country: "GLOBAL".
+  assert(expSrc.includes('destinationCountry: "GLOBAL"'), "Bridge offers use destinationCountry GLOBAL");
+  assert(expSrc.includes('sourceCountry: "GLOBAL"'), "Bridge offers use sourceCountry GLOBAL");
 
   // 7. Provider economics shared across topologies (ALL fields)
   console.log("\n== 7. Provider economics shared across topologies ==");
@@ -170,9 +175,11 @@ async function main() {
   assert(expSrc.includes("assetRiskCeiling("), "Production exec uses assetRiskCeiling()");
   assert(expSrc.includes("providerCounterpartyRisk("), "Production exec uses providerCounterpartyRisk()");
   assert(expSrc.includes("counterpartyRiskCeiling("), "Production exec uses counterpartyRiskCeiling()");
-  // Verify multi-hop checks EACH hop's destination liquidity (general pattern,
-  // not hard-coded to a specific settlement asset / final destination).
-  assert(expSrc.includes("provider.liquidity.balances.get(hopDstAsset)"), "Path feasibility checks each hop's destination liquidity");
+  // (P4.8.8S) Multi-hop checks EACH hop's destination liquidity via the
+  // output-aware pattern: computeHopOutput() then balances.get(offer.destinationAsset).
+  assert(expSrc.includes("computeHopOutput(a.amount,"), "Path feasibility computes hop output for liquidity check");
+  assert(expSrc.includes("provider.liquidity.balances.get(offer.destinationAsset)"), "Path feasibility checks each hop's destination liquidity (output-aware)");
+  assert(expSrc.includes("dstLiquidity < requiredDstLiquidity"), "Path feasibility compares destination liquidity against hop output");
 
   // 9. Production-faithful path search (Prompt 4.8.8)
   console.log("\n== 9. Production-faithful path search (P4.8.8) ==");
@@ -229,8 +236,41 @@ async function main() {
   assert(expSrc.includes("Simulator (engine-faithful.ts"), "Adapter documents simulator semantics");
   assert(expSrc.includes("Production (collateral.ts"), "Adapter documents production semantics");
 
+  // 12. P4.8.8S — Frozen diagnostic integrity
+  console.log("\n== 12. Frozen diagnostic integrity (P4.8.8S) ==");
+  // (4.8.8S) Aggregate capacity: FX-propagated physical capacity.
+  // Propagates the amount through computeHopOutput using the MIN outputMultiplier
+  // per hop — this fixes the 4.8.8R constant-amount unit-mismatch bug and
+  // guarantees the monotonicity invariant (greedyCap => aggCap).
+  assert(expSrc.includes("PHYSICAL capacity with FX propagation"), "Aggregate capacity documents FX propagation");
+  assert(expSrc.includes("minOutputMultiplier"), "Aggregate capacity tracks minimum outputMultiplier for propagation");
+  assert(expSrc.includes("sum(usableCapacity"), "Aggregate capacity sums usable capacity across offers");
+  assert(expSrc.includes("greedyCapacity feasible  =>  aggregateCapacity feasible"), "Aggregate capacity documents the monotonicity invariant");
+  assert(expSrc.includes("UNIT MISMATCH"), "Aggregate capacity documents the 4.8.8R unit-mismatch bug it fixes");
+  // Path-cache cap tracking (the fix for the broken 4.8.8R tracking).
+  assert(expSrc.includes("pathCapHitCount") && expSrc.includes("maxPathsObserved"), "RunMetrics carries path-cap tracking fields");
+  assert(expSrc.includes("cache.pathCapHitCount = pathCapHitCount"), "buildPathCache writes cap stats onto the cache object");
+  assert(expSrc.includes("pathCache?.pathCapHitCount ?? 0"), "extractMetrics inherits cap stats from the cache");
+  assert(expSrc.includes("pathCap: number = MAX_PATHS_PER_TIER"), "buildPathCache accepts a pathCap override (for validation)");
+  // Per-demand evaluator (DRY: shared by extractMetrics + validators).
+  assert(expSrc.includes("export function evaluateDemandFeasibility"), "Exports evaluateDemandFeasibility helper");
+  assert(expSrc.includes("export interface DemandFeasibility"), "Exports DemandFeasibility interface");
+  assert(expSrc.includes("structural: boolean") && expSrc.includes("aggregateCapacity: boolean"), "DemandFeasibility has structural + aggregateCapacity flags");
+  // Demand-sampling override (for validation).
+  assert(expSrc.includes("demandSampleCap"), "extractMetrics accepts demandSampleCap override");
+  assert(expSrc.includes("export interface ExtractMetricsOpts"), "Exports ExtractMetricsOpts interface");
+  // Path-cap acceptance gate in output.
+  assert(expSrc.includes("Path-Cap Acceptance Gate"), "printResults emits a path-cap acceptance gate");
+  assert(expSrc.includes("pathCapHitCount === 0"), "Output documents the pathCapHitCount === 0 acceptance criterion");
+  // Frozen table.
+  assert(expSrc.includes("FROZEN Routing Diagnostic"), "printResults emits the FROZEN diagnostic table");
+  assert(expSrc.includes("DIAGNOSTIC FROZEN (P4.8.8S)"), "Output marks the diagnostic as frozen");
+  assert(expSrc.includes("alternative production LB"), "Frozen table labels alternative production as LOWER BOUND");
+  // alternativeProduction still labelled LOWER_BOUND (not exact).
+  assert(expSrc.includes("LOWER_BOUND") || expSrc.includes("LOWER BOUND"), "Alternative production labelled as lower bound (not exact)");
+
   console.log(`\n========================================`);
-  console.log(`  P4.8.8A Integrity: Passed: ${passed}  |  Failed: ${failed}`);
+  console.log(`  P4.8.8S Integrity: Passed: ${passed}  |  Failed: ${failed}`);
   console.log(`========================================`);
   if (failed > 0) {
     console.log("\nFailures:");
